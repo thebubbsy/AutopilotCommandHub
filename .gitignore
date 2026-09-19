@@ -1,0 +1,18 @@
+# Environment & Secret Configurations
+.env
+.env.local
+*.secret
+*.key
+
+# Temporary files & logs
+*.log
+*.tmp
+*.csv
+Test*.csv
+__pycache__/
+*.pyc
+
+# Windows / OS Artifacts
+Thumbs.db
+Desktop.ini
+.DS_Store
