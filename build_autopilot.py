@@ -2475,7 +2475,7 @@ function Start-AutopilotHubGui {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Autopilot Provisioning Hub — Enterprise Endpoint Deployment"
-        Height="800" Width="1480" MinHeight="700" MinWidth="1240"
+        Height="900" Width="1480" MinHeight="700" MinWidth="1240"
         WindowStartupLocation="CenterScreen"
         Background="#202020" Foreground="#FFFFFF"
         FontFamily="Segoe UI Variable Text, Segoe UI, sans-serif">
@@ -3342,49 +3342,63 @@ function Start-AutopilotHubGui {
                         <ColumnDefinition Width="*"/>
                     </Grid.ColumnDefinitions>
 
-                    <!-- Left: Package Builder -->
+                    <!-- Left: Package Builder (fields scroll if cramped; the action button stays pinned) -->
                     <Border Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="16" Margin="0,0,6,0">
-                        <StackPanel>
-                            <TextBlock Text="WIN32 PACKAGE BUILDER (.INTUNEWIN)" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,0,0,14"/>
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto">
+                                <StackPanel>
+                                    <TextBlock Text="WIN32 PACKAGE BUILDER (.INTUNEWIN)" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,0,0,14"/>
 
-                            <TextBlock Text="Winget Package ID / Source:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
-                            <TextBox Name="TxtPkgId" Height="32" Text="Mozilla.Firefox" Margin="0,0,0,10"/>
+                                    <TextBlock Text="Winget Package ID / Source:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
+                                    <TextBox Name="TxtPkgId" Height="32" Text="Mozilla.Firefox" Margin="0,0,0,10"/>
 
-                            <TextBlock Text="Display Name:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
-                            <TextBox Name="TxtPkgDisplayName" Height="32" Text="Mozilla Firefox Enterprise" Margin="0,0,0,10"/>
+                                    <TextBlock Text="Display Name:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
+                                    <TextBox Name="TxtPkgDisplayName" Height="32" Text="Mozilla Firefox Enterprise" Margin="0,0,0,10"/>
 
-                            <TextBlock Text="Output Folder:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
-                            <TextBox Name="TxtPkgOutputDir" Height="32" Text="C:\temp\WingetIntune\Output" Margin="0,0,0,10"/>
+                                    <TextBlock Text="Output Folder:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
+                                    <TextBox Name="TxtPkgOutputDir" Height="32" Text="C:\temp\WingetIntune\Output" Margin="0,0,0,10"/>
 
-                            <TextBlock Text="Silent Install Arguments:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
-                            <TextBox Name="TxtPkgInstallArgs" Height="32" Text="/S" Margin="0,0,0,16"/>
-
-                            <Button Name="BtnBuildPackage" Content="Build Package (.intunewin)" Style="{StaticResource AccentBtn}" Height="34"/>
-                        </StackPanel>
+                                    <TextBlock Text="Silent Install Arguments:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
+                                    <TextBox Name="TxtPkgInstallArgs" Height="32" Text="/S" Margin="0,0,0,16"/>
+                                </StackPanel>
+                            </ScrollViewer>
+                            <Button Name="BtnBuildPackage" Grid.Row="1" Content="Build Package (.intunewin)" Style="{StaticResource AccentBtn}" Height="34" Margin="0,12,0,0"/>
+                        </Grid>
                     </Border>
 
-                    <!-- Right: Cloud Publisher -->
+                    <!-- Right: Cloud Publisher (fields scroll if cramped; the action button stays pinned) -->
                     <Border Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="16" Margin="6,0,0,0">
-                        <StackPanel>
-                            <TextBlock Text="MICROSOFT GRAPH INTUNE CLOUD PUBLISHER" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,0,0,14"/>
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto">
+                                <StackPanel>
+                                    <TextBlock Text="MICROSOFT GRAPH INTUNE CLOUD PUBLISHER" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,0,0,14"/>
 
-                            <TextBlock Text="Target Assignment Intent:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
-                            <ComboBox Name="CmbAssignmentIntent" Height="32" Margin="0,0,0,10" Background="#1F1F1F" Foreground="#FFFFFF">
-                                <ComboBoxItem Content="Available (Self-Service in Company Portal)" IsSelected="True"/>
-                                <ComboBoxItem Content="Required (Mandatory Push)"/>
-                                <ComboBoxItem Content="Uninstall"/>
-                            </ComboBox>
+                                    <TextBlock Text="Target Assignment Intent:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
+                                    <ComboBox Name="CmbAssignmentIntent" Height="32" Margin="0,0,0,10" Background="#1F1F1F" Foreground="#FFFFFF">
+                                        <ComboBoxItem Content="Available (Self-Service in Company Portal)" IsSelected="True"/>
+                                        <ComboBoxItem Content="Required (Mandatory Push)"/>
+                                        <ComboBoxItem Content="Uninstall"/>
+                                    </ComboBox>
 
-                            <TextBlock Text="Target Entra ID Group / Audience:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
-                            <TextBox Name="TxtAssignGroup" Height="32" Text="All Devices" Margin="0,0,0,16"/>
+                                    <TextBlock Text="Target Entra ID Group / Audience:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
+                                    <TextBox Name="TxtAssignGroup" Height="32" Text="All Devices" Margin="0,0,0,16"/>
 
-                            <Border Background="#242424" BorderBrush="#383838" BorderThickness="1" CornerRadius="4" Padding="12" Margin="0,0,0,16">
-                                <TextBlock Text="Direct Graph publishing utilizes chunked Azure SAS storage upload and generates automated Win32 detection rules."
-                                           FontSize="11.5" Foreground="#8A8A8A" TextWrapping="Wrap"/>
-                            </Border>
-
-                            <Button Name="BtnPublishIntune" Content="Publish to Intune Cloud" Style="{StaticResource AccentBtn}" Height="34"/>
-                        </StackPanel>
+                                    <Border Background="#242424" BorderBrush="#383838" BorderThickness="1" CornerRadius="4" Padding="12" Margin="0,0,0,16">
+                                        <TextBlock Text="Direct Graph publishing utilizes chunked Azure SAS storage upload and generates automated Win32 detection rules."
+                                                   FontSize="11.5" Foreground="#8A8A8A" TextWrapping="Wrap"/>
+                                    </Border>
+                                </StackPanel>
+                            </ScrollViewer>
+                            <Button Name="BtnPublishIntune" Grid.Row="1" Content="Publish to Intune Cloud" Style="{StaticResource AccentBtn}" Height="34" Margin="0,12,0,0"/>
+                        </Grid>
                     </Border>
                 </Grid>
             </TabItem>
