@@ -10,7 +10,7 @@
 
 ---
 
-![Autopilot Command Hub UI](media/autopilotfast-oobe.png)
+![Autopilot Command Hub UI](screenshots/01-autopilot-cloud-registration.png)
 
 ---
 
@@ -26,6 +26,52 @@ Or from an existing clone:
 ```powershell
 powershell -ExecutionPolicy Bypass -File "C:\src\AutopilotCommandHub\autopilot.ps1"
 ```
+
+---
+
+## 📸 Screenshots
+
+### Autopilot & Cloud Registration
+Device-state banner (reads cached Autopilot profile, MDM enrollment and Entra join from the machine itself), hardware-hash buffer, group tag / user / rename, and the always-visible privilege badge.
+
+![Autopilot & Cloud Registration](screenshots/01-autopilot-cloud-registration.png)
+
+### Skip Autopilot in OOBE
+Finish OOBE as a normal local-account Windows - no Autopilot, no forced enrollment. Run from `Shift`+`F10` at the first OOBE screen, before connecting to a network.
+
+![Skip Autopilot in OOBE](screenshots/06-skip-autopilot-in-oobe.png)
+
+### App Deployment
+Curated Winget bundles with presets; the advisory adapts to whether the device is Intune-managed.
+
+![App Deployment](screenshots/02-app-deployment.png)
+
+### Win32 Packaging & Cloud Publishing
+Build `.intunewin` packages and publish straight to Intune via chunked Azure SAS upload.
+
+![Win32 Packaging](screenshots/03-win32-packaging.png)
+
+### 7-Stage Pre-Flight Diagnostics
+Interface -> Gateway -> DNS -> TLS -> Clock -> Autopilot DNS -> TPM.
+
+![Pre-Flight Diagnostics](screenshots/04-preflight-diagnostics.png)
+
+### Dell Warranty & Refresh
+Service-tag warranty lookup and hardware-refresh verdict via the Dell eAPI.
+
+![Dell Warranty & Refresh](screenshots/05-dell-warranty-refresh.png)
+
+### Privilege Check
+Current vs. preferred privilege level, why it matters, and a guided elevated relaunch.
+
+![Privilege Check](screenshots/10-modal-privilege-guide.png)
+
+### Microsoft Graph / Intune Authentication
+One parent sign-in unlocks every cloud action - Device Code Flow for field techs, App Secret for automation.
+
+Device Code Flow | App Secret
+:---:|:---:
+![Device Code Flow](screenshots/11-modal-auth-device-code.png) | ![App Secret](screenshots/12-modal-auth-app-secret.png)
 
 ---
 
