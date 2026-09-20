@@ -44,7 +44,7 @@ powershell -ExecutionPolicy Bypass -File "C:\src\AutopilotCommandHub\autopilot.p
 ## 🚀 Core Functional Hubs
 
 ### 1. Autopilot & Cloud Registration
-* **High-Speed Hardware Hash Harvester**: Queries WMI `MDM_DevDetail_Ext01` and enforces strict OA3 ASN.1 DER parser verification (`0x30` sequence header, bounds check 2,048–16,384 bytes).
+* **High-Speed Hardware Hash Harvester**: Queries WMI `MDM_DevDetail_Ext01` and validates the genuine OA3 blob (magic `4F 41 33 00` = Base64 prefix `T0EzAA`, 2,048–16,384 bytes). The hub never fabricates a hash: if the provider cannot be read (not elevated, VM without OA3), it reports `HardwareHashStatus = Unavailable` with the reason and blocks Intune registration and CSV export.
 * **Direct Intune Cloud Upload**: Imports hardware identities directly via `https://graph.microsoft.com/v1.0/deviceManagement/importedWindowsAutopilotDeviceIdentities`.
 * **Smart CSV Exporter**: Automatically detects connected USB flash drives (`Win32_Volume` DriveType 2) and saves the standardized Microsoft Intune CSV format.
 * **Dynamic Computer Renaming**: Resolves computer naming patterns (e.g. `WS-%SERIAL%` or `LT-%SERIAL%`) and applies them with a single click.

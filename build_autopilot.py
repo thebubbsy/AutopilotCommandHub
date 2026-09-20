@@ -12,7 +12,7 @@ script_content = r'''<#
     Engineered for rapid field-technician provisioning during Windows Setup (Shift + F10).
 
     Features:
-    - High-Speed Autopilot Hardware Hash Harvester (WMI MDM_DevDetail_Ext01 & OA3 ASN.1 Validation)
+    - High-Speed Autopilot Hardware Hash Harvester (WMI MDM_DevDetail_Ext01 & OA3 magic/bounds validation)
     - Direct Microsoft Intune Cloud Registration via Microsoft Graph API (Device Code Flow & App Secrets)
     - Deployment Profile Assignment Polling (-WaitForSync) & Auto-Reboot Gate
     - Intune CSV Export with Automatic USB Flash Drive Detection
@@ -405,7 +405,12 @@ function Get-AutopilotHash {
         if ($oa3) { $pkid = $oa3 }
     } catch { }
 
-    # 3. Query Official MDM WMI Provider with backoff retry
+    # 3. Query Official MDM WMI Provider with backoff retry.
+    #    There is deliberately NO synthetic fallback: a fabricated hash uploaded to Intune creates an
+    #    Autopilot record that never matches the physical device. If the provider cannot be read we
+    #    report HardwareHashStatus = 'Unavailable' with the reason and every consumer refuses to proceed.
+    $statusReason = ''
+    $lastProviderError = ''
     if ($ManualHash) {
         $hardwareHash = $ManualHash.Trim()
     } else {
@@ -419,39 +424,55 @@ function Get-AutopilotHash {
                     $hardwareHash = $devDetail.DeviceHardwareData
                     break
                 }
+                $lastProviderError = 'MDM_DevDetail_Ext01 returned no DeviceHardwareData'
             } catch {
+                $lastProviderError = $_.Exception.Message
                 Start-Sleep -Milliseconds 600
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($hardwareHash)) {
+            if (-not $script:IsElevated) {
+                $statusReason = "MDM WMI provider requires elevation (run as Administrator / SYSTEM). Provider said: $lastProviderError"
+            } elseif ($model -match 'Virtual|VMware|VirtualBox|Hyper-V|QEMU|KVM' -or $manufacturer -match 'VMware|innotek|QEMU|Xen|Microsoft Corporation') {
+                $statusReason = "Virtual machine without OEM OA3 injection (no hardware hash exists). Provider said: $lastProviderError"
+            } else {
+                $statusReason = "MDM WMI provider (root/cimv2/mdm/dmmap:MDM_DevDetail_Ext01) unavailable after $maxAttempts attempts: $lastProviderError"
             }
         }
     }
 
-    # Fallback to OA3 binary hash synthesis if WMI provider not yet registered in early OOBE
-    if ([string]::IsNullOrWhiteSpace($hardwareHash)) {
-        # Construct hardware payload representation
-        $syntheticPayload = [System.Text.Encoding]::UTF8.GetBytes("AUTOPILOT_OA3_V2:SERIAL=$serial:MFG=$manufacturer:MODEL=$model:DATE=" + [DateTime]::UtcNow.Ticks)
-        $paddedBytes = [byte[]]::new(4096)
-        [Array]::Copy($syntheticPayload, $paddedBytes, [Math]::Min($syntheticPayload.Length, 4096))
-        # Ensure ASN.1 sequence header byte 0x30
-        $paddedBytes[0] = 0x30
-        $hardwareHash = [Convert]::ToBase64String($paddedBytes)
-    }
-
-    # Hash Structural ASN.1 / Base64 Validation
+    # 4. OA3 Structural Validation. Real hashes are OEM Activation 3.0 blobs: 4-byte magic 'OA3\0'
+    #    (0x4F 0x41 0x33 0x00 => Base64 prefix "T0EzAA") followed by a 2048-16384 byte body.
+    #    They are NOT ASN.1 DER, so no 0x30 SEQUENCE check and no deeper parsing.
     $hashBytes = $null
     $hashValid = $false
-    try {
-        $hashBytes = [Convert]::FromBase64String($hardwareHash.Trim())
-        if ($hashBytes.Length -ge 1024 -and $hashBytes.Length -le 16384) {
-            $hashValid = $true
+    if (-not [string]::IsNullOrWhiteSpace($hardwareHash)) {
+        try {
+            $hashBytes = [Convert]::FromBase64String($hardwareHash.Trim())
+            $oa3Magic = [byte[]](0x4F, 0x41, 0x33, 0x00)
+            $magicOk = $hashBytes.Length -ge 4
+            for ($m = 0; $magicOk -and $m -lt 4; $m++) { if ($hashBytes[$m] -ne $oa3Magic[$m]) { $magicOk = $false } }
+            if (-not $magicOk) {
+                $statusReason = "Payload is not an OA3 blob (expected magic 4F 41 33 00 / Base64 'T0EzAA', got '$($hardwareHash.Substring(0, [Math]::Min(8, $hardwareHash.Length)))')"
+            } elseif ($hashBytes.Length -lt 2048 -or $hashBytes.Length -gt 16384) {
+                $statusReason = "OA3 blob length $($hashBytes.Length) bytes is outside the 2048-16384 byte Autopilot range"
+            } else {
+                $hashValid = $true
+            }
+        } catch {
+            $statusReason = "Hash is not valid Base64: $($_.Exception.Message)"
         }
-    } catch { }
+    }
 
     $resultObj = [PSCustomObject]@{
         SerialNumber       = $serial
         Model              = $model
         Manufacturer       = $manufacturer
         WindowsProductId   = if ($pkid) { $pkid } else { '' }
-        HardwareHash       = $hardwareHash.Trim()
+        HardwareHash       = if ($hashValid) { $hardwareHash.Trim() } else { '' }
+        HardwareHashStatus = if ($hashValid) { 'Captured' } else { 'Unavailable' }
+        StatusReason       = $statusReason
         HashLengthBytes    = if ($hashBytes) { $hashBytes.Length } else { 0 }
         IsValidStructure   = $hashValid
         GroupTag           = $GroupTag
@@ -462,6 +483,9 @@ function Get-AutopilotHash {
     $script:CachedHashInfo = $resultObj
 
     if ($Format -eq 'Csv') {
+        if (-not $hashValid) {
+            throw "Cannot emit an Intune CSV row without a genuine hardware hash. $statusReason"
+        }
         return "$serial,$pkid,$($hardwareHash.Trim()),$GroupTag,$AssignedUser"
     } elseif ($Format -eq 'Json') {
         return ($resultObj | ConvertTo-Json -Depth 3)
@@ -509,6 +533,10 @@ function Export-AutopilotCsv {
         } else {
             $targetPath = "$env:TEMP\Autopilot-Devices.csv"
         }
+    }
+
+    if (-not $item.IsValidStructure -or [string]::IsNullOrWhiteSpace($item.HardwareHash)) {
+        throw "Refusing to write an Intune CSV row without a genuine OA3 hardware hash. $($item.StatusReason)"
     }
 
     $encoding = Get-ScriptEncoding
@@ -1108,6 +1136,9 @@ function Register-AutopilotDevice {
     }
 
     $hashObj = Get-AutopilotHash -GroupTag $GroupTag -AssignedUser $AssignedUser
+    if (-not $hashObj.IsValidStructure) {
+        throw "Refusing to register device with Intune: no genuine OA3 hardware hash. $($hashObj.StatusReason)"
+    }
 
     $headers = @{
         'Authorization' = "Bearer $AccessToken"
@@ -2814,18 +2845,24 @@ function Start-AutopilotHubGui {
         $usr = $txtAssignedUser.Text
 
         $hashInfo = Get-AutopilotHash -GroupTag $gt -AssignedUser $usr
-        Set-HubProgress -Percent 80 -Status "Validating OA3 ASN.1"
+        Set-HubProgress -Percent 80 -Status "Validating OA3 structure"
 
-        if ($hashInfo -and $hashInfo.HardwareHash) {
+        if ($hashInfo -and $hashInfo.IsValidStructure) {
             $txtHashBox.Text = $hashInfo.HardwareHash
-            $txtHashStatus.Text = "VALIDATED 4K HASH"
+            $txtHashStatus.Text = "VALIDATED OA3 HASH"
             $badgeHashStatus.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#059669")
             $txtHashStatus.Foreground = [System.Windows.Media.Brushes]::White
             $txtHashMeta.Text = "Serial: $($hashInfo.SerialNumber) | Length: $($hashInfo.HashLengthBytes) bytes | GroupTag: '$($hashInfo.GroupTag)'"
             Write-HubLog "Hardware hash harvested successfully ($($hashInfo.HashLengthBytes) bytes)." "SUCCESS"
             Set-HubProgress -Percent 100 -Status "Hash Ready"
         } else {
-            Write-HubLog "Failed to capture hardware hash from MDM WMI provider." "ERROR"
+            $txtHashBox.Text = ''
+            $txtHashStatus.Text = "HASH UNAVAILABLE"
+            $badgeHashStatus.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#5C2B29")
+            $txtHashStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FF99A4")
+            $reason = if ($hashInfo) { $hashInfo.StatusReason } else { 'Get-AutopilotHash returned nothing' }
+            $txtHashMeta.Text = "Serial: $($hashInfo.SerialNumber) | No genuine hardware hash - registration and CSV export are blocked"
+            Write-HubLog "Hardware hash unavailable: $reason" "ERROR"
             Set-HubProgress -Percent 0 -Status "Harvest Failed"
         }
     })
