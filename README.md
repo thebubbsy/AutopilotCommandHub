@@ -61,6 +61,11 @@ Service-tag warranty lookup and hardware-refresh verdict via the Dell eAPI.
 
 ![Dell Warranty & Refresh](screenshots/05-dell-warranty-refresh.png)
 
+### Hybrid Azure AD Join & Co-Management
+On-device diagnostics and one-click fixes for the things that break in a hybrid (on-prem domain + Entra) co-managed environment: join/PRT state, forced Intune sync, IME health, co-management workload ownership, DC line-of-sight, BitLocker escrow, CA readiness and a helpdesk diagnostics bundle.
+
+![Hybrid & Co-Management](screenshots/07-hybrid-comgmt.png)
+
 ### Privilege Check
 Current vs. preferred privilege level, why it matters, and a guided elevated relaunch.
 
@@ -126,6 +131,15 @@ The Hub is built to run in two very different places - the OOBE `Shift+F10` prom
   * 🔴 **REFRESH RECOMMENDED (DECOMMISSION / OUT OF WARRANTY)**
 * **Detailed SLA Telemetry**: System model, product line, factory ship date, device age in years/days, and complete contract entitlements table.
 * **Export Options**: Copy Markdown audit report to clipboard or export audit CSV to USB.
+
+### 5b. Hybrid Azure AD Join & Co-Management Toolset
+For hybrid (on-prem domain-joined **and** Entra-registered) and co-managed (ConfigMgr + Intune) devices - where identity, policy authority, network trust and update channels all change and quietly fail. Every action is local and degrades gracefully off-domain; write actions require elevation.
+
+* **Join & Identity**: decoded `dsregcmd` (join type, PRT/SSO-token health, tenant, device ID), retry hybrid Azure AD join, and a machine secure-channel test (`Test-ComputerSecureChannel`) for the "trust relationship failed" case.
+* **MDM / Intune**: force an immediate Intune sync (the `EnterpriseMgmt` PushLaunch task), Intune Management Extension health + one-click restart (when IME hangs, Win32 apps and PS scripts silently stop), and force GPO-style MDM auto-enrollment.
+* **Co-Management**: decodes the ConfigMgr/Intune workload authority bitmask so you can see, per workload (Compliance, Device Config, Endpoint Protection, Client Apps, Office, Windows Update, Resource Access), whether **Intune or ConfigMgr wins** - the usual source of "conflicting policy" mysteries. Plus trigger a ConfigMgr machine-policy retrieval.
+* **Policy & Connectivity**: DC line-of-sight (`nltest /dsgetdc`), `gpupdate /force`, and domain time resync (`w32tm`) for the Kerberos/cert failures that clock skew causes.
+* **Compliance / Security / Diagnostics**: Conditional Access readiness (Entra join + PRT + MDM enrollment) so you know *why* a device is blocked; one-click BitLocker recovery-key escrow to Entra (and AD); a legacy-dependency scan (SMBv1, NTLM level, Credential Guard, mapped drives) for what security baselines will break; machine certificate expiry (802.1x/VPN/SCEP); and a **Collect Hybrid Diagnostics** bundle (`dsregcmd`, `gpresult`, `mdmdiagnosticstool`, IME logs) zipped for the helpdesk.
 
 ### 5. 7-Stage Pre-Flight Network & Hardware Ladder
 1. **Network Interface**: Verifies active physical adapter is in `Up` status.

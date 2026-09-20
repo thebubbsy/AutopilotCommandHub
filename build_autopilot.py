@@ -662,6 +662,374 @@ function Show-PrivilegeGuide {
     return $result.Relaunched
 }
 
+# ==============================================================================
+# HYBRID AZURE AD JOIN & CO-MANAGEMENT TOOLSET
+# Everything here degrades gracefully off-domain (returns 'n/a' rather than throwing),
+# so the Hub still runs on a workgroup bench machine.
+# ==============================================================================
+
+function Invoke-DsregStatus {
+    # Parse `dsregcmd /status` into a case-insensitive hashtable of Key = Value.
+    $map = @{}
+    try {
+        $exe = Join-Path $env:SystemRoot 'System32\dsregcmd.exe'
+        if (-not (Test-Path $exe)) { return $map }
+        foreach ($line in (& $exe /status 2>$null)) {
+            if ($line -match '^\s*([A-Za-z0-9_ ]+?)\s*:\s*(.+?)\s*$') {
+                $map[$Matches[1].Trim()] = $Matches[2].Trim()
+            }
+        }
+    } catch { }
+    return $map
+}
+
+function Get-HybridJoinState {
+    $d = Invoke-DsregStatus
+    $aadj   = ($d['AzureAdJoined'] -eq 'YES')
+    $domain = ($d['DomainJoined'] -eq 'YES')
+    $prt    = ($d['AzureAdPrt'] -eq 'YES')
+    $entJoined = ($d['EnterpriseJoined'] -eq 'YES')
+
+    $joinType = if ($aadj -and $domain) { 'Hybrid Azure AD Joined' }
+                elseif ($aadj)          { 'Azure AD Joined (cloud only)' }
+                elseif ($domain)        { 'On-prem Domain Joined only' }
+                elseif ($entJoined)     { 'Enterprise (ADFS) Joined' }
+                else                    { 'Workgroup / Not joined' }
+
+    [PSCustomObject]@{
+        JoinType       = $joinType
+        AzureAdJoined  = $aadj
+        DomainJoined   = $domain
+        EnterpriseJoined = $entJoined
+        HasPrt         = $prt
+        DeviceId       = $d['DeviceId']
+        TenantName     = $d['TenantName']
+        TenantId       = $d['TenantId']
+        IdpDomain      = $d['IdpDomain']
+        MdmUrl         = $d['MdmUrl']
+        DomainName     = $d['DomainName']
+        DcName         = $d['KeySignTest'] # placeholder; DC comes from Test-DomainConnectivity
+        PrtAuthority   = $d['AzureAdPrtAuthority']
+        Raw            = $d
+        IsHybrid       = ($aadj -and $domain)
+    }
+}
+
+function Get-MdmEnrollmentInfo {
+    $info = [PSCustomObject]@{ Enrolled = $false; EnrollmentId = ''; Provider = ''; Upn = ''; MdmUrl = '' }
+    try {
+        foreach ($k in @(Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue)) {
+            $pv = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
+            if ($pv -and $pv.ProviderID -eq 'MS DM Server') {
+                $info.Enrolled = $true; $info.EnrollmentId = $k.PSChildName; $info.Provider = $pv.ProviderID
+                if ($pv.UPN) { $info.Upn = [string]$pv.UPN }
+                if ($pv.DiscoveryServiceFullURL) { $info.MdmUrl = [string]$pv.DiscoveryServiceFullURL }
+                break
+            }
+        }
+    } catch { }
+    return $info
+}
+
+function Invoke-MdmSync {
+    # Kick the EnterpriseMgmt "PushLaunch" scheduled task(s) that trigger an immediate MDM/Intune sync.
+    $ran = [System.Collections.Generic.List[string]]::new()
+    try {
+        $tasks = @(Get-ScheduledTask -TaskPath '\Microsoft\Windows\EnterpriseMgmt\*' -ErrorAction SilentlyContinue |
+                   Where-Object { $_.TaskName -match 'PushLaunch|Schedule #3|Login' })
+        if ($tasks.Count -eq 0) {
+            $tasks = @(Get-ScheduledTask -TaskPath '\Microsoft\Windows\EnterpriseMgmt\*' -ErrorAction SilentlyContinue)
+        }
+        foreach ($t in $tasks) {
+            try { Start-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction Stop; $ran.Add($t.TaskName) } catch { }
+        }
+    } catch { }
+    # Fallback: the modern sync ML client
+    if ($ran.Count -eq 0) {
+        try {
+            $ml = Join-Path $env:SystemRoot 'System32\deviceenroller.exe'
+            if (Test-Path $ml) { Start-Process $ml -ArgumentList '/o /c' -WindowStyle Hidden -ErrorAction Stop; $ran.Add('deviceenroller /o /c') }
+        } catch { }
+    }
+    return ,$ran
+}
+
+function Invoke-MdmAutoEnroll {
+    # GPO-style auto-enrollment into Intune using the device's Entra identity.
+    try {
+        $exe = Join-Path $env:SystemRoot 'System32\deviceenroller.exe'
+        if (-not (Test-Path $exe)) { return 'deviceenroller.exe not present on this build' }
+        Start-Process $exe -ArgumentList '/c /AutoEnrollMDM' -WindowStyle Hidden -ErrorAction Stop
+        return 'Triggered deviceenroller /c /AutoEnrollMDM'
+    } catch { return "Auto-enroll failed: $($_.Exception.Message)" }
+}
+
+function Get-IntuneExtensionHealth {
+    $svc = Get-Service -Name 'Microsoft Intune Management Extension' -ErrorAction SilentlyContinue
+    $logDir = 'C:\ProgramData\Microsoft\IntuneManagementExtension\Logs'
+    $lastLog = $null
+    if (Test-Path $logDir) {
+        $lastLog = Get-ChildItem $logDir -Filter *.log -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    }
+    [PSCustomObject]@{
+        Installed   = [bool]$svc
+        Status      = if ($svc) { [string]$svc.Status } else { 'Not installed' }
+        StartType   = if ($svc) { [string]$svc.StartType } else { '' }
+        LogDir      = $logDir
+        LastLogFile = if ($lastLog) { $lastLog.Name } else { '' }
+        LastLogTime = if ($lastLog) { $lastLog.LastWriteTime } else { $null }
+        StaleMins   = if ($lastLog) { [int]((Get-Date) - $lastLog.LastWriteTime).TotalMinutes } else { -1 }
+    }
+}
+
+function Restart-IntuneExtension {
+    try {
+        $svc = Get-Service -Name 'Microsoft Intune Management Extension' -ErrorAction Stop
+        Restart-Service -InputObject $svc -Force -ErrorAction Stop
+        return 'Restarted Microsoft Intune Management Extension'
+    } catch { return "Could not restart IME: $($_.Exception.Message)" }
+}
+
+function Get-CoManagementState {
+    # Decode the ConfigMgr co-management workload bitmask (which authority owns each workload).
+    $workloadBits = [ordered]@{
+        1   = 'Compliance Policies'
+        2   = 'Resource Access Policies (Wi-Fi/VPN/Cert/Email)'
+        4   = 'Device Configuration'
+        8   = 'Endpoint Protection (Defender)'
+        16  = 'Client Apps'
+        32  = 'Office Click-to-Run Apps'
+        64  = 'Windows Update Policies'
+    }
+    $flags = $null
+    foreach ($path in @('HKLM:\SOFTWARE\Microsoft\CCM\CoManagementFlags', 'HKLM:\SOFTWARE\Microsoft\CCM')) {
+        try {
+            $pv = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+            if ($pv) {
+                foreach ($n in @('ComanagementWorkloads', 'CoManagementFlags', 'Workloads')) {
+                    if ($null -ne $pv.$n) { $flags = [int]$pv.$n; break }
+                }
+            }
+        } catch { }
+        if ($null -ne $flags) { break }
+    }
+    $ccmPresent = [bool](Get-Service -Name CcmExec -ErrorAction SilentlyContinue)
+    $rows = foreach ($bit in $workloadBits.Keys) {
+        [PSCustomObject]@{
+            Workload = $workloadBits[$bit]
+            Authority = if ($null -eq $flags) { if ($ccmPresent) { 'ConfigMgr (default)' } else { 'Intune' } }
+                        elseif ($flags -band $bit) { 'Intune' } else { 'ConfigMgr' }
+        }
+    }
+    [PSCustomObject]@{
+        CoManaged     = ($null -ne $flags)
+        ConfigMgrPresent = $ccmPresent
+        FlagsValue    = $flags
+        Workloads     = @($rows)
+    }
+}
+
+function Invoke-ConfigMgrClientAction {
+    param([string]$ScheduleId = '{00000000-0000-0000-0000-000000000021}') # Machine Policy Retrieval & Evaluation
+    try {
+        if (-not (Get-Service -Name CcmExec -ErrorAction SilentlyContinue)) { return 'ConfigMgr (SCCM) client is not installed on this device.' }
+        Invoke-CimMethod -Namespace 'root\ccm' -ClassName 'SMS_Client' -MethodName 'TriggerSchedule' -Arguments @{ sScheduleID = $ScheduleId } -ErrorAction Stop | Out-Null
+        return "Triggered ConfigMgr schedule $ScheduleId (Machine Policy Retrieval & Evaluation)"
+    } catch { return "ConfigMgr trigger failed: $($_.Exception.Message)" }
+}
+
+function Test-DomainConnectivity {
+    $result = [PSCustomObject]@{ Applicable = $false; DcName = ''; DcReachable = $false; SecureChannel = 'n/a'; Site = ''; Message = '' }
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    if (-not $cs -or -not $cs.PartOfDomain) { $result.Message = 'Not domain-joined; DC checks not applicable.'; return $result }
+    $result.Applicable = $true
+    try {
+        $nltest = & (Join-Path $env:SystemRoot 'System32\nltest.exe') /dsgetdc: 2>$null
+        foreach ($l in $nltest) {
+            if ($l -match 'DC:\s*\\\\(\S+)') { $result.DcName = $Matches[1] }
+            if ($l -match 'Dc Site Name:\s*(\S+)') { $result.Site = $Matches[1] }
+        }
+    } catch { }
+    if ($result.DcName) {
+        try { $result.DcReachable = Test-Connection -ComputerName $result.DcName -Count 1 -Quiet -ErrorAction SilentlyContinue } catch { }
+    }
+    try {
+        $sc = Test-ComputerSecureChannel -ErrorAction SilentlyContinue
+        $result.SecureChannel = if ($sc) { 'Healthy' } else { 'BROKEN (trust relationship failed)' }
+    } catch { $result.SecureChannel = 'Unknown' }
+    $result.Message = "DC $($result.DcName) reachable=$($result.DcReachable), secure channel: $($result.SecureChannel)"
+    return $result
+}
+
+function Invoke-GpUpdateForce {
+    try {
+        $out = & (Join-Path $env:SystemRoot 'System32\gpupdate.exe') /force 2>&1
+        return ($out | Out-String).Trim()
+    } catch { return "gpupdate failed: $($_.Exception.Message)" }
+}
+
+function Sync-DomainTime {
+    try {
+        & (Join-Path $env:SystemRoot 'System32\w32tm.exe') /resync /force 2>&1 | Out-Null
+        $src = (& (Join-Path $env:SystemRoot 'System32\w32tm.exe') /query /source 2>$null) -join ''
+        return "Resynced system clock. Time source: $src"
+    } catch { return "Time resync failed: $($_.Exception.Message)" }
+}
+
+function Get-BitLockerEscrowState {
+    $vol = $null
+    try { $vol = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction Stop } catch { }
+    if (-not $vol) { return [PSCustomObject]@{ Available = $false; Message = 'BitLocker cmdlets unavailable or access denied (needs elevation).' } }
+    $rp = @($vol.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' })
+    [PSCustomObject]@{
+        Available        = $true
+        MountPoint       = $vol.MountPoint
+        ProtectionStatus = [string]$vol.ProtectionStatus
+        VolumeStatus     = [string]$vol.VolumeStatus
+        RecoveryProtectors = $rp.Count
+        KeyProtectorIds  = @($rp | ForEach-Object { $_.KeyProtectorId })
+        Message          = "Protection $($vol.ProtectionStatus), $($rp.Count) recovery-password protector(s)"
+    }
+}
+
+function Invoke-BitLockerEscrow {
+    # Back up every recovery-password protector to Entra ID (BackupToAAD) and, if domain-joined, to AD.
+    $done = [System.Collections.Generic.List[string]]::new()
+    try {
+        $vol = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction Stop
+        $rp = @($vol.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' })
+        if ($rp.Count -eq 0) { return 'No recovery-password protector to escrow. Add one first (Add-BitLockerKeyProtector -RecoveryPasswordProtector).' }
+        $domainJoined = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).PartOfDomain
+        foreach ($k in $rp) {
+            try { BackupToAAD-BitLockerKeyProtector -MountPoint $env:SystemDrive -KeyProtectorId $k.KeyProtectorId -ErrorAction Stop | Out-Null; $done.Add("Entra: $($k.KeyProtectorId)") } catch { $done.Add("Entra FAILED: $($_.Exception.Message)") }
+            if ($domainJoined) {
+                try { Backup-BitLockerKeyProtector -MountPoint $env:SystemDrive -KeyProtectorId $k.KeyProtectorId -ErrorAction Stop | Out-Null; $done.Add("AD: $($k.KeyProtectorId)") } catch { }
+            }
+        }
+    } catch { return "BitLocker escrow failed: $($_.Exception.Message)" }
+    return ($done -join '; ')
+}
+
+function Get-CaReadiness {
+    # Composite "will Conditional Access let this device through?" signal from local evidence.
+    $j = Get-HybridJoinState
+    $m = Get-MdmEnrollmentInfo
+    $checks = [ordered]@{
+        'Entra joined (or hybrid joined)' = $j.AzureAdJoined
+        'Primary Refresh Token present'   = $j.HasPrt
+        'Enrolled in Intune (MDM)'        = $m.Enrolled
+    }
+    $blockers = @($checks.GetEnumerator() | Where-Object { -not $_.Value } | ForEach-Object { $_.Key })
+    [PSCustomObject]@{
+        Checks   = $checks
+        Ready    = ($blockers.Count -eq 0)
+        Blockers = $blockers
+        Note     = 'Device compliance itself is evaluated server-side in Intune; confirm the compliance state in the portal.'
+    }
+}
+
+function Get-LegacyDependencyState {
+    # Local "what will bite you when cloud security baselines / NTLM-blocking / CG land" scan.
+    $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    # SMBv1 - removed/blocked by most security baselines; on-prem shares may still need it
+    try {
+        $smb1 = Get-SmbServerConfiguration -ErrorAction SilentlyContinue
+        if ($smb1 -and $smb1.EnableSMB1Protocol) {
+            $findings.Add([PSCustomObject]@{ Item='SMBv1'; State='ENABLED'; Risk='High'; Note='Legacy/insecure; disabled by security baselines. Confirm no dependency before hardening.' })
+        } else {
+            $findings.Add([PSCustomObject]@{ Item='SMBv1'; State='Disabled'; Risk='OK'; Note='' })
+        }
+    } catch { }
+
+    # NTLM restriction level (LmCompatibilityLevel) + outbound NTLM auditing/blocking
+    try {
+        $lsa = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -ErrorAction SilentlyContinue
+        $lm = if ($lsa -and $null -ne $lsa.LmCompatibilityLevel) { [int]$lsa.LmCompatibilityLevel } else { -1 }
+        $lmNote = switch ($lm) { 5 {'Send NTLMv2 only, refuse LM & NTLM (hardened)'} 3 {'Send NTLMv2 only (default)'} -1 {'Not set (OS default = 3)'} default {"Level $lm"} }
+        $findings.Add([PSCustomObject]@{ Item='NTLM (LmCompatibilityLevel)'; State=$lmNote; Risk=$(if ($lm -le 2 -and $lm -ge 0){'Medium'}else{'OK'}); Note='Cloud tenants increasingly block NTLM; legacy apps that force NTLM will break.' })
+    } catch { }
+
+    # Credential Guard (Win32_DeviceGuard) - often forced on by baselines; can break some VPN/creds tooling
+    try {
+        $dg = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction SilentlyContinue
+        $cgRunning = $dg -and ($dg.SecurityServicesRunning -contains 1)
+        $findings.Add([PSCustomObject]@{ Item='Credential Guard'; State=$(if ($cgRunning){'Running'}else{'Not running'}); Risk='OK'; Note='Baselines enable it; some legacy credential managers/VPNs misbehave with it on.' })
+    } catch { }
+
+    # DFS / mapped-drive dependency hint
+    try {
+        $mapped = @(Get-CimInstance Win32_NetworkConnection -ErrorAction SilentlyContinue)
+        if ($mapped.Count -gt 0) {
+            $findings.Add([PSCustomObject]@{ Item='Mapped network drives'; State="$($mapped.Count) mapped"; Risk='Info'; Note='Domain/DFS shares need line-of-sight to a DC; cloud-only devices lose these.' })
+        }
+    } catch { }
+
+    return ,@($findings)
+}
+
+function Get-ClientCertificateHealth {
+    param([int]$WarnDays = 30)
+    # Machine certs that matter for hybrid: client-auth (802.1x/VPN/SCEP) and anything expiring soon.
+    $rows = [System.Collections.Generic.List[PSCustomObject]]::new()
+    try {
+        $now = Get-Date
+        foreach ($c in (Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue)) {
+            $eku = @($c.EnhancedKeyUsageList | ForEach-Object { $_.FriendlyName })
+            $isClientAuth = ($eku -match 'Client Authentication') -or ($c.Extensions.EnhancedKeyUsages.Value -contains '1.3.6.1.5.5.7.3.2')
+            $days = [int]($c.NotAfter - $now).TotalDays
+            if ($isClientAuth -or $days -le $WarnDays) {
+                $rows.Add([PSCustomObject]@{
+                    Subject   = ($c.Subject -replace '^CN=', '')
+                    Issuer    = ($c.Issuer -replace '.*CN=([^,]+).*', '$1')
+                    NotAfter  = $c.NotAfter.ToString('yyyy-MM-dd')
+                    DaysLeft  = $days
+                    ClientAuth= [bool]$isClientAuth
+                    State     = if ($days -lt 0) { 'EXPIRED' } elseif ($days -le $WarnDays) { "Expiring ($days d)" } else { 'Valid' }
+                })
+            }
+        }
+    } catch { }
+    return ,@($rows | Sort-Object DaysLeft)
+}
+
+function New-HybridDiagnosticsBundle {
+    param([string]$OutputDir = '')
+    if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        $OutputDir = if ($desktop -and (Test-Path $desktop)) { $desktop } else { $env:TEMP }
+    }
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $work = Join-Path $env:TEMP "HubDiag_$stamp"
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    try {
+        try { & (Join-Path $env:SystemRoot 'System32\dsregcmd.exe') /status *> (Join-Path $work 'dsregcmd.txt') } catch { }
+        try { & (Join-Path $env:SystemRoot 'System32\gpresult.exe') /h (Join-Path $work 'gpresult.html') /f 2>$null | Out-Null } catch { }
+        try { Get-HybridJoinState | Format-List | Out-File (Join-Path $work 'joinstate.txt') } catch { }
+        try { (Get-CoManagementState).Workloads | Format-Table -AutoSize | Out-File (Join-Path $work 'comgmt-workloads.txt') } catch { }
+        # Official MDM diagnostics (enrollment/provisioning/autopilot/TPM)
+        try {
+            $mdmTool = Join-Path $env:SystemRoot 'System32\mdmdiagnosticstool.exe'
+            if (Test-Path $mdmTool) { & $mdmTool -area 'DeviceEnrollment;DeviceProvisioning;Autopilot;TPM' -zip (Join-Path $work 'mdmdiag.zip') 2>$null | Out-Null }
+        } catch { }
+        # Copy the most recent IME logs
+        try {
+            $imeLogs = 'C:\ProgramData\Microsoft\IntuneManagementExtension\Logs'
+            if (Test-Path $imeLogs) {
+                $dst = Join-Path $work 'IME-Logs'; New-Item -ItemType Directory -Path $dst -Force | Out-Null
+                Get-ChildItem $imeLogs -Filter *.log | Sort-Object LastWriteTime -Descending | Select-Object -First 6 | Copy-Item -Destination $dst -Force -ErrorAction SilentlyContinue
+            }
+        } catch { }
+        $zip = Join-Path $OutputDir "HybridDiagnostics_$($env:COMPUTERNAME)_$stamp.zip"
+        if (Test-Path $zip) { Remove-Item $zip -Force }
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($work, $zip)
+        return $zip
+    } finally {
+        Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # --- Function: Test-StagedNetwork (IntuneShared Core) ---
 function Test-StagedNetwork {
     [CmdletBinding()]
@@ -3000,6 +3368,118 @@ function Start-AutopilotHubGui {
                     </Grid>
                 </Border>
             </TabItem>
+
+            <!-- TAB 6: HYBRID AZURE AD JOIN & CO-MANAGEMENT TOOLSET -->
+            <TabItem Header="Hybrid &amp; Co-Mgmt">
+                <Grid Margin="0,12,0,0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="150"/>
+                    </Grid.RowDefinitions>
+
+                    <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+
+                            <!-- Card: Join & Identity -->
+                            <Border Grid.Row="0" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                                <StackPanel>
+                                    <TextBlock Text="JOIN &amp; IDENTITY" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
+                                    <TextBlock Name="TxtHybJoin" Text="Click Refresh to read dsregcmd join state, PRT and tenant." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <WrapPanel>
+                                        <Button Name="BtnHybRefresh" Content="Refresh State" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybRetryJoin" Content="Retry Hybrid Join" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybSecChan" Content="Test Secure Channel" Margin="0,0,6,6" Padding="10,5"/>
+                                    </WrapPanel>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card: MDM / Intune -->
+                            <Border Grid.Row="0" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                                <StackPanel>
+                                    <TextBlock Text="MDM / INTUNE" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
+                                    <TextBlock Name="TxtHybMdm" Text="Enrollment + Intune Management Extension health." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <WrapPanel>
+                                        <Button Name="BtnHybSync" Content="Force Intune Sync" Style="{StaticResource AccentBtn}" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybRestartIme" Content="Restart IME" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybEnroll" Content="Force MDM Enroll" Margin="0,0,6,6" Padding="10,5"/>
+                                    </WrapPanel>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card: Co-Management -->
+                            <Border Grid.Row="1" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                                <StackPanel>
+                                    <TextBlock Text="CO-MANAGEMENT (WHO OWNS EACH WORKLOAD)" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
+                                    <TextBlock Name="TxtHybComgmt" Text="Decode the ConfigMgr/Intune workload authority bitmask." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                                    <ListBox Name="LstHybWorkloads" Height="120" Background="#1F1F1F" BorderBrush="#383838" Margin="0,0,0,8">
+                                        <ListBox.ItemTemplate>
+                                            <DataTemplate>
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*"/>
+                                                        <ColumnDefinition Width="120"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock Text="{Binding Workload}" Foreground="#D0D0D0" FontSize="11"/>
+                                                    <TextBlock Grid.Column="1" Text="{Binding Authority}" Foreground="#6CCB5F" FontSize="11" FontWeight="SemiBold"/>
+                                                </Grid>
+                                            </DataTemplate>
+                                        </ListBox.ItemTemplate>
+                                    </ListBox>
+                                    <WrapPanel>
+                                        <Button Name="BtnHybComgmt" Content="Read Workloads" Margin="0,0,6,0" Padding="10,5"/>
+                                        <Button Name="BtnHybCcm" Content="Trigger ConfigMgr Policy" Margin="0,0,6,0" Padding="10,5"/>
+                                    </WrapPanel>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card: Policy & Connectivity -->
+                            <Border Grid.Row="1" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                                <StackPanel>
+                                    <TextBlock Text="POLICY &amp; CONNECTIVITY" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
+                                    <TextBlock Name="TxtHybNet" Text="DC line-of-sight, Group Policy and domain time." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <WrapPanel>
+                                        <Button Name="BtnHybDc" Content="Test DC Line-of-Sight" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybGpupdate" Content="gpupdate /force" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybTime" Content="Resync Domain Time" Margin="0,0,6,6" Padding="10,5"/>
+                                    </WrapPanel>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card: Compliance, BitLocker, Legacy & Certs -->
+                            <Border Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,0,10">
+                                <StackPanel>
+                                    <TextBlock Text="COMPLIANCE / SECURITY / DIAGNOSTICS" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
+                                    <TextBlock Name="TxtHybCompliance" Text="Conditional Access readiness, BitLocker escrow, legacy-dependency scan, certificate expiry, and a helpdesk log bundle." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <WrapPanel>
+                                        <Button Name="BtnHybCa" Content="Check CA Readiness" Style="{StaticResource AccentBtn}" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybBitlocker" Content="Escrow BitLocker Keys" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybLegacy" Content="Legacy Dependency Scan" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybCerts" Content="Certificate Health" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybBundle" Content="Collect Hybrid Diagnostics (.zip)" Margin="0,0,6,6" Padding="10,5"/>
+                                    </WrapPanel>
+                                </StackPanel>
+                            </Border>
+                        </Grid>
+                    </ScrollViewer>
+
+                    <!-- Tab-local output pane -->
+                    <Border Grid.Row="1" Background="#161616" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Margin="0,4,0,0">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto">
+                            <TextBox Name="TxtHybOut" Background="Transparent" Foreground="#D0D0D0" BorderThickness="0" FontFamily="Consolas" FontSize="11.5" IsReadOnly="True" TextWrapping="Wrap" Padding="10" Text="Hybrid &amp; co-management tools. Elevated (SYSTEM/Administrator) is required for most actions - use Fix Privileges in the header."/>
+                        </ScrollViewer>
+                    </Border>
+                </Grid>
+            </TabItem>
+
         </TabControl>
 
         <!-- PROGRESS BAR & STATUS -->
@@ -3189,6 +3669,30 @@ function Start-AutopilotHubGui {
     $btnPublishIntune  = $window.FindName('BtnPublishIntune')
 
     $btnRunDiag        = $window.FindName('BtnRunDiag')
+    # Hybrid & Co-Mgmt tab
+    $txtHybOut         = $window.FindName('TxtHybOut')
+    $txtHybJoin        = $window.FindName('TxtHybJoin')
+    $txtHybMdm         = $window.FindName('TxtHybMdm')
+    $txtHybComgmt      = $window.FindName('TxtHybComgmt')
+    $txtHybNet         = $window.FindName('TxtHybNet')
+    $txtHybCompliance  = $window.FindName('TxtHybCompliance')
+    $lstHybWorkloads   = $window.FindName('LstHybWorkloads')
+    $btnHybRefresh     = $window.FindName('BtnHybRefresh')
+    $btnHybRetryJoin   = $window.FindName('BtnHybRetryJoin')
+    $btnHybSecChan     = $window.FindName('BtnHybSecChan')
+    $btnHybSync        = $window.FindName('BtnHybSync')
+    $btnHybRestartIme  = $window.FindName('BtnHybRestartIme')
+    $btnHybEnroll      = $window.FindName('BtnHybEnroll')
+    $btnHybComgmt      = $window.FindName('BtnHybComgmt')
+    $btnHybCcm         = $window.FindName('BtnHybCcm')
+    $btnHybDc          = $window.FindName('BtnHybDc')
+    $btnHybGpupdate    = $window.FindName('BtnHybGpupdate')
+    $btnHybTime        = $window.FindName('BtnHybTime')
+    $btnHybCa          = $window.FindName('BtnHybCa')
+    $btnHybBitlocker   = $window.FindName('BtnHybBitlocker')
+    $btnHybLegacy      = $window.FindName('BtnHybLegacy')
+    $btnHybCerts       = $window.FindName('BtnHybCerts')
+    $btnHybBundle      = $window.FindName('BtnHybBundle')
     $lstDiagStages     = $window.FindName('LstDiagStages')
 
     $hubProgressBar    = $window.FindName('HubProgressBar')
@@ -3763,6 +4267,144 @@ function Start-AutopilotHubGui {
         Write-HubLog "Active Graph session verified for tenant $($script:GraphAuthContext.TenantId)." "SUCCESS"
         Write-HubLog "Ready to upload .intunewin package '$($txtPkgDisplayName.Text)' ($($txtPkgId.Text)) to Microsoft Intune mobileApps." "INFO"
         [System.Windows.MessageBox]::Show("Authenticated as $($script:GraphAuthContext.TenantId).`n`nReady to publish '$($txtPkgDisplayName.Text)' directly to Intune mobileApps.", "Intune Cloud Publisher", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+    })
+
+    # --- Hybrid & Co-Mgmt tab helpers ---
+    function Write-HybOut {
+        param([string]$Message, [string]$Level = 'INFO')
+        $ts = (Get-Date).ToString('HH:mm:ss')
+        $txtHybOut.AppendText("`r`n[$ts] [$Level] $Message")
+        $txtHybOut.ScrollToEnd()
+        Write-HubLog $Message $Level
+        Update-WpfUI
+    }
+    function Assert-HybElevated {
+        if (-not $script:RuntimeContext.MeetsPreferred) {
+            Write-HybOut "This action needs elevation (SYSTEM/Administrator). Use 'Fix Privileges' in the header." "WARN"
+            return $false
+        }
+        return $true
+    }
+
+    $btnHybRefresh.Add_Click({
+        Write-HybOut "Reading join/identity state (dsregcmd)..."
+        $j = Get-HybridJoinState
+        $prt = if ($j.HasPrt) { 'present' } else { 'MISSING' }
+        $txtHybJoin.Text = "$($j.JoinType). PRT: $prt. Tenant: $(if ($j.TenantName) { $j.TenantName } else { 'n/a' }). DeviceId: $(if ($j.DeviceId) { $j.DeviceId } else { 'n/a' })"
+        $m = Get-MdmEnrollmentInfo
+        $ime = Get-IntuneExtensionHealth
+        $stale = if ($ime.StaleMins -ge 0) { "$($ime.StaleMins) min ago" } else { 'no logs' }
+        $txtHybMdm.Text = "MDM enrolled: $($m.Enrolled)$(if ($m.Upn) { " ($($m.Upn))" }). IME: $($ime.Status), last log $stale."
+        Write-HybOut "$($j.JoinType); PRT $prt; MDM enrolled=$($m.Enrolled); IME=$($ime.Status)." $(if ($j.IsHybrid) { 'SUCCESS' } else { 'INFO' })
+    })
+
+    $btnHybRetryJoin.Add_Click({
+        if (-not (Assert-HybElevated)) { return }
+        Write-HybOut "Retrying Azure AD device registration (dsregcmd /join + Automatic-Device-Join task)..." "WARN"
+        try { & (Join-Path $env:SystemRoot 'System32\dsregcmd.exe') /join 2>&1 | Out-Null } catch {}
+        try { Start-ScheduledTask -TaskPath '\Microsoft\Windows\Workplace Join\' -TaskName 'Automatic-Device-Join' -ErrorAction SilentlyContinue } catch {}
+        Write-HybOut "Join retry kicked. Re-run Refresh State in a minute; hybrid join can lag behind Entra Connect sync." "INFO"
+    })
+
+    $btnHybSecChan.Add_Click({
+        Write-HybOut "Testing machine secure channel to the domain..."
+        $d = Test-DomainConnectivity
+        Write-HybOut $d.Message $(if ($d.SecureChannel -like 'Healthy*') { 'SUCCESS' } elseif ($d.SecureChannel -like 'BROKEN*') { 'ERROR' } else { 'INFO' })
+    })
+
+    $btnHybSync.Add_Click({
+        if (-not (Assert-HybElevated)) { return }
+        Write-HybOut "Forcing an Intune/MDM sync..."
+        $ran = @(Invoke-MdmSync)
+        if ($ran.Count -gt 0) { Write-HybOut "Triggered: $($ran -join ', ')" "SUCCESS" } else { Write-HybOut "No MDM sync task found - is this device enrolled?" "WARN" }
+    })
+
+    $btnHybRestartIme.Add_Click({
+        if (-not (Assert-HybElevated)) { return }
+        Write-HybOut (Restart-IntuneExtension) "INFO"
+    })
+
+    $btnHybEnroll.Add_Click({
+        if (-not (Assert-HybElevated)) { return }
+        Write-HybOut "Triggering GPO-style automatic MDM enrollment..." "WARN"
+        Write-HybOut (Invoke-MdmAutoEnroll) "INFO"
+    })
+
+    $btnHybComgmt.Add_Click({
+        Write-HybOut "Reading co-management workload authority..."
+        $c = Get-CoManagementState
+        $lstHybWorkloads.ItemsSource = $c.Workloads
+        if ($c.CoManaged) { $txtHybComgmt.Text = "Co-managed (flags=$($c.FlagsValue)). Each row shows which authority currently owns that workload." }
+        elseif ($c.ConfigMgrPresent) { $txtHybComgmt.Text = "ConfigMgr client present but no co-management flags - workloads default to ConfigMgr." }
+        else { $txtHybComgmt.Text = "Not co-managed (no ConfigMgr client). Intune is the sole authority." }
+        Write-HybOut $txtHybComgmt.Text "INFO"
+    })
+
+    $btnHybCcm.Add_Click({
+        if (-not (Assert-HybElevated)) { return }
+        Write-HybOut (Invoke-ConfigMgrClientAction) "INFO"
+    })
+
+    $btnHybDc.Add_Click({
+        Write-HybOut "Checking domain controller line-of-sight..."
+        $d = Test-DomainConnectivity
+        if (-not $d.Applicable) { $txtHybNet.Text = $d.Message; Write-HybOut $d.Message "INFO"; return }
+        $txtHybNet.Text = "DC $($d.DcName) (site $($d.Site)) reachable=$($d.DcReachable); secure channel $($d.SecureChannel)"
+        Write-HybOut $txtHybNet.Text $(if ($d.DcReachable) { 'SUCCESS' } else { 'WARN' })
+    })
+
+    $btnHybGpupdate.Add_Click({
+        if (-not (Assert-HybElevated)) { return }
+        Write-HybOut "Running gpupdate /force (this can take a moment)..." "WARN"
+        Write-HybOut (Invoke-GpUpdateForce) "INFO"
+    })
+
+    $btnHybTime.Add_Click({
+        if (-not (Assert-HybElevated)) { return }
+        Write-HybOut (Sync-DomainTime) "INFO"
+    })
+
+    $btnHybCa.Add_Click({
+        Write-HybOut "Evaluating Conditional Access readiness from local evidence..."
+        $r = Get-CaReadiness
+        foreach ($k in $r.Checks.Keys) { Write-HybOut ("  {0}: {1}" -f $k, $(if ($r.Checks[$k]) { 'PASS' } else { 'FAIL' })) }
+        if ($r.Ready) { $txtHybCompliance.Text = "CA readiness: all local checks pass. ($($r.Note))"; Write-HybOut "CA readiness: PASS. $($r.Note)" "SUCCESS" }
+        else { $txtHybCompliance.Text = "CA readiness: blocked by - $($r.Blockers -join ', '). $($r.Note)"; Write-HybOut "CA readiness: blockers -> $($r.Blockers -join ', ')" "WARN" }
+    })
+
+    $btnHybBitlocker.Add_Click({
+        if (-not (Assert-HybElevated)) { return }
+        $state = Get-BitLockerEscrowState
+        Write-HybOut "BitLocker: $($state.Message)"
+        if ($state.Available) {
+            Write-HybOut "Escrowing recovery key(s) to Entra ID (and AD if domain-joined)..." "WARN"
+            Write-HybOut (Invoke-BitLockerEscrow) "INFO"
+        }
+    })
+
+    $btnHybLegacy.Add_Click({
+        Write-HybOut "Scanning for legacy dependencies that cloud/security baselines will break..."
+        foreach ($f in (Get-LegacyDependencyState)) {
+            $lvl = switch ($f.Risk) { 'High' {'WARN'} 'Medium' {'WARN'} default {'INFO'} }
+            Write-HybOut ("  {0}: {1} [{2}] {3}" -f $f.Item, $f.State, $f.Risk, $f.Note) $lvl
+        }
+    })
+
+    $btnHybCerts.Add_Click({
+        Write-HybOut "Checking machine client-auth certificates and near-expiry..."
+        $certs = @(Get-ClientCertificateHealth)
+        if ($certs.Count -eq 0) { Write-HybOut "  No client-auth or expiring machine certificates found." "INFO"; return }
+        foreach ($c in $certs) { Write-HybOut ("  {0} | issuer {1} | {2} | {3}" -f $c.Subject, $c.Issuer, $c.NotAfter, $c.State) $(if ($c.State -eq 'EXPIRED' -or $c.State -like 'Expiring*') { 'WARN' } else { 'INFO' }) }
+    })
+
+    $btnHybBundle.Add_Click({
+        if (-not (Assert-HybElevated)) { return }
+        Write-HybOut "Collecting hybrid diagnostics bundle (dsregcmd, gpresult, mdmdiagnosticstool, IME logs)..." "WARN"
+        try {
+            $zip = New-HybridDiagnosticsBundle
+            Write-HybOut "Diagnostics written to: $zip" "SUCCESS"
+            try { Start-Process explorer.exe "/select,`"$zip`"" } catch {}
+        } catch { Write-HybOut "Bundle failed: $($_.Exception.Message)" "ERROR" }
     })
 
     # --- ACTION: Run Diagnostics ---
