@@ -2302,7 +2302,7 @@ function Start-AutopilotHubGui {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Autopilot Provisioning Hub — Enterprise Endpoint Deployment"
-        Height="800" Width="1240" MinHeight="700" MinWidth="1100"
+        Height="800" Width="1480" MinHeight="700" MinWidth="1240"
         WindowStartupLocation="CenterScreen"
         Background="#202020" Foreground="#FFFFFF"
         FontFamily="Segoe UI Variable Text, Segoe UI, sans-serif">
