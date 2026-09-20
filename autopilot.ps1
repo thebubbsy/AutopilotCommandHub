@@ -378,6 +378,64 @@ function Unregister-HubResumeAfterRestart {
     return $removed
 }
 
+# --- Function: Invoke-AutopilotBypass (finish OOBE as a normal Windows, no Autopilot / no forced enrollment) ---
+function Invoke-AutopilotBypass {
+    param([switch]$DisableNetwork)
+    $actions = [System.Collections.Generic.List[string]]::new()
+    $disabledAdapters = [System.Collections.Generic.List[string]]::new()
+
+    # 1. The only thing that matters: no Autopilot profile may drive this OOBE. Remove anything cached.
+    foreach ($jsonPath in @("$env:SystemRoot\ServiceState\wmansvc\AutopilotDDSZTDFile.json", "$env:SystemRoot\Provisioning\Autopilot\AutopilotConfigurationFile.json")) {
+        if (Test-Path $jsonPath) {
+            try { Remove-Item -Path $jsonPath -Force -ErrorAction Stop; $actions.Add("Removed cached Autopilot profile: $jsonPath") }
+            catch { $actions.Add("FAILED to remove $jsonPath : $($_.Exception.Message)") }
+        }
+    }
+
+    # 2. Flag Autopilot as disabled on this install and clear any tenant assignment the client wrote
+    try {
+        $diagKey = 'HKLM:\SOFTWARE\Microsoft\Provisioning\Diagnostics\AutoPilot'
+        if (-not (Test-Path $diagKey)) { New-Item -Path $diagKey -Force | Out-Null }
+        Set-ItemProperty -Path $diagKey -Name 'IsAutopilotDisabled' -Value 1 -Type DWord -ErrorAction Stop
+        foreach ($v in @('CloudAssignedTenantDomain', 'CloudAssignedTenantId', 'CloudAssignedOobeConfig', 'CloudAssignedDeviceName')) {
+            Remove-ItemProperty -Path $diagKey -Name $v -ErrorAction SilentlyContinue
+        }
+        $actions.Add("Set IsAutopilotDisabled=1 and cleared CloudAssigned* under Provisioning\Diagnostics\AutoPilot")
+    } catch { $actions.Add("FAILED to write Autopilot diagnostics key: $($_.Exception.Message)") }
+
+    # 3. Let OOBE finish without internet / with a local account (BypassNRO for older builds; ms-cxh:localonly for 24H2+)
+    try {
+        $oobeKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE'
+        if (-not (Test-Path $oobeKey)) { New-Item -Path $oobeKey -Force | Out-Null }
+        Set-ItemProperty -Path $oobeKey -Name 'BypassNRO' -Value 1 -Type DWord -ErrorAction Stop
+        $actions.Add("Set OOBE\BypassNRO=1 (offline / local-account path allowed)")
+    } catch { $actions.Add("FAILED to set BypassNRO: $($_.Exception.Message)") }
+
+    # 4. Optionally cut the network so the Deployment Service cannot be contacted for the rest of OOBE
+    if ($DisableNetwork) {
+        try {
+            foreach ($ad in @(Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -ne 'Disabled' })) {
+                try { Disable-NetAdapter -Name $ad.Name -Confirm:$false -ErrorAction Stop; $disabledAdapters.Add($ad.Name) } catch { }
+            }
+            if ($disabledAdapters.Count -gt 0) { $actions.Add("Disabled network adapters: $($disabledAdapters -join ', ') (re-enable from the Hub or Settings after OOBE)") }
+            else { $actions.Add("No enabled physical network adapters found to disable") }
+        } catch { $actions.Add("Could not enumerate network adapters: $($_.Exception.Message)") }
+    }
+
+    [PSCustomObject]@{
+        Actions          = $actions
+        DisabledAdapters = $disabledAdapters
+    }
+}
+
+function Enable-HubNetworkAdapters {
+    $enabled = [System.Collections.Generic.List[string]]::new()
+    foreach ($ad in @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Disabled' })) {
+        try { Enable-NetAdapter -Name $ad.Name -Confirm:$false -ErrorAction Stop; $enabled.Add($ad.Name) } catch { }
+    }
+    return ,$enabled
+}
+
 # --- Function: Get-DeviceEnrollmentState (is this PC already Autopilot / Intune / Entra managed?) ---
 function Get-DeviceEnrollmentState {
     $evidence = [System.Collections.Generic.List[string]]::new()
@@ -2526,6 +2584,13 @@ function Start-AutopilotHubGui {
                                 <Button Name="BtnHarvestHash" Content="Harvest Hardware Hash" Style="{StaticResource AccentBtn}" Height="36" Margin="0,0,0,8"/>
                                 <Button Name="BtnExportCsv" Content="Export Intune CSV (USB Priority)" Height="34" Margin="0,0,0,8"/>
                                 <Button Name="BtnRegisterIntune" Content="Register Device with Intune (Graph)" Style="{StaticResource AccentBtn}" Height="36" Margin="0,0,0,8"/>
+                                <!-- Skip Autopilot in OOBE -->
+                                <TextBlock Text="SKIP AUTOPILOT IN OOBE" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,6,0,6"/>
+                                <TextBlock Text="Finish OOBE as a normal Windows with a local account, no Autopilot and no forced enrollment. Run from Shift+F10 at the first OOBE screen, before connecting to a network." FontSize="11" Foreground="#8A8A8A" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                                <CheckBox Name="ChkPersonalDisableNet" Content="Disable network adapters for the rest of OOBE" IsChecked="True" Margin="0,0,0,8"/>
+                                <Button Name="BtnPersonalInstall" Content="Skip Autopilot in OOBE" Style="{StaticResource AccentBtn}" Height="34" Margin="0,0,0,6"/>
+                                <Button Name="BtnReenableNet" Content="Re-enable Network Adapters" Height="28" Margin="0,0,0,14"/>
+
                                 <Button Name="BtnSaveEnvDefaults" Content="Save Current Settings to .env" Height="30"/>
                             </StackPanel>
                         </ScrollViewer>
@@ -2965,6 +3030,9 @@ function Start-AutopilotHubGui {
     $btnExportCsv       = $window.FindName('BtnExportCsv')
     $btnRegisterIntune  = $window.FindName('BtnRegisterIntune')
     $btnSaveEnvDefaults = $window.FindName('BtnSaveEnvDefaults')
+    $chkPersonalDisableNet = $window.FindName('ChkPersonalDisableNet')
+    $btnPersonalInstall    = $window.FindName('BtnPersonalInstall')
+    $btnReenableNet        = $window.FindName('BtnReenableNet')
     $txtHashBox        = $window.FindName('TxtHashBox')
     $txtHashMeta       = $window.FindName('TxtHashMeta')
     $txtHashStatus     = $window.FindName('TxtHashStatus')
@@ -3424,6 +3492,43 @@ function Start-AutopilotHubGui {
     }
     $btnHarvestHash.Add_Click({ Invoke-HubHarvest })
     $btnDeviceStateAction.Add_Click({ Invoke-HubHarvest })
+
+    # --- ACTION: Skip Autopilot in OOBE ---
+    $btnPersonalInstall.Add_Click({
+        $ctx = $script:RuntimeContext
+        if (-not $ctx.MeetsPreferred) {
+            [System.Windows.MessageBox]::Show("This needs elevation (it edits HKLM and can disable network adapters). Use 'Fix Privileges' first.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+            return
+        }
+        $disableNet = [bool]$chkPersonalDisableNet.IsChecked -and $ctx.IsOobe
+        $plan = "- remove any cached Autopilot profile`n- flag Autopilot as disabled (IsAutopilotDisabled=1)`n- let OOBE continue without internet / with a local account (BypassNRO)`n" + $(if ($disableNet) { "- disable physical network adapters until you re-enable them`n" } else { '' })
+        $msg = if ($ctx.IsOobe) {
+            "Finish this OOBE as a normal Windows - no Autopilot, no forced enrollment:`n`n$plan`nDo not connect to a network until you are past the account page.`n`nContinue?"
+        } else {
+            "Autopilot only acts during OOBE, so there is nothing to skip on an installed system.`n`nTo use this on a fresh install: at the first OOBE screen press Shift+F10, run   irm $($script:BootstrapUrl) | iex   and click this button there, BEFORE connecting to a network.`n`nApply the (harmless) flags to this install anyway?`n`n$plan"
+        }
+        $ans = [System.Windows.MessageBox]::Show($msg, "Skip Autopilot in OOBE", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+        if ($ans -ne [System.Windows.MessageBoxResult]::Yes) { return }
+
+        Write-HubLog "Applying Autopilot bypass so OOBE finishes as a normal Windows..." "WARN"
+        $res = Invoke-AutopilotBypass -DisableNetwork:$disableNet
+        foreach ($a in $res.Actions) { Write-HubLog "  $a" $(if ($a -like 'FAILED*') { 'ERROR' } else { 'INFO' }) }
+        if ($ctx.IsOobe) {
+            Write-HubLog "Done. Close this window, continue OOBE and pick 'I don't have internet' / local account. If the build offers no offline option, run  start ms-cxh:localonly  from Shift+F10." "SUCCESS"
+            try { Start-Process 'ms-cxh:localonly' -ErrorAction Stop; Write-HubLog "Launched the local-account OOBE page (ms-cxh:localonly)." "INFO" } catch { }
+        } else {
+            Write-HubLog "Flags applied. Remember: this only matters during OOBE of a fresh install." "SUCCESS"
+        }
+    })
+
+    $btnReenableNet.Add_Click({
+        if (-not $script:RuntimeContext.MeetsPreferred) {
+            [System.Windows.MessageBox]::Show("Re-enabling adapters needs elevation. Use 'Fix Privileges' first.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+            return
+        }
+        $en = @(Enable-HubNetworkAdapters)
+        if ($en.Count -gt 0) { Write-HubLog "Re-enabled network adapters: $($en -join ', ')" "SUCCESS" } else { Write-HubLog "No disabled physical network adapters found." "INFO" }
+    })
 
     # --- ACTION: Export CSV ---
     $btnExportCsv.Add_Click({
