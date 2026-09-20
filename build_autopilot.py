@@ -6,7 +6,7 @@ import os
 
 script_content = r'''<#
 .SYNOPSIS
-    Autopilot OOBE Command Hub — Enterprise Provisioning & Endpoint Deployment Engine
+    Autopilot OOBE Command Hub - Enterprise Provisioning & Endpoint Deployment Engine
 .DESCRIPTION
     Standalone Windows Autopilot OOBE bootstrap package with an interactive Fluent dark WPF GUI.
     Engineered for rapid field-technician provisioning during Windows Setup (Shift + F10).
@@ -28,6 +28,8 @@ script_content = r'''<#
     - Skip Autopilot in OOBE, Hybrid Join & Co-Management toolset, ESP Diagnostics & Lifecycle tab
     - Multi-vendor hardware health (Dell/Lenovo warranty, battery wear, SSD reliability), offline JSON
       profiles, Wi-Fi / 802.1X / driver injection for OOBE, tenant branding in the header
+    - Windows Update & Driver Engine: Native COM Session (Microsoft.Update.Session) & USO Client for OOBE
+      system updates & hardware drivers with auto-reboot persistence
 
     Bootstrap Invocation:
         irm https://onyachamp.com/autopilot | iex
@@ -59,7 +61,11 @@ param(
     [switch]$HardwareHealth,
     [switch]$OfflineJson,
     [string]$OfflineJsonPath = '',
-    [switch]$Decommission
+    [switch]$Decommission,
+    [switch]$WindowsUpdate,
+    [switch]$IncludeDrivers,
+    [switch]$AutoReboot,
+    [switch]$ScanOnly
 )
 
 # 0. Central Environment & Configuration Engine (.env)
@@ -3310,6 +3316,562 @@ function Export-HubWindowScreenshot {
     return $fullPath
 }
 
+# --- Function: Ensure-HubUpdateServices (Start Windows Update & USO Services) ---
+function Ensure-HubUpdateServices {
+    [CmdletBinding()]
+    param()
+
+    $services = @('wuauserv', 'UsoSvc', 'BITS', 'TrustedInstaller', 'cryptsvc')
+    foreach ($s in $services) {
+        try {
+            $svc = Get-Service -Name $s -ErrorAction SilentlyContinue
+            if ($svc) {
+                if ($svc.StartType -eq 'Disabled') {
+                    Set-Service -Name $s -StartupType Manual -ErrorAction SilentlyContinue
+                }
+                if ($svc.Status -ne 'Running') {
+                    Start-Service -Name $s -ErrorAction SilentlyContinue
+                }
+            }
+        } catch { }
+    }
+}
+
+# --- Function: Invoke-HubUsoScan (Background Update Orchestrator Trigger) ---
+function Invoke-HubUsoScan {
+    [CmdletBinding()]
+    param()
+
+    Ensure-HubUpdateServices
+    $uso = Join-Path $env:SystemRoot "System32\usoclient.exe"
+    if (Test-Path $uso) {
+        Start-Process -FilePath $uso -ArgumentList "StartInteractiveScan" -WindowStyle Hidden -ErrorAction SilentlyContinue
+        return $true
+    }
+    return $false
+}
+
+# --- Function: Get-HubPendingWindowsUpdates (COM Query via Microsoft.Update.Session) ---
+function Get-HubPendingWindowsUpdates {
+    [CmdletBinding()]
+    param(
+        [switch]$IncludeDrivers,
+        [scriptblock]$StatusCallback
+    )
+
+    Ensure-HubUpdateServices
+    if ($StatusCallback) { & $StatusCallback "Connecting to Windows Update searcher..." }
+
+    $updates = @()
+    try {
+        $session = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $session.CreateUpdateSearcher()
+
+        $query = "IsInstalled=0 and IsHidden=0"
+        if (-not $IncludeDrivers) {
+            $query += " and Type='Software'"
+        }
+
+        if ($StatusCallback) { & $StatusCallback "Scanning for available updates ($query)..." }
+        $searchResult = $searcher.Search($query)
+
+        if ($searchResult -and $searchResult.Updates) {
+            for ($i = 0; $i -lt $searchResult.Updates.Count; $i++) {
+                $u = $searchResult.Updates.Item($i)
+                $isDriver = $false
+                try {
+                    if ($u.Type -eq 2) { $isDriver = $true }
+                    if ($u.Categories) {
+                        for ($c = 0; $c -lt $u.Categories.Count; $c++) {
+                            if ($u.Categories.Item($c).Name -like '*Driver*') { $isDriver = $true; break }
+                        }
+                    }
+                } catch { }
+
+                $sizeMb = 0
+                try {
+                    $sizeMb = [math]::Round($u.MaxDownloadSize / 1MB, 2)
+                } catch { }
+
+                $kb = ""
+                try {
+                    if ($u.KBArticleIDs -and $u.KBArticleIDs.Count -gt 0) {
+                        $kbList = @()
+                        for ($k = 0; $k -lt $u.KBArticleIDs.Count; $k++) {
+                            $kbList += "KB" + $u.KBArticleIDs.Item($k)
+                        }
+                        $kb = $kbList -join ", "
+                    }
+                } catch { }
+
+                $updates += [PSCustomObject]@{
+                    Title          = $u.Title
+                    KB             = $kb
+                    SizeMB         = $sizeMb
+                    IsDownloaded   = [bool]$u.IsDownloaded
+                    IsMandatory    = [bool]$u.IsMandatory
+                    RebootRequired = [bool]$u.RebootRequired
+                    IsDriver       = $isDriver
+                    UpdateObject   = $u
+                }
+            }
+        }
+    } catch {
+        Write-Warning "Windows Update search failed: $($_.Exception.Message)"
+        if ($StatusCallback) { & $StatusCallback "Search failed: $($_.Exception.Message)" }
+    }
+
+    return $updates
+}
+
+# --- Function: Start-HubWindowsUpdate (Download & Install Updates with Persistence) ---
+function Start-HubWindowsUpdate {
+    [CmdletBinding()]
+    param(
+        [switch]$IncludeDrivers,
+        [switch]$AutoReboot,
+        [scriptblock]$StatusCallback,
+        [System.Collections.IList]$SelectedUpdates = $null
+    )
+
+    Ensure-HubUpdateServices
+    $updatesToProcess = if ($SelectedUpdates -and $SelectedUpdates.Count -gt 0) {
+        $SelectedUpdates
+    } else {
+        Get-HubPendingWindowsUpdates -IncludeDrivers:$IncludeDrivers -StatusCallback $StatusCallback
+    }
+
+    if (-not $updatesToProcess -or $updatesToProcess.Count -eq 0) {
+        if ($StatusCallback) { & $StatusCallback "No pending Windows Updates found. System is up to date." }
+        return [PSCustomObject]@{
+            Success        = $true
+            InstalledCount = 0
+            FailedCount    = 0
+            RebootRequired = $false
+        }
+    }
+
+    if ($StatusCallback) { & $StatusCallback "Preparing download for $($updatesToProcess.Count) update(s)..." }
+
+    $session = New-Object -ComObject Microsoft.Update.Session
+    $downloader = $session.CreateUpdateDownloader()
+    $downloadColl = New-Object -ComObject Microsoft.Update.UpdateColl
+
+    foreach ($item in $updatesToProcess) {
+        $uObj = if ($item.UpdateObject) { $item.UpdateObject } else { $item }
+        if ($uObj.EulaAccepted -eq $false) {
+            try { $uObj.AcceptEula() } catch { }
+        }
+        $downloadColl.Add($uObj) | Out-Null
+    }
+
+    $downloader.Updates = $downloadColl
+    if ($StatusCallback) { & $StatusCallback "Downloading $($downloadColl.Count) update package(s)..." }
+
+    try {
+        $downloadResult = $downloader.Download()
+    } catch {
+        if ($StatusCallback) { & $StatusCallback "Download error: $($_.Exception.Message)" }
+        return [PSCustomObject]@{
+            Success        = $false
+            InstalledCount = 0
+            FailedCount    = $updatesToProcess.Count
+            RebootRequired = $false
+            Error          = $_.Exception.Message
+        }
+    }
+
+    $installer = $session.CreateUpdateInstaller()
+    $installer.ForceQuiet = $true
+    $installed = 0
+    $failed = 0
+    $rebootNeeded = $false
+
+    for ($i = 0; $i -lt $downloadColl.Count; $i++) {
+        $u = $downloadColl.Item($i)
+        if (-not $u.IsDownloaded) {
+            $failed++
+            continue
+        }
+
+        if ($StatusCallback) { & $StatusCallback "Installing ($($i+1)/$($downloadColl.Count)): $($u.Title)..." }
+
+        $singleColl = New-Object -ComObject Microsoft.Update.UpdateColl
+        $singleColl.Add($u) | Out-Null
+        $installer.Updates = $singleColl
+
+        try {
+            $instRes = $installer.Install()
+            $code = $instRes.ResultCode
+            if ($code -eq 2 -or $code -eq 3) {
+                $installed++
+            } else {
+                $failed++
+            }
+            if ($instRes.RebootRequired) {
+                $rebootNeeded = $true
+            }
+        } catch {
+            $failed++
+        }
+    }
+
+    if ($StatusCallback) {
+        & $StatusCallback "Installation finished: $installed succeeded, $failed failed. Reboot required: $rebootNeeded"
+    }
+
+    if ($rebootNeeded -and $AutoReboot) {
+        if ($StatusCallback) { & $StatusCallback "System restart required. Scheduling restart-resume task and rebooting in 5 seconds..." }
+        Register-HubResumeAfterRestart
+        Start-Sleep -Seconds 5
+        Restart-Computer -Force
+    }
+
+    return [PSCustomObject]@{
+        Success        = ($failed -eq 0)
+        InstalledCount = $installed
+        FailedCount    = $failed
+        RebootRequired = $rebootNeeded
+    }
+}
+
+# --- Function: Show-HubWindowsUpdateDialog (Interactive OOBE Windows Update & Driver Engine) ---
+function Show-HubWindowsUpdateDialog {
+    [CmdletBinding()]
+    param([System.Windows.Window]$Owner = $null)
+
+    $xamlWinUpd = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Windows Update &amp; Driver Engine" Width="820" Height="590"
+        WindowStartupLocation="CenterOwner"
+        Background="#1F1F1F" Foreground="#FFFFFF" FontFamily="Segoe UI Variable Text, Segoe UI, sans-serif" ResizeMode="CanResizeWithGrip">
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Header -->
+        <Grid Grid.Row="0" Margin="0,0,0,12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <StackPanel>
+                <TextBlock Text="WINDOWS UPDATE &amp; DRIVER ENGINE (OOBE READY)" FontSize="12.5" FontWeight="Bold" Foreground="#60CDFF"/>
+                <TextBlock Text="Native COM Session + Update Orchestrator (USO) - install critical updates &amp; hardware drivers before Autopilot enrollment." FontSize="11" Foreground="#A0A0A0" Margin="0,2,0,0"/>
+            </StackPanel>
+            <Border Grid.Column="1" Background="#1F2822" CornerRadius="3" Padding="8,4" BorderBrush="#2A5435" BorderThickness="1" VerticalAlignment="Center">
+                <TextBlock Text="COM ENGINE READY" FontSize="10.5" FontWeight="SemiBold" Foreground="#6CCB5F"/>
+            </Border>
+        </Grid>
+
+        <!-- Controls Toolbar -->
+        <Border Grid.Row="1" Background="#262626" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12,10" Margin="0,0,0,10">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <CheckBox Name="ChkIncludeDrivers" Grid.Column="0" Content="Include Hardware Drivers" IsChecked="True" Foreground="#FFFFFF" VerticalAlignment="Center" Margin="0,0,16,0"/>
+                <CheckBox Name="ChkAutoReboot" Grid.Column="1" Content="Auto-Restart if required (persists Hub to resume)" IsChecked="False" Foreground="#FFFFFF" VerticalAlignment="Center" Margin="0,0,16,0"/>
+                
+                <Button Name="BtnUsoScan" Grid.Column="3" Content="Trigger USO Scan" Padding="10,5" Margin="0,0,8,0" Background="#2D2D2D" Foreground="#FFFFFF" BorderBrush="#3E3E3E" ToolTip="Triggers background usoclient.exe StartInteractiveScan"/>
+                <Button Name="BtnScan" Grid.Column="4" Content="Scan for Updates" Padding="14,5" Background="#0067C0" Foreground="#FFFFFF" BorderBrush="#0067C0" FontWeight="SemiBold"/>
+            </Grid>
+        </Border>
+
+        <!-- Status & Progress -->
+        <StackPanel Grid.Row="2" Margin="0,0,0,10">
+            <Grid Margin="0,0,0,4">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Name="TxtStatus" Text="Ready. Click 'Scan for Updates' to query Microsoft Update services." FontSize="11" Foreground="#D0D0D0"/>
+                <TextBlock Name="TxtProgressPercent" Grid.Column="1" Text="" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF"/>
+            </Grid>
+            <ProgressBar Name="ProgBar" Height="4" Background="#2B2B2B" Foreground="#60CDFF" BorderThickness="0" Minimum="0" Maximum="100" Value="0"/>
+        </StackPanel>
+
+        <!-- Updates List -->
+        <Border Grid.Row="3" Background="#181818" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Margin="0,0,0,12">
+            <ListView Name="LstUpdates" Background="Transparent" BorderThickness="0" Foreground="#FFFFFF" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                <ListView.ItemTemplate>
+                    <DataTemplate>
+                        <Border BorderBrush="#262626" BorderThickness="0,0,0,1" Padding="4,6">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="100"/>
+                                </Grid.ColumnDefinitions>
+                                <CheckBox IsChecked="{Binding IsSelected, Mode=TwoWay}" VerticalAlignment="Center" Margin="4,0,10,0"/>
+                                <Border Grid.Column="1" Background="{Binding BadgeBackground}" CornerRadius="3" Padding="6,2" Margin="0,0,10,0" VerticalAlignment="Center">
+                                    <TextBlock Text="{Binding CategoryText}" FontSize="9.5" FontWeight="Bold" Foreground="{Binding BadgeForeground}"/>
+                                </Border>
+                                <StackPanel Grid.Column="2" VerticalAlignment="Center" Margin="0,0,8,0">
+                                    <TextBlock Text="{Binding Title}" FontSize="11.5" FontWeight="SemiBold" Foreground="#FFFFFF" TextWrapping="Wrap"/>
+                                    <TextBlock Text="{Binding Subtitle}" FontSize="10" Foreground="#8A8A8A" Margin="0,2,0,0"/>
+                                </StackPanel>
+                                <TextBlock Grid.Column="3" Text="{Binding SizeText}" FontSize="11" Foreground="#B0B0B0" VerticalAlignment="Center" Margin="8,0,12,0"/>
+                                <TextBlock Grid.Column="4" Text="{Binding StatusText}" FontSize="11" FontWeight="SemiBold" Foreground="{Binding StatusColor}" VerticalAlignment="Center" HorizontalAlignment="Right" Margin="0,0,8,0"/>
+                            </Grid>
+                        </Border>
+                    </DataTemplate>
+                </ListView.ItemTemplate>
+            </ListView>
+        </Border>
+
+        <!-- Action Footer -->
+        <Grid Grid.Row="4">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Name="TxtSummary" Text="0 updates found." FontSize="11" Foreground="#8A8A8A" VerticalAlignment="Center"/>
+            <Button Name="BtnRestartNow" Grid.Column="1" Content="Restart System Now (Resume Hub)" Padding="12,6" Margin="0,0,8,0" Background="#442726" Foreground="#FF99A4" BorderBrush="#5C3130" Visibility="Collapsed"/>
+            <Button Name="BtnInstall" Grid.Column="2" Content="Install Selected Updates" Padding="14,6" Margin="0,0,8,0" Background="#0067C0" Foreground="#FFFFFF" BorderBrush="#0067C0" FontWeight="SemiBold" IsEnabled="False"/>
+            <Button Name="BtnClose" Grid.Column="3" Content="Close" Padding="12,6" Background="#2B2B2B" Foreground="#FFFFFF" BorderBrush="#3E3E3E"/>
+        </Grid>
+    </Grid>
+</Window>
+'@
+
+    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xamlWinUpd))
+    $dlg = [System.Windows.Markup.XamlReader]::Load($reader)
+    if ($Owner) { $dlg.Owner = $Owner }
+
+    $chkDrivers     = $dlg.FindName('ChkIncludeDrivers')
+    $chkAutoReboot  = $dlg.FindName('ChkAutoReboot')
+    $btnUsoScan     = $dlg.FindName('BtnUsoScan')
+    $btnScan        = $dlg.FindName('BtnScan')
+    $txtStatus      = $dlg.FindName('TxtStatus')
+    $txtProgress    = $dlg.FindName('TxtProgressPercent')
+    $progBar        = $dlg.FindName('ProgBar')
+    $lstUpdates     = $dlg.FindName('LstUpdates')
+    $txtSummary     = $dlg.FindName('TxtSummary')
+    $btnRestartNow  = $dlg.FindName('BtnRestartNow')
+    $btnInstall     = $dlg.FindName('BtnInstall')
+    $btnClose       = $dlg.FindName('BtnClose')
+
+    $dlgItems = [System.Collections.ArrayList]::new()
+    $script:DlgRebootNeeded = $false
+
+    function Update-DlgUI {
+        $frame = [System.Windows.Threading.DispatcherFrame]::new()
+        [System.Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
+            [System.Windows.Threading.DispatcherPriority]::Background,
+            [System.Action[System.Windows.Threading.DispatcherFrame]]{ param($f) $f.Continue = $false },
+            $frame
+        ) | Out-Null
+        [System.Windows.Threading.Dispatcher]::PushFrame($frame)
+    }
+
+    $btnUsoScan.Add_Click({
+        $ok = Invoke-HubUsoScan
+        if ($ok) {
+            $txtStatus.Text = "USO Interactive Scan initiated in background."
+        } else {
+            $txtStatus.Text = "usoclient.exe not found on this system."
+        }
+    })
+
+    $btnScan.Add_Click({
+        $btnScan.IsEnabled = $false
+        $btnInstall.IsEnabled = $false
+        $txtStatus.Text = "Scanning Microsoft Update catalog..."
+        $progBar.IsIndeterminate = $true
+        Update-DlgUI
+
+        try {
+            $incDrivers = [bool]$chkDrivers.IsChecked
+            $rawUpdates = Get-HubPendingWindowsUpdates -IncludeDrivers:$incDrivers -StatusCallback {
+                param($m)
+                $txtStatus.Text = $m
+                Update-DlgUI
+            }
+            $dlgItems.Clear()
+            foreach ($u in $rawUpdates) {
+                $isDrv = [bool]$u.IsDriver
+                $cat = if ($isDrv) { "DRIVER" } else { "SOFTWARE" }
+                $bgBadge = if ($isDrv) { "#3E2547" } else { "#1F2D3D" }
+                $fgBadge = if ($isDrv) { "#C586C0" } else { "#60CDFF" }
+                $sub = if ($u.KB) { "$($u.KB)  |  Size: $($u.SizeMB) MB" } else { "Size: $($u.SizeMB) MB" }
+                if ($u.RebootRequired) { $sub += "  |  Reboot Required" }
+
+                $item = [PSCustomObject]@{
+                    IsSelected      = $true
+                    CategoryText    = $cat
+                    BadgeBackground = $bgBadge
+                    BadgeForeground = $fgBadge
+                    Title           = $u.Title
+                    Subtitle        = $sub
+                    SizeText        = "$($u.SizeMB) MB"
+                    StatusText      = "Pending"
+                    StatusColor     = "#D0D0D0"
+                    UpdateObject    = $u.UpdateObject
+                    RawItem         = $u
+                }
+                [void]$dlgItems.Add($item)
+            }
+            $lstUpdates.ItemsSource = $null
+            $lstUpdates.ItemsSource = $dlgItems
+            $txtSummary.Text = "$($dlgItems.Count) update(s) available."
+            if ($dlgItems.Count -gt 0) {
+                $btnInstall.IsEnabled = $true
+                $txtStatus.Text = "Found $($dlgItems.Count) update(s). Select items and click 'Install Selected Updates'."
+            } else {
+                $txtStatus.Text = "System is up to date. No pending updates found."
+            }
+        } catch {
+            $txtStatus.Text = "Scan error: $($_.Exception.Message)"
+        } finally {
+            $progBar.IsIndeterminate = $false
+            $progBar.Value = 0
+            $btnScan.IsEnabled = $true
+        }
+    })
+
+    $btnInstall.Add_Click({
+        $selected = @($dlgItems | Where-Object { $_.IsSelected -eq $true })
+        if ($selected.Count -eq 0) {
+            [System.Windows.MessageBox]::Show("Please select at least one update to install.", "No Updates Selected", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+            return
+        }
+
+        $btnScan.IsEnabled = $false
+        $btnInstall.IsEnabled = $false
+        $progBar.Value = 0
+        $txtStatus.Text = "Preparing update download session..."
+        Update-DlgUI
+
+        try {
+            Ensure-HubUpdateServices
+            $session = New-Object -ComObject Microsoft.Update.Session
+            $downloader = $session.CreateUpdateDownloader()
+            $downColl = New-Object -ComObject Microsoft.Update.UpdateColl
+
+            foreach ($it in $selected) {
+                $uObj = $it.UpdateObject
+                if ($uObj.EulaAccepted -eq $false) {
+                    try { $uObj.AcceptEula() } catch { }
+                }
+                $downColl.Add($uObj) | Out-Null
+            }
+
+            $downloader.Updates = $downColl
+            $txtStatus.Text = "Downloading $($downColl.Count) update package(s)..."
+            $progBar.IsIndeterminate = $true
+            Update-DlgUI
+
+            $downRes = $downloader.Download()
+            $progBar.IsIndeterminate = $false
+            $progBar.Value = 20
+
+            # Mark downloaded status
+            foreach ($it in $selected) {
+                if ($it.UpdateObject.IsDownloaded) {
+                    $it.StatusText = "Downloaded"
+                    $it.StatusColor = "#60CDFF"
+                }
+            }
+            $lstUpdates.Items.Refresh()
+            Update-DlgUI
+
+            # Sequentially install each update for real-time visual progress
+            $installer = $session.CreateUpdateInstaller()
+            $installer.ForceQuiet = $true
+            $total = $selected.Count
+            $instSucceeded = 0
+            $instFailed = 0
+
+            for ($i = 0; $i -lt $total; $i++) {
+                $it = $selected[$i]
+                $pct = 20 + [math]::Round((($i) / $total) * 75)
+                $progBar.Value = $pct
+                $txtProgress.Text = "$pct%"
+                $txtStatus.Text = "Installing ($($i+1)/$total): $($it.Title)..."
+                $it.StatusText = "Installing..."
+                $it.StatusColor = "#EAA300"
+                $lstUpdates.Items.Refresh()
+                Update-DlgUI
+
+                $singleColl = New-Object -ComObject Microsoft.Update.UpdateColl
+                $singleColl.Add($it.UpdateObject) | Out-Null
+                $installer.Updates = $singleColl
+
+                try {
+                    $instRes = $installer.Install()
+                    $code = $instRes.ResultCode
+                    if ($code -eq 2 -or $code -eq 3) {
+                        $it.StatusText = "Installed"
+                        $it.StatusColor = "#6CCB5F"
+                        $instSucceeded++
+                    } else {
+                        $it.StatusText = "Failed ($code)"
+                        $it.StatusColor = "#FF99A4"
+                        $instFailed++
+                    }
+                    if ($instRes.RebootRequired) {
+                        $script:DlgRebootNeeded = $true
+                    }
+                } catch {
+                    $it.StatusText = "Error"
+                    $it.StatusColor = "#FF99A4"
+                    $instFailed++
+                }
+                $lstUpdates.Items.Refresh()
+                Update-DlgUI
+            }
+
+            $progBar.Value = 100
+            $txtProgress.Text = "100%"
+            $txtStatus.Text = "Update complete: $instSucceeded installed, $instFailed failed."
+            try { [System.Media.SystemSounds]::Asterisk.Play() } catch { }
+
+            if ($script:DlgRebootNeeded) {
+                $btnRestartNow.Visibility = [System.Windows.Visibility]::Visible
+                $txtStatus.Text = "Updates installed successfully. System restart is REQUIRED."
+                if ($chkAutoReboot.IsChecked) {
+                    $txtStatus.Text = "Restarting system in 5 seconds (persists Hub to resume)..."
+                    Update-DlgUI
+                    Register-HubResumeAfterRestart
+                    Start-Sleep -Seconds 5
+                    Restart-Computer -Force
+                }
+            }
+        } catch {
+            $txtStatus.Text = "Installation error: $($_.Exception.Message)"
+        } finally {
+            $btnScan.IsEnabled = $true
+        }
+    })
+
+    $btnRestartNow.Add_Click({
+        $ans = [System.Windows.MessageBox]::Show("Restart system now to complete Windows Update installation?`n`nThe Hub will register a resume task and re-launch automatically when the system boots back up.", "Confirm Restart", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+        if ($ans -eq [System.Windows.MessageBoxResult]::Yes) {
+            Register-HubResumeAfterRestart
+            Restart-Computer -Force
+        }
+    })
+
+    $btnClose.Add_Click({ $dlg.Close() })
+
+    $dlg.ShowDialog() | Out-Null
+}
+
 # ==============================================================================
 # SECTION B: INTERACTIVE CYBER-DARK WPF XAML INTERFACE
 # ==============================================================================
@@ -3318,7 +3880,7 @@ function Start-AutopilotHubGui {
     $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Autopilot Provisioning Hub — Enterprise Endpoint Deployment"
+        Title="Autopilot Provisioning Hub - Enterprise Endpoint Deployment"
         Height="900" Width="1480" MinHeight="700" MinWidth="1240"
         WindowStartupLocation="CenterScreen"
         Background="#202020" Foreground="#FFFFFF"
@@ -3870,6 +4432,7 @@ function Start-AutopilotHubGui {
 
             <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                 <Button Name="BtnConnectGraph" Content="Sign In to Intune" Style="{StaticResource AccentBtn}" Margin="0,0,6,0"/>
+                <Button Name="BtnWindowsUpdate" Content="Windows Update" Margin="0,0,6,0" Style="{StaticResource AccentBtn}" ToolTip="Scan, download and install Windows Updates &amp; hardware drivers directly during OOBE Setup"/>
                 <Button Name="BtnLaunchEdge" Content="Edge / Portal" Margin="0,0,6,0" ToolTip="Launch Microsoft Edge to authenticate against staging dock captive portals"/>
                 <Button Name="BtnScreenshotUsb" Content="Capture Proof" Margin="0,0,6,0" ToolTip="Export a high-res staging proof screenshot directly to USB flash drive"/>
                 <Button Name="BtnToggleDpi" Content="Scale: 100%" Margin="0,0,6,0" ToolTip="Toggle High-DPI UI scaling between 100% and 125%"/>
@@ -4344,14 +4907,17 @@ function Start-AutopilotHubGui {
                                     <ColumnDefinition Width="Auto"/>
                                     <ColumnDefinition Width="Auto"/>
                                     <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
                                 </Grid.ColumnDefinitions>
                                 <TextBlock Text="PRE-FLIGHT REMEDIATION &amp; DRIVERS" FontSize="11" FontWeight="SemiBold" Foreground="#8A8A8A" VerticalAlignment="Center"/>
                                 <Button Name="BtnFixClockSkew" Grid.Column="1" Content="Auto-Remediate Clock Skew" Margin="0,0,8,0" Padding="10,5"
                                         ToolTip="Queries Microsoft Online date header and forces local time + w32tm /resync"/>
                                 <Button Name="BtnTpmAttestation" Grid.Column="2" Content="TPM 2.0 &amp; EK Attestation Engine" Margin="0,0,8,0" Padding="10,5"
                                         ToolTip="Tests Endorsement Key (EK) certificates and manufacturer EK CA server reachability"/>
-                                <Button Name="BtnInjectDriversPreflight" Grid.Column="3" Content="Inject USB Drivers (pnputil)" Padding="10,5"
+                                <Button Name="BtnInjectDriversPreflight" Grid.Column="3" Content="Inject USB Drivers (pnputil)" Margin="0,0,8,0" Padding="10,5"
                                         ToolTip="Scans USB drives for .inf network and chipset driver packages and installs them"/>
+                                <Button Name="BtnPreflightWinUpdate" Grid.Column="4" Content="Windows Update" Padding="10,5" Style="{StaticResource AccentBtn}"
+                                        ToolTip="Scan, download and install Windows Updates &amp; hardware drivers directly during OOBE Setup"/>
                             </Grid>
                         </Grid>
                     </Grid>
@@ -4903,11 +5469,13 @@ function Start-AutopilotHubGui {
     $btnLaunchEdge         = $window.FindName('BtnLaunchEdge')
     $btnScreenshotUsb      = $window.FindName('BtnScreenshotUsb')
     $btnToggleDpi          = $window.FindName('BtnToggleDpi')
+    $btnWindowsUpdate      = $window.FindName('BtnWindowsUpdate')
 
     # Additional Controls: Tab 4 Pre-Flight
     $btnFixClockSkew       = $window.FindName('BtnFixClockSkew')
     $btnTpmAttestation     = $window.FindName('BtnTpmAttestation')
     $btnInjectDriversPreflight = $window.FindName('BtnInjectDriversPreflight')
+    $btnPreflightWinUpdate = $window.FindName('BtnPreflightWinUpdate')
 
     # Additional Controls: Tab 5 Warranty & Hardware Health
     $btnCheckLenovoWarranty = $window.FindName('BtnCheckLenovoWarranty')
@@ -6165,6 +6733,13 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
         })
     }
 
+    if ($btnWindowsUpdate) {
+        $btnWindowsUpdate.Add_Click({
+            Write-HubLog "Launching Windows Update & Driver Engine..." "INFO"
+            Show-HubWindowsUpdateDialog -Owner $window
+        })
+    }
+
     if ($btnLaunchEdge) {
         $btnLaunchEdge.Add_Click({
             try {
@@ -6330,6 +6905,13 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
             } else {
                 Write-HubLog "No driver packages (.inf) found on connected USB drives." "INFO"
             }
+        })
+    }
+
+    if ($btnPreflightWinUpdate) {
+        $btnPreflightWinUpdate.Add_Click({
+            Write-HubLog "Launching Windows Update & Driver Engine from Pre-Flight tab..." "INFO"
+            Show-HubWindowsUpdateDialog -Owner $window
         })
     }
 
@@ -6768,6 +7350,33 @@ if ($ExportCsv) {
     return
 }
 
+if ($WindowsUpdate) {
+    Write-Host "`nAutopilot Command Hub - Windows Update & Driver Engine (OOBE Ready)" -ForegroundColor Cyan
+    if (-not $script:RuntimeContext.MeetsPreferred) {
+        Write-Host "Notice: Windows Update installation requires administrator privileges. Some updates may fail without elevation." -ForegroundColor Yellow
+    }
+    if ($ScanOnly) {
+        Write-Host "Scanning for available updates (IncludeDrivers: $([bool]$IncludeDrivers))..." -ForegroundColor Cyan
+        $updates = Get-HubPendingWindowsUpdates -IncludeDrivers:$IncludeDrivers -StatusCallback { param($m) Write-Host "  $m" -ForegroundColor Gray }
+        Write-Host "Found $($updates.Count) pending update(s):" -ForegroundColor Green
+        if ($updates.Count -gt 0) {
+            $updates | Select-Object Title, KB, SizeMB, IsDriver, RebootRequired | Format-Table -AutoSize
+        }
+    } else {
+        Write-Host "Starting update scan, download, and installation..." -ForegroundColor Cyan
+        $res = Start-HubWindowsUpdate -IncludeDrivers:$IncludeDrivers -AutoReboot:$AutoReboot -StatusCallback { param($m) Write-Host "  $m" -ForegroundColor Gray }
+        if ($res.Success) {
+            Write-Host "Updates completed successfully! ($($res.InstalledCount) succeeded, $($res.FailedCount) failed)." -ForegroundColor Green
+        } else {
+            Write-Host "Updates completed with errors: $($res.InstalledCount) succeeded, $($res.FailedCount) failed." -ForegroundColor Yellow
+        }
+        if ($res.RebootRequired) {
+            Write-Host "System restart is REQUIRED to complete update installation." -ForegroundColor Red
+        }
+    }
+    return
+}
+
 # Launch GUI in STA Apartment State
 if (-not $NoGui) {
     # Single-instance lifecycle: Automatically close prior lingering instances instead of blocking
@@ -6845,10 +7454,10 @@ repo_dir = os.path.dirname(os.path.abspath(__file__))
 ps1_path = os.path.join(repo_dir, 'autopilot.ps1')
 raw_path = os.path.join(repo_dir, 'autopilot')
 
-with open(ps1_path, 'w', encoding='utf-8', newline='\n') as f:
+with open(ps1_path, 'w', encoding='utf-8-sig', newline='\n') as f:
     f.write(script_content)
 
-with open(raw_path, 'w', encoding='utf-8', newline='\n') as f:
+with open(raw_path, 'w', encoding='utf-8-sig', newline='\n') as f:
     f.write(script_content)
 
 print(f"Successfully generated {ps1_path} ({len(script_content)} bytes)")
