@@ -1,0 +1,71 @@
+name: Deploy autopilot script to onyachamp.com
+
+# Rebuilds autopilot.ps1 / autopilot from source and publishes them to the
+# thebubbsy/onyachamp repo, which GitHub Pages serves at https://onyachamp.com/autopilot.
+#
+# Requires a repository secret named SITE_DEPLOY_TOKEN: a token with contents:write
+# permission on thebubbsy/onyachamp (a fine-grained PAT scoped to that one repo is ideal,
+# or a classic PAT with `repo`). The default GITHUB_TOKEN cannot push to another repo.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'build_autopilot.py'
+      - 'autopilot.ps1'
+      - 'autopilot'
+      - '.github/workflows/deploy-website.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-website
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: Build and publish to onyachamp
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout AutopilotCommandHub
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Rebuild autopilot.ps1 and autopilot from source
+        run: python build_autopilot.py
+
+      - name: Fail if the committed build is stale
+        run: |
+          if ! git diff --quiet -- autopilot.ps1 autopilot; then
+            echo "::error::autopilot.ps1 / autopilot differ from a fresh build of build_autopilot.py. Run 'python build_autopilot.py' and commit the result."
+            git --no-pager diff --stat -- autopilot.ps1 autopilot
+            exit 1
+          fi
+
+      - name: Checkout onyachamp (website repo)
+        uses: actions/checkout@v4
+        with:
+          repository: thebubbsy/onyachamp
+          token: ${{ secrets.SITE_DEPLOY_TOKEN }}
+          path: site
+
+      - name: Copy freshly built scripts into the website
+        run: |
+          cp autopilot.ps1 site/autopilot.ps1
+          cp autopilot     site/autopilot
+
+      - name: Commit and push to onyachamp
+        working-directory: site
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- autopilot autopilot.ps1; then
+            echo "Website already up to date; nothing to publish."
+            exit 0
+          fi
+          git add autopilot autopilot.ps1
+          git commit -m "deploy: sync autopilot bootstrap from AutopilotCommandHub@${GITHUB_SHA::7}"
+          git push
