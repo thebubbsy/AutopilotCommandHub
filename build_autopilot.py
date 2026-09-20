@@ -4323,7 +4323,7 @@ function Start-AutopilotHubGui {
         $ts = (Get-Date).ToString('HH:mm:ss')
         $txtHybOut.AppendText("`r`n[$ts] [$Level] $Message")
         $txtHybOut.ScrollToEnd()
-        Write-HubLog $Message $Level
+        # Tab-local pane only - do NOT also mirror to the main audit log (that was double-printing every line)
         Update-WpfUI
     }
     function Assert-HybElevated {
