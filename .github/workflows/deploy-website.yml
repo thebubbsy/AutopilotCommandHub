@@ -64,10 +64,11 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- autopilot autopilot.ps1 .env.example; then
+          git add autopilot autopilot.ps1 .env.example
+          # --cached sees new (previously untracked) files too; a plain 'git diff --quiet' does not
+          if git diff --cached --quiet; then
             echo "Website already up to date; nothing to publish."
             exit 0
           fi
-          git add autopilot autopilot.ps1 .env.example
           git commit -m "deploy: sync autopilot bootstrap from AutopilotCommandHub@${GITHUB_SHA::7}"
           git push

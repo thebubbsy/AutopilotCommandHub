@@ -454,17 +454,19 @@ public class HubWinUtil {
         $candidateProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
             ($_.Name -in @('powershell.exe', 'pwsh.exe')) -and
             ($_.ProcessId -ne $currentPid) -and
+            # Match the Hub itself only. '*AutopilotCommandHub*' would also match Get-DellWarranty.ps1,
+            # Start-DeviceAuth.ps1, the test suite or any dev shell that names the repo folder.
             (
-                $_.CommandLine -like '*autopilot.ps1*' -or
-                $_.CommandLine -like '*AutopilotCommandHub*' -or
-                $_.CommandLine -like '*onyachamp.com/autopilot*'
+                $_.CommandLine -match '(?i)[\\/]autopilot(\.ps1)?["'']?(\s|$)' -or
+                $_.CommandLine -like '*onyachamp.com/autopilot*' -or
+                $_.CommandLine -like '*-ResumeFromRestart*' -or
+                $_.CommandLine -like '*-ReplacingInstance*'
             ) -and
-            (
-                $_.CommandLine -notlike '*python*' -and
-                $_.CommandLine -notlike '*git*' -and
-                $_.CommandLine -notlike '*antigravity*' -and
-                $_.CommandLine -notlike '*code.exe*'
-            )
+            $_.CommandLine -notlike '*-NoGui*' -and
+            $_.CommandLine -notlike '*-HarvestOnly*' -and
+            $_.CommandLine -notlike '*-DellWarranty*' -and
+            $_.CommandLine -notlike '*-ExportCsv*' -and
+            $_.CommandLine -notlike '*-RenameComputer*'
         }
         foreach ($cp in $candidateProcs) {
             [void]$targetPids.Add([int]$cp.ProcessId)
@@ -962,14 +964,16 @@ function Restart-IntuneExtension {
 
 function Get-CoManagementState {
     # Decode the ConfigMgr co-management workload bitmask (which authority owns each workload).
+    # HKLM\SOFTWARE\Microsoft\CCM\CoManagementFlags. Bit 1 only means "co-management is configured";
+    # the workloads themselves start at 2 (e.g. 67 = enabled + Compliance + Client Apps).
     $workloadBits = [ordered]@{
-        1   = 'Compliance Policies'
-        2   = 'Resource Access Policies (Wi-Fi/VPN/Cert/Email)'
-        4   = 'Device Configuration'
-        8   = 'Endpoint Protection (Defender)'
-        16  = 'Client Apps'
-        32  = 'Office Click-to-Run Apps'
-        64  = 'Windows Update Policies'
+        2   = 'Compliance Policies'
+        4   = 'Resource Access Policies (Wi-Fi/VPN/Cert/Email)'
+        8   = 'Device Configuration'
+        16  = 'Windows Update Policies'
+        32  = 'Endpoint Protection (Defender)'
+        64  = 'Client Apps'
+        128 = 'Office Click-to-Run Apps'
     }
     $flags = $null
     foreach ($path in @('HKLM:\SOFTWARE\Microsoft\CCM\CoManagementFlags', 'HKLM:\SOFTWARE\Microsoft\CCM')) {
@@ -992,7 +996,7 @@ function Get-CoManagementState {
         }
     }
     [PSCustomObject]@{
-        CoManaged     = ($null -ne $flags)
+        CoManaged     = ($null -ne $flags -and ($flags -band 1))
         ConfigMgrPresent = $ccmPresent
         FlagsValue    = $flags
         Workloads     = @($rows)
