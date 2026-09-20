@@ -920,6 +920,30 @@ function Get-AutopilotHash {
     return $resultObj
 }
 
+# --- Function: Resolve-HubDeviceName (filesystem-safe name for a device, from the rename template) ---
+function Resolve-HubDeviceName {
+    param(
+        [string]$Template = '',
+        [string]$SerialNumber = ''
+    )
+    # Prefer the configured rename template (e.g. 'WS-%SERIAL%'), then the live hostname, then the serial.
+    $name = $Template
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = $env:COMPUTERNAME }
+    if (-not [string]::IsNullOrWhiteSpace($name)) {
+        # Resolve %SERIAL% (deterministic, ties to the hardware); drop %RAND% so the filename stays stable
+        $name = $name.Replace('%SERIAL%', $SerialNumber).Replace('%RAND%', '')
+    }
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = $SerialNumber }
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = 'AutopilotDevice' }
+
+    # Strip characters that are illegal in a filename, then tidy separators
+    foreach ($c in [System.IO.Path]::GetInvalidFileNameChars()) { $name = $name.Replace($c, '-') }
+    $name = ($name -replace '-{2,}', '-').Trim().Trim('-', '_', '.', ' ')
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = if ($SerialNumber) { $SerialNumber } else { 'AutopilotDevice' } }
+    if ($name.Length -gt 48) { $name = $name.Substring(0, 48) }
+    return $name
+}
+
 # --- Function: Export-AutopilotCsv (AutopilotFast Core) ---
 function Export-AutopilotCsv {
     [CmdletBinding()]
@@ -928,7 +952,8 @@ function Export-AutopilotCsv {
         [switch]$AutoDetectUsb,
         [PSCustomObject]$InputObject,
         [string]$GroupTag = '',
-        [string]$AssignedUser = ''
+        [string]$AssignedUser = '',
+        [string]$DeviceName = ''
     )
 
     $header = "Device Serial Number,Windows Product ID,Hardware Hash,Group Tag,Assigned User"
@@ -936,6 +961,16 @@ function Export-AutopilotCsv {
     $item = $InputObject
     if (-not $item) {
         $item = Get-AutopilotHash -GroupTag $GroupTag -AssignedUser $AssignedUser
+    }
+
+    # Name the file after the device (e.g. WS-6BYQJW2.csv) unless an explicit -Path was given.
+    # Note: Intune does NOT read the filename - the imported device's name comes from the Autopilot
+    # deployment profile naming template. This is purely so a stack of CSVs on a USB stick is legible.
+    $autoNamed = [string]::IsNullOrWhiteSpace($Path)
+    $csvFileName = 'Autopilot-Devices.csv'
+    if ($autoNamed) {
+        $resolvedName = Resolve-HubDeviceName -Template $DeviceName -SerialNumber $item.SerialNumber
+        $csvFileName = "$resolvedName.csv"
     }
 
     $targetPath = $Path
@@ -946,7 +981,7 @@ function Export-AutopilotCsv {
             $usbDrives = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType = 2" -ErrorAction SilentlyContinue
             foreach ($d in $usbDrives) {
                 if (Test-Path "$($d.DeviceID)\") {
-                    $targetPath = Join-Path -Path "$($d.DeviceID)\" -ChildPath "Autopilot-Devices.csv"
+                    $targetPath = Join-Path -Path "$($d.DeviceID)\" -ChildPath $csvFileName
                     break
                 }
             }
@@ -956,9 +991,9 @@ function Export-AutopilotCsv {
     if ([string]::IsNullOrWhiteSpace($targetPath)) {
         $desktop = [Environment]::GetFolderPath('Desktop')
         if ($desktop -and (Test-Path $desktop)) {
-            $targetPath = Join-Path -Path $desktop -ChildPath 'Autopilot-Devices.csv'
+            $targetPath = Join-Path -Path $desktop -ChildPath $csvFileName
         } else {
-            $targetPath = "$env:TEMP\Autopilot-Devices.csv"
+            $targetPath = Join-Path -Path $env:TEMP -ChildPath $csvFileName
         }
     }
 
@@ -969,14 +1004,17 @@ function Export-AutopilotCsv {
     $encoding = Get-ScriptEncoding
     $line = "$($item.SerialNumber),$($item.WindowsProductId),$($item.HardwareHash),$($item.GroupTag),$($item.AssignedUser)"
 
-    if (-not (Test-Path $targetPath)) {
+    if ($autoNamed -or -not (Test-Path $targetPath)) {
+        # One device per auto-named file - overwrite so a re-export never doubles the row
         [System.IO.File]::WriteAllLines($targetPath, @($header, $line), $encoding)
     } else {
+        # Explicit -Path is treated as a roster: append this device
         [System.IO.File]::AppendAllLines($targetPath, @($line), $encoding)
     }
 
     return [PSCustomObject]@{
         Path         = $targetPath
+        FileName     = [System.IO.Path]::GetFileName($targetPath)
         SerialNumber = $item.SerialNumber
         GroupTag     = $item.GroupTag
         AssignedUser = $item.AssignedUser
@@ -3542,10 +3580,11 @@ function Start-AutopilotHubGui {
         $gt = $cmbGroupTag.Text
         $usr = $txtAssignedUser.Text
 
-        $res = Export-AutopilotCsv -AutoDetectUsb:$chkAutoDetectUsb.IsChecked -GroupTag $gt -AssignedUser $usr
+        $deviceName = if ($txtComputerName -and -not [string]::IsNullOrWhiteSpace($txtComputerName.Text)) { $txtComputerName.Text } else { '' }
+        $res = Export-AutopilotCsv -AutoDetectUsb:$chkAutoDetectUsb.IsChecked -GroupTag $gt -AssignedUser $usr -DeviceName $deviceName
         if ($res.Success) {
-            Write-HubLog "Autopilot CSV written to: $($res.Path)" "SUCCESS"
-            [System.Windows.MessageBox]::Show("Autopilot CSV exported successfully!`n`nDestination: $($res.Path)", "CSV Export Succeeded", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+            Write-HubLog "Autopilot CSV '$($res.FileName)' written to: $($res.Path)" "SUCCESS"
+            [System.Windows.MessageBox]::Show("Autopilot CSV exported successfully!`n`nFile: $($res.FileName)`nDestination: $($res.Path)", "CSV Export Succeeded", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
         }
     })
 
@@ -4183,7 +4222,7 @@ if ($DellWarranty) {
 
 if ($ExportCsv) {
     Write-Host "`nAutopilotFast CSV Exporter" -ForegroundColor Cyan
-    $res = Export-AutopilotCsv -Path $CsvPath -AutoDetectUsb -GroupTag $GroupTag -AssignedUser $AssignedUser
+    $res = Export-AutopilotCsv -Path $CsvPath -AutoDetectUsb -GroupTag $GroupTag -AssignedUser $AssignedUser -DeviceName $ComputerNameTemplate
     Write-Host "Exported to: $($res.Path)" -ForegroundColor Green
     return
 }
