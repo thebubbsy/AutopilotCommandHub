@@ -7454,10 +7454,10 @@ repo_dir = os.path.dirname(os.path.abspath(__file__))
 ps1_path = os.path.join(repo_dir, 'autopilot.ps1')
 raw_path = os.path.join(repo_dir, 'autopilot')
 
-with open(ps1_path, 'w', encoding='utf-8-sig', newline='\n') as f:
+with open(ps1_path, 'w', encoding='utf-8', newline='\n') as f:
     f.write(script_content)
 
-with open(raw_path, 'w', encoding='utf-8-sig', newline='\n') as f:
+with open(raw_path, 'w', encoding='utf-8', newline='\n') as f:
     f.write(script_content)
 
 print(f"Successfully generated {ps1_path} ({len(script_content)} bytes)")

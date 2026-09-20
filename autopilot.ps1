@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Autopilot OOBE Command Hub - Enterprise Provisioning & Endpoint Deployment Engine
 .DESCRIPTION
