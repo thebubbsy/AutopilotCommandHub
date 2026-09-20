@@ -21,6 +21,10 @@ script_content = r'''<#
     - Win32 App Packaging (.intunewin) & Direct Cloud Publishing powered by WingetIntune
     - 7-Stage Hardware & Network Pre-Flight Diagnostic Ladder powered by IntuneShared
     - Real-Time Live Monospace Console Log & Animated Progress Bar
+    - Always-visible privilege badge (SYSTEM / Administrator / Standard) with a guided elevated relaunch
+    - Device enrollment awareness on launch: cached Autopilot profile, Intune MDM enrollment, Entra join,
+      plus a tenant-side Autopilot identity lookup once signed in to Graph
+    - Restart with persistence: re-opens the Hub automatically when OOBE (or the desktop) comes back
 
     Bootstrap Invocation:
         irm https://onyachamp.com/autopilot | iex
@@ -44,7 +48,8 @@ param(
     [string]$EnvFile = '',
     [switch]$RenameComputer,
     [string]$ComputerNamePrefix = '',
-    [string]$ComputerNameTemplate = ''
+    [string]$ComputerNameTemplate = '',
+    [switch]$ResumeFromRestart
 )
 
 # 0. Central Environment & Configuration Engine (.env)
@@ -230,10 +235,374 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
 # 4. Global State & Hardware Hash Cache
 $script:CachedHashInfo = $null
 $script:GraphAuthContext = $null
+$script:DeviceState = $null
+
+# 5. Self-Source Capture. Under `irm <url> | iex` there is no $PSCommandPath, but the script block that is
+#    executing still carries the full source - that is what makes an elevated relaunch and the post-restart
+#    resume possible without needing internet access again.
+$script:SelfScriptPath = $PSCommandPath
+$script:SelfSource = $null
+try {
+    if ([string]::IsNullOrWhiteSpace($script:SelfScriptPath)) {
+        $script:SelfSource = $MyInvocation.MyCommand.ScriptBlock.ToString()
+    }
+} catch { }
+$script:BootstrapUrl    = 'https://onyachamp.com/autopilot'
+$script:PersistRoot     = Join-Path $env:ProgramData 'AutopilotCommandHub'
+$script:ResumeTaskName  = 'AutopilotCommandHub-ResumeAfterRestart'
+$script:ResumeRunOnceName = 'AutopilotCommandHubResume'
+$script:ResumeFromRestart = [bool]$ResumeFromRestart
 
 # ==============================================================================
 # SECTION A: EMBEDDED RESILIENT CORE ENGINES (AutopilotFast, IntuneShared, WingetIntune, WingetBatch)
 # ==============================================================================
+
+# --- Function: Get-HubRuntimeContext (Privilege & Session Mode Detection) ---
+function Get-HubRuntimeContext {
+    $isSystem = $false
+    $userName = $env:USERNAME
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $isSystem = $identity.IsSystem
+        $userName = $identity.Name
+    } catch { }
+    $isElevated = [bool]($script:IsElevated -or $isSystem)
+
+    # OOBE detection: Windows Setup flags first, then the tell-tale of the OOBE session (no shell, OOBE service account)
+    $isOobe = $false
+    try {
+        $setup = Get-ItemProperty -Path 'HKLM:\SYSTEM\Setup' -ErrorAction SilentlyContinue
+        if ($setup -and (($setup.OOBEInProgress -eq 1) -or ($setup.SystemSetupInProgress -eq 1))) { $isOobe = $true }
+    } catch { }
+    if (-not $isOobe) {
+        try {
+            $explorerRunning = [bool](Get-Process -Name explorer -ErrorAction SilentlyContinue)
+            if (-not $explorerRunning -and ($userName -match 'defaultuser0$' -or $isSystem)) { $isOobe = $true }
+        } catch { }
+    }
+
+    $hostPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    try { $hp = (Get-Process -Id $PID -ErrorAction Stop).Path; if ($hp) { $hostPath = $hp } } catch { }
+
+    [PSCustomObject]@{
+        UserName       = $userName
+        IsSystem       = $isSystem
+        IsElevated     = $isElevated
+        IsOobe         = $isOobe
+        Mode           = if ($isOobe) { 'OOBE' } else { 'DESKTOP' }
+        PrivilegeLevel = if ($isSystem) { 'SYSTEM' } elseif ($isElevated) { 'ADMINISTRATOR' } else { 'STANDARD USER' }
+        PreferredLevel = if ($isOobe) { 'SYSTEM (the Shift+F10 command prompt)' } else { 'ADMINISTRATOR (an elevated PowerShell)' }
+        MeetsPreferred = $isElevated
+        HostEngine     = "PowerShell $($PSVersionTable.PSVersion)"
+        HostPath       = $hostPath
+    }
+}
+$script:RuntimeContext = Get-HubRuntimeContext
+
+# --- Function: Save-HubSelfCopy (persist the running script + .env for relaunch / resume) ---
+function Save-HubSelfCopy {
+    param([string]$Directory = $script:PersistRoot)
+    if (-not (Test-Path $Directory)) { New-Item -ItemType Directory -Path $Directory -Force | Out-Null }
+    $target = Join-Path $Directory 'autopilot.ps1'
+    if ($script:SelfScriptPath -and (Test-Path $script:SelfScriptPath)) {
+        if ((Resolve-Path $script:SelfScriptPath).Path -ne $target) { Copy-Item -Path $script:SelfScriptPath -Destination $target -Force }
+    } elseif ($script:SelfSource) {
+        [System.IO.File]::WriteAllText($target, $script:SelfSource, [System.Text.UTF8Encoding]::new($false))
+    } else {
+        throw "Cannot locate the running script's source to persist it."
+    }
+    # Carry the active .env so tenant defaults survive the relaunch
+    if ($script:LoadedEnvPath -and (Test-Path $script:LoadedEnvPath)) {
+        $envTarget = Join-Path $Directory '.env'
+        if ((Resolve-Path $script:LoadedEnvPath).Path -ne $envTarget) { Copy-Item -Path $script:LoadedEnvPath -Destination $envTarget -Force }
+    }
+    return $target
+}
+
+function Get-HubRelaunchArguments {
+    param([Parameter(Mandatory = $true)][string]$ScriptPath, [switch]$Resume)
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', "`"$ScriptPath`"")
+    $envCandidate = Join-Path (Split-Path $ScriptPath -Parent) '.env'
+    if (Test-Path $envCandidate) { $argList += @('-EnvFile', "`"$envCandidate`"") }
+    if ($Resume) { $argList += '-ResumeFromRestart' }
+    return ($argList -join ' ')
+}
+
+# --- Function: Invoke-HubElevatedRelaunch (UAC relaunch of this exact script) ---
+function Invoke-HubElevatedRelaunch {
+    $path = Save-HubSelfCopy
+    $argLine = Get-HubRelaunchArguments -ScriptPath $path
+    Start-Process -FilePath $script:RuntimeContext.HostPath -ArgumentList $argLine -Verb RunAs -ErrorAction Stop | Out-Null
+    return $true
+}
+
+# --- Function: Register-HubResumeAfterRestart (re-open the Hub when OOBE / the desktop comes back) ---
+function Register-HubResumeAfterRestart {
+    $ctx = $script:RuntimeContext
+    $path = Save-HubSelfCopy
+    $argLine = Get-HubRelaunchArguments -ScriptPath $path -Resume
+    $hostExe = $ctx.HostPath
+
+    $action  = New-ScheduledTaskAction -Execute $hostExe -Argument $argLine
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    # A SYSTEM/startup task lands in session 0 where no window can be seen. The task must run in the
+    # interactive session: during OOBE that session belongs to defaultuser0 (a local administrator),
+    # on the desktop it is whoever is sitting here now.
+    $principal = if ($ctx.IsOobe) {
+        New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-544' -RunLevel Highest
+    } else {
+        New-ScheduledTaskPrincipal -UserId $ctx.UserName -LogonType Interactive -RunLevel Highest
+    }
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+    Register-ScheduledTask -TaskName $script:ResumeTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+
+    # Desktop belt-and-braces: RunOnce fires when the shell starts for the next interactive user.
+    # (It does not fire inside OOBE - the scheduled task covers that.) A named mutex stops a double launch.
+    try {
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name $script:ResumeRunOnceName -Value "`"$hostExe`" $argLine" -ErrorAction Stop
+    } catch { }
+    return $path
+}
+
+function Unregister-HubResumeAfterRestart {
+    $removed = $false
+    try {
+        if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+            if (Get-ScheduledTask -TaskName $script:ResumeTaskName -ErrorAction SilentlyContinue) {
+                Unregister-ScheduledTask -TaskName $script:ResumeTaskName -Confirm:$false -ErrorAction Stop
+                $removed = $true
+            }
+        }
+    } catch { }
+    try {
+        $ro = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name $script:ResumeRunOnceName -ErrorAction SilentlyContinue
+        if ($ro) {
+            Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name $script:ResumeRunOnceName -ErrorAction Stop
+            $removed = $true
+        }
+    } catch { }
+    return $removed
+}
+
+# --- Function: Get-DeviceEnrollmentState (is this PC already Autopilot / Intune / Entra managed?) ---
+function Get-DeviceEnrollmentState {
+    $evidence = [System.Collections.Generic.List[string]]::new()
+    $state = [ordered]@{
+        AutopilotProfileCached = $false
+        AutopilotTenantDomain  = ''
+        AutopilotTenantId      = ''
+        AutopilotProfileName   = ''
+        AutopilotDeviceName    = ''
+        AutopilotCorrelationId = ''
+        IntuneEnrolled         = $false
+        EnrollmentId           = ''
+        EnrollmentUpn          = ''
+        EnrollmentTenantId     = ''
+        AzureAdJoined          = $false
+        DomainJoined           = $false
+        EntraTenantName        = ''
+        EntraTenantId          = ''
+        MdmUrl                 = ''
+        Verdict                = 'Unmanaged'
+        Summary                = ''
+        Evidence               = $evidence
+        CloudChecked           = $false
+        CloudRegistered        = $null
+        CloudIdentity          = $null
+    }
+
+    # 1. The Autopilot profile the device itself fetched from the Deployment Service during OOBE.
+    #    This is what makes a registered PC boot into the branded, company-logo OOBE - and it is cached here.
+    foreach ($jsonPath in @("$env:SystemRoot\ServiceState\wmansvc\AutopilotDDSZTDFile.json", "$env:SystemRoot\Provisioning\Autopilot\AutopilotConfigurationFile.json")) {
+        if (-not (Test-Path $jsonPath)) { continue }
+        try {
+            $j = Get-Content -Path $jsonPath -Raw -ErrorAction Stop | ConvertFrom-Json
+            if ($j.CloudAssignedTenantDomain -or $j.CloudAssignedTenantId) {
+                $state.AutopilotProfileCached = $true
+                if ($j.CloudAssignedTenantDomain) { $state.AutopilotTenantDomain = [string]$j.CloudAssignedTenantDomain }
+                if ($j.CloudAssignedTenantId)     { $state.AutopilotTenantId     = [string]$j.CloudAssignedTenantId }
+                if ($j.DeploymentProfileName)     { $state.AutopilotProfileName  = [string]$j.DeploymentProfileName }
+                if ($j.CloudAssignedDeviceName)   { $state.AutopilotDeviceName   = [string]$j.CloudAssignedDeviceName }
+                if ($j.ZtdCorrelationId)          { $state.AutopilotCorrelationId = [string]$j.ZtdCorrelationId }
+                $evidence.Add("Autopilot profile JSON: $jsonPath")
+            }
+        } catch {
+            $evidence.Add("Unreadable Autopilot profile JSON: $jsonPath ($($_.Exception.Message))")
+        }
+    }
+
+    # 2. Provisioning diagnostics written by the Autopilot client
+    try {
+        $diag = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Provisioning\Diagnostics\AutoPilot' -ErrorAction SilentlyContinue
+        if ($diag -and ($diag.CloudAssignedTenantDomain -or $diag.CloudAssignedTenantId)) {
+            $state.AutopilotProfileCached = $true
+            if (-not $state.AutopilotTenantDomain -and $diag.CloudAssignedTenantDomain) { $state.AutopilotTenantDomain = [string]$diag.CloudAssignedTenantDomain }
+            if (-not $state.AutopilotTenantId -and $diag.CloudAssignedTenantId)         { $state.AutopilotTenantId = [string]$diag.CloudAssignedTenantId }
+            if (-not $state.AutopilotCorrelationId -and $diag.AutopilotServiceCorrelationId) { $state.AutopilotCorrelationId = [string]$diag.AutopilotServiceCorrelationId }
+            $evidence.Add('Registry: HKLM\SOFTWARE\Microsoft\Provisioning\Diagnostics\AutoPilot')
+        }
+    } catch { }
+
+    # 3. MDM enrollment - Intune is provider 'MS DM Server'
+    try {
+        foreach ($k in @(Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue)) {
+            $pv = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
+            if ($pv -and $pv.ProviderID -eq 'MS DM Server') {
+                $state.IntuneEnrolled = $true
+                $state.EnrollmentId = $k.PSChildName
+                if ($pv.UPN)         { $state.EnrollmentUpn = [string]$pv.UPN }
+                if ($pv.AADTenantID) { $state.EnrollmentTenantId = [string]$pv.AADTenantID }
+                $evidence.Add("Registry: HKLM\SOFTWARE\Microsoft\Enrollments\$($k.PSChildName) (MS DM Server)")
+                break
+            }
+        }
+    } catch { }
+
+    # 4. Entra / domain join state
+    try {
+        $dsregPath = Join-Path $env:SystemRoot 'System32\dsregcmd.exe'
+        if (Test-Path $dsregPath) {
+            $ds = @(& $dsregPath /status 2>$null)
+            $getField = {
+                param($name)
+                foreach ($line in $ds) { if ($line -match "^\s*$name\s*:\s*(.+)$") { return $Matches[1].Trim() } }
+                return ''
+            }
+            $state.AzureAdJoined   = ((& $getField 'AzureAdJoined') -eq 'YES')
+            $state.DomainJoined    = ((& $getField 'DomainJoined') -eq 'YES')
+            $state.EntraTenantName = & $getField 'TenantName'
+            $state.EntraTenantId   = & $getField 'TenantId'
+            $state.MdmUrl          = & $getField 'MdmUrl'
+            if ($state.AzureAdJoined) { $evidence.Add("dsregcmd: AzureAdJoined=YES, tenant '$($state.EntraTenantName)'") }
+            if ($state.MdmUrl)        { $evidence.Add("dsregcmd: MdmUrl $($state.MdmUrl)") }
+        }
+    } catch { }
+
+    $tenantLabel = if ($state.AutopilotTenantDomain) { $state.AutopilotTenantDomain }
+                   elseif ($state.EntraTenantName)   { $state.EntraTenantName }
+                   elseif ($state.AutopilotTenantId) { $state.AutopilotTenantId }
+                   elseif ($state.EnrollmentTenantId){ $state.EnrollmentTenantId }
+                   else { 'unknown tenant' }
+
+    if ($state.AutopilotProfileCached) {
+        $state.Verdict = 'AutopilotRegistered'
+        $profileNote = if ($state.AutopilotProfileName) { " (profile: $($state.AutopilotProfileName))" } else { '' }
+        $state.Summary = "Autopilot-registered to $tenantLabel$profileNote"
+    } elseif ($state.IntuneEnrolled) {
+        $state.Verdict = 'IntuneEnrolled'
+        $upnNote = if ($state.EnrollmentUpn) { " as $($state.EnrollmentUpn)" } else { '' }
+        $state.Summary = "Intune-enrolled ($tenantLabel)$upnNote, but no Autopilot profile is cached locally"
+    } elseif ($state.AzureAdJoined) {
+        $state.Verdict = 'EntraJoined'
+        $state.Summary = "Entra-joined to $tenantLabel without MDM enrollment"
+    } elseif ($state.DomainJoined) {
+        $state.Verdict = 'DomainJoined'
+        $state.Summary = 'On-prem domain joined, not cloud managed'
+    } else {
+        $state.Verdict = 'Unmanaged'
+        $state.Summary = 'No Autopilot profile, MDM enrollment or Entra join found on this device'
+    }
+    return [PSCustomObject]$state
+}
+
+# --- Function: Find-AutopilotIdentityInTenant (does the signed-in tenant already know this serial?) ---
+function Find-AutopilotIdentityInTenant {
+    param(
+        [Parameter(Mandatory = $true)][string]$SerialNumber,
+        [Parameter(Mandatory = $true)][string]$AccessToken
+    )
+    $serial = $SerialNumber.Trim()
+    if ([string]::IsNullOrWhiteSpace($serial)) { return $null }
+    $escaped = $serial.Replace("'", "''")
+    $uri = "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities?`$filter=contains(serialNumber,'$escaped')"
+    $res = Invoke-RestMethod -Uri $uri -Method GET -Headers @{ 'Authorization' = "Bearer $AccessToken" } -ErrorAction Stop
+    $exact = @($res.value | Where-Object { $_.serialNumber -eq $serial })
+    if ($exact.Count -gt 0) { return $exact[0] }
+    $any = @($res.value)
+    if ($any.Count -gt 0) { return $any[0] }
+    return $null
+}
+
+# --- Function: Show-PrivilegeGuide (walk the operator to the privilege level the Hub wants) ---
+function Show-PrivilegeGuide {
+    param([System.Windows.Window]$Owner = $null)
+    $ctx = $script:RuntimeContext
+    $canRelaunch = (-not $ctx.IsOobe) -and (-not $ctx.MeetsPreferred)
+
+    $stepsText = if ($ctx.MeetsPreferred) {
+        "Nothing to do - this window already runs as $($ctx.PrivilegeLevel), which is the level the Hub wants in $($ctx.Mode) mode."
+    } elseif ($ctx.IsOobe) {
+        "1. Press Shift + F10 on the OOBE screen to open the built-in command prompt (it runs as SYSTEM).`n" +
+        "2. Type:  powershell -ExecutionPolicy Bypass   and press Enter.`n" +
+        "3. Type:  irm $($script:BootstrapUrl) | iex   and press Enter.`n" +
+        "4. Close this window once the elevated Hub appears."
+    } else {
+        "1. Click 'Relaunch as Administrator' below.`n" +
+        "2. Accept the User Account Control prompt.`n" +
+        "3. This window closes itself; the elevated Hub opens with the same settings.`n`n" +
+        "Manual alternative: right-click PowerShell > Run as administrator, then run:`n   irm $($script:BootstrapUrl) | iex"
+    }
+    $whyText = "Reading the hardware hash (MDM_DevDetail_Ext01), renaming the computer, installing apps, syncing the clock and registering a restart-resume task all need elevation. Without it those actions fail and Intune registration is blocked."
+
+    $xamlGuide = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Privilege Check" Width="620" SizeToContent="Height" WindowStartupLocation="CenterOwner"
+        Background="#1F1F1F" Foreground="#FFFFFF" FontFamily="Segoe UI" ResizeMode="NoResize">
+    <StackPanel Margin="20">
+        <TextBlock Text="PRIVILEGE CHECK" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,0,0,10"/>
+        <Grid Margin="0,0,0,12">
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+            <Border Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12,8" Margin="0,0,6,0">
+                <StackPanel>
+                    <TextBlock Text="CURRENT" FontSize="10" Foreground="#8A8A8A" FontWeight="SemiBold"/>
+                    <TextBlock Name="TxtCurrent" FontSize="13" FontWeight="Bold" Foreground="#FFFFFF" Margin="0,2,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
+            </Border>
+            <Border Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12,8" Margin="6,0,0,0">
+                <StackPanel>
+                    <TextBlock Text="PREFERRED" FontSize="10" Foreground="#8A8A8A" FontWeight="SemiBold"/>
+                    <TextBlock Name="TxtPreferred" FontSize="13" FontWeight="Bold" Foreground="#6CCB5F" Margin="0,2,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
+            </Border>
+        </Grid>
+        <TextBlock Text="WHY IT MATTERS" FontSize="10" Foreground="#8A8A8A" FontWeight="SemiBold"/>
+        <TextBlock Name="TxtWhy" FontSize="12" Foreground="#D0D0D0" TextWrapping="Wrap" Margin="0,2,0,12"/>
+        <TextBlock Text="HOW TO GET THERE" FontSize="10" Foreground="#8A8A8A" FontWeight="SemiBold"/>
+        <TextBox Name="TxtSteps" FontSize="12" FontFamily="Consolas" Foreground="#FFFFFF" Background="#161616" BorderBrush="#383838" BorderThickness="1" Padding="10" IsReadOnly="True" TextWrapping="Wrap" Margin="0,2,0,14"/>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button Name="BtnCopyCmd" Content="Copy bootstrap command" Padding="12,6" Margin="0,0,8,0" Background="#2B2B2B" Foreground="#FFFFFF" BorderBrush="#484848"/>
+            <Button Name="BtnRelaunch" Content="Relaunch as Administrator" Padding="12,6" Margin="0,0,8,0" Background="#0067C0" Foreground="#FFFFFF" BorderBrush="#0067C0" FontWeight="SemiBold"/>
+            <Button Name="BtnCloseGuide" Content="Close" Padding="12,6" Background="#2B2B2B" Foreground="#FFFFFF" BorderBrush="#484848"/>
+        </StackPanel>
+    </StackPanel>
+</Window>
+"@
+    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xamlGuide))
+    $dlg = [System.Windows.Markup.XamlReader]::Load($reader)
+    if ($Owner) { $dlg.Owner = $Owner }
+    $dlg.FindName('TxtCurrent').Text   = "$($ctx.PrivilegeLevel) - $($ctx.UserName) - $($ctx.Mode) mode"
+    $dlg.FindName('TxtPreferred').Text = $ctx.PreferredLevel
+    $dlg.FindName('TxtWhy').Text       = $whyText
+    $dlg.FindName('TxtSteps').Text     = $stepsText
+    $btnRelaunch = $dlg.FindName('BtnRelaunch')
+    $btnRelaunch.IsEnabled = $canRelaunch
+    if (-not $canRelaunch) { $btnRelaunch.Opacity = 0.4 }
+    $result = [hashtable]::Synchronized(@{ Relaunched = $false })
+    $dlg.FindName('BtnCopyCmd').Add_Click({ [System.Windows.Clipboard]::SetText("irm $($script:BootstrapUrl) | iex") })
+    $btnRelaunch.Add_Click({
+        try {
+            Invoke-HubElevatedRelaunch | Out-Null
+            $result.Relaunched = $true
+            $dlg.Close()
+        } catch {
+            [System.Windows.MessageBox]::Show("Elevated relaunch failed: $($_.Exception.Message)", "Relaunch Failed", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+        }
+    }.GetNewClosure())
+    $dlg.FindName('BtnCloseGuide').Add_Click({ $dlg.Close() }.GetNewClosure())
+    $dlg.ShowDialog() | Out-Null
+    return $result.Relaunched
+}
 
 # --- Function: Test-StagedNetwork (IntuneShared Core) ---
 function Test-StagedNetwork {
@@ -1164,7 +1533,12 @@ function Register-AutopilotDevice {
         $startTime = [DateTime]::UtcNow
         while (([DateTime]::UtcNow - $startTime).TotalMinutes -lt $TimeoutMinutes) {
             Start-Sleep -Seconds 10
-            $statusCheck = Invoke-RestMethod -Uri $syncUri -Method GET -Headers $headers -ErrorAction SilentlyContinue
+            $statusCheck = $null
+            try { $statusCheck = Invoke-RestMethod -Uri $syncUri -Method GET -Headers $headers -ErrorAction Stop } catch { continue }
+            if ($statusCheck.state.deviceImportStatus -eq 'error') {
+                # e.g. 806 ZtdDeviceAlreadyAssigned, 808 ZtdDeviceAssignedToOtherTenant - polling further never helps
+                throw "Autopilot import failed: $($statusCheck.state.deviceErrorCode) - $($statusCheck.state.deviceErrorName)"
+            }
             if ($statusCheck.state.deviceImportStatus -eq 'complete' -or $statusCheck.deploymentProfileAssignmentStatus -eq 'assigned') {
                 return [PSCustomObject]@{
                     Success          = $true
@@ -1464,7 +1838,7 @@ function Start-AutopilotHubGui {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Autopilot Provisioning Hub — Enterprise Endpoint Deployment"
-        Height="800" Width="1120" MinHeight="700" MinWidth="960"
+        Height="800" Width="1240" MinHeight="700" MinWidth="1100"
         WindowStartupLocation="CenterScreen"
         Background="#202020" Foreground="#FFFFFF"
         FontFamily="Segoe UI Variable Text, Segoe UI, sans-serif">
@@ -1957,39 +2331,51 @@ function Start-AutopilotHubGui {
             <RowDefinition Height="170"/>  <!-- Console Log -->
         </Grid.RowDefinitions>
 
-        <!-- HEADER BAR -->
+        <!-- HEADER BAR: row 0 = title + actions, row 1 = live status badges -->
         <Grid Grid.Row="0" Margin="0,0,0,12">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
 
-            <StackPanel Orientation="Vertical">
-                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                    <TextBlock Text="Autopilot Provisioning Hub" FontSize="20" FontWeight="Bold" Foreground="#FFFFFF" VerticalAlignment="Center"/>
-                    <Border Background="#262626" CornerRadius="3" Padding="6,2" Margin="12,0,0,0" VerticalAlignment="Center" BorderBrush="#383838" BorderThickness="1">
-                        <TextBlock Text="OOBE PROVISIONING" FontSize="10.5" FontWeight="SemiBold" Foreground="#B0B0B0"/>
-                    </Border>
-                    <Border Background="#1F2822" CornerRadius="3" Padding="6,2" Margin="6,0,0,0" VerticalAlignment="Center" BorderBrush="#2A5435" BorderThickness="1">
-                        <TextBlock Text="STANDALONE KERNEL" FontSize="10.5" FontWeight="SemiBold" Foreground="#6CCB5F"/>
-                    </Border>
-                </StackPanel>
+            <StackPanel Grid.Row="0" Grid.Column="0" Orientation="Vertical" VerticalAlignment="Center">
+                <TextBlock Text="Autopilot Provisioning Hub" FontSize="20" FontWeight="Bold" Foreground="#FFFFFF"/>
                 <TextBlock Text="Microsoft Intune &amp; Windows Autopilot Automated Deployment Engine" FontSize="11.5" Foreground="#8A8A8A" Margin="0,2,0,0"/>
             </StackPanel>
 
-            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                <!-- Graph Authentication Session Badge & Connector -->
-                <Border Name="BadgeGraphAuth" Background="#2E2221" CornerRadius="3" Padding="8,4" Margin="0,0,8,0" VerticalAlignment="Center" BorderBrush="#542E2A" BorderThickness="1">
-                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                        <Ellipse Name="DotGraphStatus" Width="7" Height="7" Fill="#FFAA99" VerticalAlignment="Center" Margin="0,0,6,0"/>
-                        <TextBlock Name="TxtGraphStatus" Text="GRAPH: NOT SIGNED IN" FontSize="10.5" FontWeight="SemiBold" Foreground="#D0D0D0" VerticalAlignment="Center"/>
-                    </StackPanel>
-                </Border>
+            <StackPanel Grid.Row="1" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,10,0,0">
+                    <!-- Live privilege / session badge (replaces the old static OOBE pill - it is wrong on the desktop) -->
+                    <Border Name="BadgePrivilege" Background="#2E2221" CornerRadius="3" Padding="8,3" Margin="0,0,0,0" VerticalAlignment="Center" BorderBrush="#542E2A" BorderThickness="1" Cursor="Hand"
+                            ToolTip="The privilege level this window is running with. Click for details. Hash harvest, rename, app installs, clock sync and restart-resume all need elevation.">
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                            <Ellipse Name="DotPrivilege" Width="7" Height="7" Fill="#FFAA99" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                            <TextBlock Name="TxtPrivilege" Text="PRIV: CHECKING" FontSize="10.5" FontWeight="SemiBold" Foreground="#D0D0D0" VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </Border>
+                    <Button Name="BtnFixPrivilege" Content="Fix Privileges" Style="{StaticResource DestructiveBtn}" Margin="6,0,0,0" Padding="8,3" FontSize="11" Visibility="Collapsed"
+                            ToolTip="Walks you through relaunching the Hub with the privilege level it needs."/>
+                    <!-- Graph Authentication Session Badge -->
+                    <Border Name="BadgeGraphAuth" Background="#2E2221" CornerRadius="3" Padding="8,3" Margin="6,0,0,0" VerticalAlignment="Center" BorderBrush="#542E2A" BorderThickness="1">
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                            <Ellipse Name="DotGraphStatus" Width="7" Height="7" Fill="#FFAA99" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                            <TextBlock Name="TxtGraphStatus" Text="GRAPH: NOT SIGNED IN" FontSize="10.5" FontWeight="SemiBold" Foreground="#D0D0D0" VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Background="#1F2822" CornerRadius="3" Padding="6,3" Margin="6,0,0,0" VerticalAlignment="Center" BorderBrush="#2A5435" BorderThickness="1">
+                        <TextBlock Text="STANDALONE KERNEL" FontSize="10.5" FontWeight="SemiBold" Foreground="#6CCB5F"/>
+                    </Border>
+            </StackPanel>
+
+            <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                 <Button Name="BtnConnectGraph" Content="Sign In to Intune" Style="{StaticResource AccentBtn}" Margin="0,0,8,0"/>
 
                 <Button Name="BtnInstallPwsh" Content="Install PS7" Margin="0,0,8,0"
                         ToolTip="Cause fuck Microsoft for still shipping Windows with the outta date garbage that is PowerShell 5.1."/>
-                <Button Name="BtnQuickCmd" Content="Command Prompt (Shift+F10)" Margin="0,0,8,0"/>
+                <Button Name="BtnQuickCmd" Content="Cmd (Shift+F10)" ToolTip="Open a command prompt (same as Shift+F10 in OOBE)" Margin="0,0,8,0"/>
                 <Button Name="BtnTimeSync" Content="Sync Clock" Margin="0,0,8,0"/>
                 <Button Name="BtnReboot" Content="Restart System" Style="{StaticResource DestructiveBtn}"/>
             </StackPanel>
@@ -2004,6 +2390,7 @@ function Start-AutopilotHubGui {
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="1.4*"/>
                 </Grid.ColumnDefinitions>
 
                 <StackPanel Grid.Column="0">
@@ -2029,6 +2416,11 @@ function Start-AutopilotHubGui {
                 <StackPanel Grid.Column="4">
                     <TextBlock Text="NETWORK STATUS" FontSize="10" Foreground="#8A8A8A" FontWeight="SemiBold"/>
                     <TextBlock Name="TxtNetwork" Text="Checking..." FontSize="12.5" Foreground="#60CDFF" FontWeight="Bold" Margin="0,2,0,0"/>
+                </StackPanel>
+
+                <StackPanel Grid.Column="5">
+                    <TextBlock Text="DEVICE STATE" FontSize="10" Foreground="#8A8A8A" FontWeight="SemiBold"/>
+                    <TextBlock Name="TxtDeviceState" Text="Inspecting..." FontSize="12.5" Foreground="#D0D0D0" FontWeight="Bold" Margin="0,2,0,0" TextTrimming="CharacterEllipsis"/>
                 </StackPanel>
             </Grid>
         </Border>
@@ -2067,13 +2459,32 @@ function Start-AutopilotHubGui {
             <!-- TAB 1: AUTOPILOT & CLOUD REGISTRATION -->
             <TabItem Header="Autopilot &amp; Cloud Registration">
                 <Grid Margin="0,12,0,0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="420"/>
                         <ColumnDefinition Width="*"/>
                     </Grid.ColumnDefinitions>
 
+                    <!-- Device Enrollment State Banner (drives what the operator is asked to do) -->
+                    <Border Name="BannerDeviceState" Grid.Row="0" Grid.ColumnSpan="2" Background="#262626" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12,8" Margin="0,0,0,12">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel>
+                                <TextBlock Name="TxtDeviceStateTitle" Text="DEVICE STATE: INSPECTING..." FontSize="11" FontWeight="SemiBold" Foreground="#D0D0D0"/>
+                                <TextBlock Name="TxtDeviceStateDetail" Text="Looking for a cached Autopilot profile, MDM enrollment and Entra join state..." FontSize="11.5" Foreground="#8A8A8A" TextWrapping="Wrap" Margin="0,3,0,0"/>
+                            </StackPanel>
+                            <Button Name="BtnDeviceStateAction" Grid.Column="1" Content="Harvest Hash Now" Style="{StaticResource AccentBtn}" VerticalAlignment="Center" Margin="12,0,0,0" Padding="10,5" Visibility="Collapsed"/>
+                        </Grid>
+                    </Border>
+
                     <!-- Left: Configuration Controls -->
-                    <Border Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="16" Margin="0,0,12,0">
+                    <Border Grid.Row="1" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="16" Margin="0,0,12,0">
                         <ScrollViewer VerticalScrollBarVisibility="Auto">
                             <StackPanel>
                                 <TextBlock Text="PROVISIONING CONFIGURATION" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,0,0,14"/>
@@ -2127,7 +2538,7 @@ function Start-AutopilotHubGui {
                     </Border>
 
                     <!-- Right: Hash Preview & Registration Status -->
-                    <Border Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="16">
+                    <Border Grid.Row="1" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="16">
                         <Grid>
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="Auto"/>
@@ -2164,7 +2575,12 @@ function Start-AutopilotHubGui {
 
             <!-- TAB 2: APP DEPLOYMENT (WingetBatch) -->
             <TabItem Header="App Deployment">
-                <Grid Margin="0,12,0,0">
+                <DockPanel Margin="0,12,0,0">
+                    <!-- Managed-device advisory: app assignment is Intune's job once the device is enrolled -->
+                    <Border Name="BannerAppAdvisory" DockPanel.Dock="Top" Background="#262626" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12,8" Margin="0,0,0,10">
+                        <TextBlock Name="TxtAppAdvisory" Text="Checking whether this device is Intune-managed..." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap"/>
+                    </Border>
+                <Grid>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="*"/>
@@ -2271,6 +2687,7 @@ function Start-AutopilotHubGui {
                         </Grid>
                     </Border>
                 </Grid>
+                </DockPanel>
             </TabItem>
 
             <!-- TAB 3: WIN32 PACKAGING (WingetIntune) -->
@@ -2559,6 +2976,17 @@ function Start-AutopilotHubGui {
     $txtHashStatus     = $window.FindName('TxtHashStatus')
     $badgeHashStatus   = $window.FindName('BadgeHashStatus')
     $btnCopyHash       = $window.FindName('BtnCopyHash')
+    $dotPrivilege          = $window.FindName('DotPrivilege')
+    $badgePrivilege        = $window.FindName('BadgePrivilege')
+    $txtPrivilege          = $window.FindName('TxtPrivilege')
+    $btnFixPrivilege       = $window.FindName('BtnFixPrivilege')
+    $txtDeviceState        = $window.FindName('TxtDeviceState')
+    $bannerDeviceState     = $window.FindName('BannerDeviceState')
+    $txtDeviceStateTitle   = $window.FindName('TxtDeviceStateTitle')
+    $txtDeviceStateDetail  = $window.FindName('TxtDeviceStateDetail')
+    $btnDeviceStateAction  = $window.FindName('BtnDeviceStateAction')
+    $bannerAppAdvisory     = $window.FindName('BannerAppAdvisory')
+    $txtAppAdvisory        = $window.FindName('TxtAppAdvisory')
 
     function Update-GraphAuthHeader {
         if ($script:GraphAuthContext -and $script:GraphAuthContext.AccessToken -and $script:GraphAuthContext.ExpiresOn -gt [datetime]::UtcNow.AddMinutes(2)) {
@@ -2578,6 +3006,7 @@ function Start-AutopilotHubGui {
             $txtGraphStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#6CCB5F")
             $btnConnectGraph.Content = "Disconnect"
             $btnConnectGraph.Style = [System.Windows.Style]$window.Resources['DestructiveBtn']
+            Invoke-TenantAutopilotLookup
         } else {
             $dotGraphStatus.Fill = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FFAA99")
             $badgeGraphAuth.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#2E2221")
@@ -2717,7 +3146,140 @@ function Start-AutopilotHubGui {
 
     # Initialize Hardware Telemetry
     Write-HubLog "Initializing Autopilot OOBE Command Hub v2.0..."
-    Write-HubLog "Elevated execution verified: $script:IsElevated"
+    $ctx = $script:RuntimeContext
+    Write-HubLog "Session: $($ctx.Mode) mode | Privilege: $($ctx.PrivilegeLevel) ($($ctx.UserName)) | Host: $($ctx.HostEngine)"
+
+    # Privilege badge - always visible; the Fix button only appears when we are below the preferred level
+    $brushConv = [System.Windows.Media.BrushConverter]::new()
+    if ($ctx.MeetsPreferred) {
+        $dotPrivilege.Fill = $brushConv.ConvertFromString("#6CCB5F")
+        $badgePrivilege.Background = $brushConv.ConvertFromString("#1F2822")
+        $badgePrivilege.BorderBrush = $brushConv.ConvertFromString("#2A5435")
+        $txtPrivilege.Text = "PRIV: $($ctx.PrivilegeLevel) | $($ctx.Mode)"
+        $txtPrivilege.Foreground = $brushConv.ConvertFromString("#6CCB5F")
+    } else {
+        $dotPrivilege.Fill = $brushConv.ConvertFromString("#FF99A4")
+        $badgePrivilege.Background = $brushConv.ConvertFromString("#5C2B29")
+        $badgePrivilege.BorderBrush = $brushConv.ConvertFromString("#8A3E3A")
+        $txtPrivilege.Text = "PRIV: $($ctx.PrivilegeLevel) | $($ctx.Mode)"
+        $txtPrivilege.Foreground = $brushConv.ConvertFromString("#FF99A4")
+        $btnFixPrivilege.Visibility = [System.Windows.Visibility]::Visible
+        Write-HubLog "Running WITHOUT elevation. Hash harvest, rename, app installs, clock sync and restart-resume will fail. Click 'Fix Privileges' in the header - preferred level is $($ctx.PreferredLevel)." "WARN"
+    }
+    $btnFixPrivilege.Add_Click({
+        if (Show-PrivilegeGuide -Owner $window) {
+            Write-HubLog "Elevated Hub launched. Closing this non-elevated window." "SUCCESS"
+            $window.Close()
+        }
+    })
+    $badgePrivilege.Add_MouseLeftButtonUp({ Show-PrivilegeGuide -Owner $window | Out-Null })
+
+    if ($script:ResumeFromRestart) {
+        Write-HubLog "Hub resumed automatically after restart; the one-shot resume task has been consumed and removed." "SUCCESS"
+    } elseif ($ctx.MeetsPreferred) {
+        if (Unregister-HubResumeAfterRestart) { Write-HubLog "Removed a stale restart-resume task left over from an earlier session." "INFO" }
+    }
+
+    function Update-DeviceStateUi {
+        $ds = $script:DeviceState
+        if (-not $ds) { return }
+        $bc = [System.Windows.Media.BrushConverter]::new()
+        $tenant = if ($ds.AutopilotTenantDomain) { $ds.AutopilotTenantDomain } elseif ($ds.EntraTenantName) { $ds.EntraTenantName } elseif ($ds.AutopilotTenantId) { $ds.AutopilotTenantId } else { '' }
+
+        $cloudNote = ''
+        if ($ds.CloudChecked) {
+            if ($ds.CloudRegistered) {
+                $ci = $ds.CloudIdentity
+                $cloudNote = " Tenant record found: group tag '$($ci.groupTag)', enrollment '$($ci.enrollmentState)', profile '$($ci.deploymentProfileAssignmentStatus)', last contact $($ci.lastContactedDateTime)."
+            } else {
+                $cloudNote = " The signed-in tenant has NO Autopilot record for this serial number."
+            }
+        }
+
+        $showAction = $true
+        switch ($ds.Verdict) {
+            'AutopilotRegistered' {
+                $title = "DEVICE STATE: AUTOPILOT REGISTERED"
+                $detail = "$($ds.Summary). This PC already received its deployment profile from the Autopilot Deployment Service - that is why it boots into the branded OOBE. Registration is NOT required; use this tab only to export a CSV or change the group tag.$cloudNote"
+                if ($ds.CloudChecked -and -not $ds.CloudRegistered) { $detail += " You are probably signed in to a different tenant than the one this device belongs to ($tenant)." }
+                $bg = '#1F2822'; $border = '#2A5435'; $fg = '#6CCB5F'; $showAction = $false
+                $txtDeviceState.Text = "AUTOPILOT: $tenant"; $txtDeviceState.Foreground = $bc.ConvertFromString('#6CCB5F')
+            }
+            'IntuneEnrolled' {
+                $title = "DEVICE STATE: INTUNE ENROLLED, NO AUTOPILOT PROFILE"
+                $detail = "$($ds.Summary). The device is managed, but Autopilot does not own it - a reset or reprovision would land in the generic OOBE. Harvest the hardware hash and register it so Autopilot takes over next time.$cloudNote"
+                $bg = '#2E2A1F'; $border = '#5C4A29'; $fg = '#FCE100'
+                $txtDeviceState.Text = "INTUNE: $tenant"; $txtDeviceState.Foreground = $bc.ConvertFromString('#FCE100')
+            }
+            'EntraJoined' {
+                $title = "DEVICE STATE: ENTRA JOINED, NOT ENROLLED"
+                $detail = "$($ds.Summary). No MDM enrollment and no Autopilot profile. Harvest and register the hash to bring it under Autopilot.$cloudNote"
+                $bg = '#2E2A1F'; $border = '#5C4A29'; $fg = '#FCE100'
+                $txtDeviceState.Text = "ENTRA: $tenant"; $txtDeviceState.Foreground = $bc.ConvertFromString('#FCE100')
+            }
+            'DomainJoined' {
+                $title = "DEVICE STATE: ON-PREM DOMAIN JOINED"
+                $detail = "$($ds.Summary). Harvest and register the hardware hash if this device is moving to Autopilot.$cloudNote"
+                $bg = '#2E2A1F'; $border = '#5C4A29'; $fg = '#FCE100'
+                $txtDeviceState.Text = "DOMAIN JOINED"; $txtDeviceState.Foreground = $bc.ConvertFromString('#FCE100')
+            }
+            default {
+                $title = "DEVICE STATE: NOT REGISTERED"
+                $detail = "$($ds.Summary). Harvest the hardware hash, then register it with Intune (Graph) or export the CSV for a bulk import.$cloudNote"
+                $bg = '#2E2221'; $border = '#542E2A'; $fg = '#FFAA99'
+                $txtDeviceState.Text = "NOT REGISTERED"; $txtDeviceState.Foreground = $bc.ConvertFromString('#FFAA99')
+            }
+        }
+        if ($ds.CloudChecked -and $ds.CloudRegistered -and $ds.Verdict -ne 'AutopilotRegistered') {
+            $title = "DEVICE STATE: REGISTERED IN SIGNED-IN TENANT"
+            $detail = "The signed-in tenant already holds an Autopilot identity for this serial number.$cloudNote Registering again is unnecessary; the local machine simply has not been through Autopilot OOBE yet."
+            $bg = '#1F2822'; $border = '#2A5435'; $fg = '#6CCB5F'; $showAction = $false
+            $txtDeviceState.Text = "AUTOPILOT (TENANT)"; $txtDeviceState.Foreground = $bc.ConvertFromString('#6CCB5F')
+        }
+        $bannerDeviceState.Background = $bc.ConvertFromString($bg)
+        $bannerDeviceState.BorderBrush = $bc.ConvertFromString($border)
+        $txtDeviceStateTitle.Text = $title
+        $txtDeviceStateTitle.Foreground = $bc.ConvertFromString($fg)
+        $txtDeviceStateDetail.Text = $detail
+        $btnDeviceStateAction.Visibility = if ($showAction -and $script:RuntimeContext.MeetsPreferred) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
+
+        # App Deployment advisory - app assignment belongs to Intune once the device is managed
+        if ($ds.Verdict -in @('AutopilotRegistered', 'IntuneEnrolled') -or $ds.CloudRegistered) {
+            $bannerAppAdvisory.Background = $bc.ConvertFromString('#2E2A1F'); $bannerAppAdvisory.BorderBrush = $bc.ConvertFromString('#5C4A29')
+            $txtAppAdvisory.Foreground = $bc.ConvertFromString('#FCE100')
+            $txtAppAdvisory.Text = "This device is managed by Intune ($tenant). App deployment normally belongs to Intune app assignments and the Enrollment Status Page - use this tab for bench builds, one-off tools and troubleshooting, not as a substitute for policy."
+        } else {
+            $bannerAppAdvisory.Background = $bc.ConvertFromString('#262626'); $bannerAppAdvisory.BorderBrush = $bc.ConvertFromString('#383838')
+            $txtAppAdvisory.Foreground = $bc.ConvertFromString('#B0B0B0')
+            $txtAppAdvisory.Text = "Unmanaged device - installing apps from here is appropriate. Once it is Autopilot-registered and enrolled, prefer Intune app assignments so the build stays reproducible."
+        }
+    }
+
+    function Invoke-TenantAutopilotLookup {
+        if (-not $script:DeviceState) { return }
+        if (-not ($script:GraphAuthContext -and $script:GraphAuthContext.AccessToken)) { return }
+        $serial = $txtSerial.Text
+        if ([string]::IsNullOrWhiteSpace($serial) -or $serial -in @('Detecting...', 'UNKNOWN', 'UNAVAILABLE')) { return }
+        $lookupKey = "$($script:GraphAuthContext.TenantId)|$serial"
+        if ($script:TenantLookupKey -eq $lookupKey) { return }
+        $script:TenantLookupKey = $lookupKey
+        try {
+            Write-HubLog "Checking the signed-in tenant for an existing Autopilot identity (serial $serial)..."
+            $identity = Find-AutopilotIdentityInTenant -SerialNumber $serial -AccessToken $script:GraphAuthContext.AccessToken
+            $script:DeviceState.CloudChecked = $true
+            $script:DeviceState.CloudRegistered = [bool]$identity
+            $script:DeviceState.CloudIdentity = $identity
+            if ($identity) {
+                Write-HubLog "Tenant already holds this device: group tag '$($identity.groupTag)', enrollment '$($identity.enrollmentState)', profile '$($identity.deploymentProfileAssignmentStatus)'." "SUCCESS"
+            } else {
+                Write-HubLog "No Autopilot identity for serial $serial in the signed-in tenant." "INFO"
+            }
+        } catch {
+            $script:TenantLookupKey = $null
+            Write-HubLog "Tenant Autopilot lookup skipped: $(Get-GraphErrorMessage -ErrorRecord $_)" "WARN"
+        }
+        Update-DeviceStateUi
+    }
 
     try {
         $bios = Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue
@@ -2837,7 +3399,7 @@ function Start-AutopilotHubGui {
     })
 
     # --- ACTION: Harvest Hash ---
-    $btnHarvestHash.Add_Click({
+    function Invoke-HubHarvest {
         Write-HubLog "Starting high-speed Autopilot hardware hash harvester..."
         Set-HubProgress -Percent 15 -Status "Querying MDM Provider"
 
@@ -2865,7 +3427,9 @@ function Start-AutopilotHubGui {
             Write-HubLog "Hardware hash unavailable: $reason" "ERROR"
             Set-HubProgress -Percent 0 -Status "Harvest Failed"
         }
-    })
+    }
+    $btnHarvestHash.Add_Click({ Invoke-HubHarvest })
+    $btnDeviceStateAction.Add_Click({ Invoke-HubHarvest })
 
     # --- ACTION: Export CSV ---
     $btnExportCsv.Add_Click({
@@ -2919,6 +3483,16 @@ function Start-AutopilotHubGui {
             return
         }
         Update-GraphAuthHeader
+
+        $ds = $script:DeviceState
+        if ($ds -and ($ds.Verdict -eq 'AutopilotRegistered' -or $ds.CloudRegistered)) {
+            $ans = [System.Windows.MessageBox]::Show("This device already appears to be Autopilot-registered:`n`n$($ds.Summary)`n`nImporting the same hardware hash again is either rejected by Intune (ZtdDeviceAlreadyAssigned) or only updates the group tag. Continue anyway?", "Already Registered", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+            if ($ans -ne [System.Windows.MessageBoxResult]::Yes) {
+                Write-HubLog "Registration skipped - device already registered." "INFO"
+                Set-HubProgress -Percent 0 -Status "Skipped"
+                return
+            }
+        }
 
         Write-HubLog "Using active Microsoft Graph session ($($script:GraphAuthContext.TenantId))." "SUCCESS"
         Set-HubProgress -Percent 40 -Status "Uploading Device Hash"
@@ -3177,11 +3751,22 @@ function Start-AutopilotHubGui {
     })
 
     $btnReboot.Add_Click({
-        $confirm = [System.Windows.MessageBox]::Show("Are you sure you want to reboot the machine into Windows OOBE setup now?", "Confirm Reboot", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+        $ctx = $script:RuntimeContext
+        $comeback = if ($ctx.IsOobe) { 'OOBE' } else { 'the desktop' }
+        $confirm = [System.Windows.MessageBox]::Show("Restart the machine now?`n`nYes = restart and automatically re-open this Hub when $comeback comes back`nNo = plain restart`nCancel = do nothing", "Restart System", [System.Windows.MessageBoxButton]::YesNoCancel, [System.Windows.MessageBoxImage]::Question)
+        if ($confirm -eq [System.Windows.MessageBoxResult]::Cancel) { return }
         if ($confirm -eq [System.Windows.MessageBoxResult]::Yes) {
-            Write-HubLog "Initiating system restart..." "WARN"
-            Restart-Computer -Force
+            try {
+                $persisted = Register-HubResumeAfterRestart
+                Write-HubLog "Resume task '$($script:ResumeTaskName)' registered (interactive logon trigger). Hub source persisted to $persisted." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not register the resume task: $($_.Exception.Message)" "ERROR"
+                $ans = [System.Windows.MessageBox]::Show("The Hub could not schedule itself to re-open after the restart:`n$($_.Exception.Message)`n`nRestart anyway (without persistence)?", "Persistence Failed", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+                if ($ans -ne [System.Windows.MessageBoxResult]::Yes) { return }
+            }
         }
+        Write-HubLog "Initiating system restart..." "WARN"
+        Restart-Computer -Force
     })
 
     $btnCopyLog.Add_Click({
@@ -3380,12 +3965,34 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     $initialDiag = Test-StagedNetwork
     $lstDiagStages.ItemsSource = $initialDiag.Stages
 
-    # Check for Existing / Silent Graph Session (.env)
+    # Device enrollment state from local evidence (cached Autopilot profile, MDM enrollment, Entra join)
+    Set-HubProgress -Percent 5 -Status "Inspecting device state"
+    try {
+        $script:DeviceState = Get-DeviceEnrollmentState
+        Write-HubLog "Device state: $($script:DeviceState.Summary)" $(if ($script:DeviceState.Verdict -eq 'AutopilotRegistered') { 'SUCCESS' } else { 'INFO' })
+        foreach ($ev in $script:DeviceState.Evidence) { Write-HubLog "  evidence: $ev" }
+    } catch {
+        Write-HubLog "Device state inspection failed: $($_.Exception.Message)" "WARN"
+    }
+    Update-DeviceStateUi
+
+    # Check for Existing / Silent Graph Session (.env) - also triggers the tenant-side Autopilot lookup
     $silentToken = Get-CurrentGraphToken
     if ($silentToken) {
         Write-HubLog "Microsoft Graph session auto-connected from environment ($($script:GraphAuthContext.TenantId))." "SUCCESS"
     }
     Update-GraphAuthHeader
+
+    # Auto-harvest: an elevated session reads the hash immediately so the operator sees it without clicking
+    if ($script:RuntimeContext.MeetsPreferred) {
+        if ($script:DeviceState -and $script:DeviceState.Verdict -eq 'AutopilotRegistered') {
+            Write-HubLog "Device is already Autopilot-registered - hash harvest is available but not required." "INFO"
+        }
+        Invoke-HubHarvest
+    } else {
+        $txtHashMeta.Text = "Hardware hash needs elevation. Click 'Fix Privileges' in the header, then the hash is read automatically."
+    }
+    Set-HubProgress -Percent 0 -Status "Ready"
 
     # Show Window
     $window.ShowDialog() | Out-Null
@@ -3478,17 +4085,42 @@ if ($ExportCsv) {
 
 # Launch GUI in STA Apartment State
 if (-not $NoGui) {
+    # Single-instance guard: the restart-resume task and its RunOnce fallback may both fire on the desktop.
+    # The inner STA runspace (below) re-runs this script in the same process and must skip the check.
+    if ($env:AUTOPILOT_HUB_STA_CHILD -ne '1') {
+        $mutexCreated = $false
+        $script:InstanceMutex = [System.Threading.Mutex]::new($true, 'Global\AutopilotCommandHub', [ref]$mutexCreated)
+        if (-not $mutexCreated) {
+            Write-Host "Autopilot Command Hub is already running in this session - use that window." -ForegroundColor Yellow
+            return
+        }
+        if ($ResumeFromRestart) { Unregister-HubResumeAfterRestart | Out-Null }
+    }
+
     if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -eq [System.Threading.ApartmentState]::STA) {
         Start-AutopilotHubGui
     } else {
-        # Spin up STA thread
-        $syncHash = [hashtable]::Synchronized(@{})
-        $thread = [System.Threading.Thread]::new([System.Threading.ThreadStart]{
-            Start-AutopilotHubGui
-        })
-        $thread.SetApartmentState([System.Threading.ApartmentState]::STA)
-        $thread.Start()
-        $thread.Join()
+        # WPF needs STA. A raw [System.Threading.Thread] cannot execute PowerShell script blocks (no runspace
+        # on that thread), so re-run this script inside a dedicated STA runspace with the same parameters.
+        $source = if ($script:SelfScriptPath -and (Test-Path $script:SelfScriptPath)) { Get-Content -Path $script:SelfScriptPath -Raw } else { $script:SelfSource }
+        if (-not $source) { throw "Cannot relaunch in STA: the running script's source is unavailable." }
+        $staRunspace = [runspacefactory]::CreateRunspace()
+        $staRunspace.ApartmentState = 'STA'
+        $staRunspace.ThreadOptions = 'ReuseThread'
+        $staRunspace.Open()
+        $staHost = [powershell]::Create()
+        $staHost.Runspace = $staRunspace
+        [void]$staHost.AddScript($source)
+        foreach ($k in $PSBoundParameters.Keys) { [void]$staHost.AddParameter($k, $PSBoundParameters[$k]) }
+        $env:AUTOPILOT_HUB_STA_CHILD = '1'
+        try {
+            $staHost.Invoke() | Out-Null
+            foreach ($e in $staHost.Streams.Error) { Write-Host "[STA] $e" -ForegroundColor Red }
+        } finally {
+            $env:AUTOPILOT_HUB_STA_CHILD = $null
+            $staHost.Dispose()
+            $staRunspace.Dispose()
+        }
     }
 }
 '''

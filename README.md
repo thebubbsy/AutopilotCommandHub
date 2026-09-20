@@ -49,6 +49,15 @@ powershell -ExecutionPolicy Bypass -File "C:\src\AutopilotCommandHub\autopilot.p
 * **Smart CSV Exporter**: Automatically detects connected USB flash drives (`Win32_Volume` DriveType 2) and saves the standardized Microsoft Intune CSV format.
 * **Dynamic Computer Renaming**: Resolves computer naming patterns (e.g. `WS-%SERIAL%` or `LT-%SERIAL%`) and applies them with a single click.
 
+### 1b. Session Awareness: Privilege Badge, Device State & Restart Persistence
+The Hub is built to run in two very different places - the OOBE `Shift+F10` prompt (SYSTEM) and a normal desktop (usually a standard user) - so it tells you where it is and what it can do, all the time:
+
+* **Always-visible privilege badge** (`PRIV: SYSTEM | OOBE`, `PRIV: ADMINISTRATOR | DESKTOP`, `PRIV: STANDARD USER | DESKTOP`). Below the preferred level a red **Fix Privileges** button appears; clicking it (or the badge) opens a guide showing current vs. preferred level, why it matters, and the exact steps. On the desktop it offers **Relaunch as Administrator**: the running script is persisted to `%ProgramData%\AutopilotCommandHub` (works even when started via `irm | iex`), relaunched through UAC with the same `.env`, and the unprivileged window closes itself.
+* **Device state on launch** - before you touch anything the Hub answers "is this PC already someone's?" from local evidence: the Autopilot profile the device fetched from the Deployment Service during OOBE (`AutopilotDDSZTDFile.json` / `Provisioning\Diagnostics\AutoPilot` - the thing that makes a registered PC boot into the branded OOBE), Intune MDM enrollment (`Enrollments\*` with provider `MS DM Server`) and `dsregcmd` Entra/domain join. Verdicts: **Autopilot registered** (no action needed, Register asks for confirmation), **Intune enrolled but no Autopilot profile**, **Entra joined**, **Domain joined**, or **Not registered** (harvest + register). Elevated sessions harvest the hash automatically at start.
+* **Tenant-side lookup** - once signed in to Graph, the serial is checked against `windowsAutopilotDeviceIdentities` in *that* tenant and the banner is updated with group tag, enrollment state and last contact. (Only the device itself, during OOBE, can ask "which tenant owns me?" across all tenants - and its answer is exactly the cached profile above. Graph only sees the tenant you signed in to.)
+* **Restart with persistence** - **Restart System** now asks *Yes = restart and re-open the Hub when OOBE / the desktop comes back*. It persists the script + `.env`, registers a one-shot logon-triggered scheduled task in the interactive session (`Administrators` group during OOBE, the current user on the desktop, `RunLevel Highest`) plus a `RunOnce` fallback, then restarts. The relaunched Hub (`-ResumeFromRestart`) removes both itself; a named mutex prevents a double launch.
+* **App Deployment advisory** - on managed devices the App tab explains that app assignment belongs to Intune and this tab is for bench builds and one-offs.
+
 ### 2. Microsoft Graph & Entra ID Device Code Authentication
 * **Interactive Device Code Flow**: Directly acquires tokens via RFC 8628 Device Authorization with universal pre-consented Azure PowerShell client ID (`1950a258-227b-4e31-a9cf-717495945fc2`).
 * **One-Click Browser Launcher**: Dedicated **Open Browser** button alongside automated clipboard copy of the user code.
@@ -101,6 +110,9 @@ powershell -File .\autopilot.ps1 -DellWarranty -ExportCsv -CsvPath "C:\temp\Warr
 
 # 5. Rename computer using template
 powershell -File .\autopilot.ps1 -RenameComputer -ComputerNamePrefix "WS" -ComputerNameTemplate "WS-%SERIAL%"
+
+# 6. (internal) What the restart-resume scheduled task runs - cleans itself up on start
+powershell -NoProfile -ExecutionPolicy Bypass -STA -File "C:\ProgramData\AutopilotCommandHub\autopilot.ps1" -EnvFile "C:\ProgramData\AutopilotCommandHub\.env" -ResumeFromRestart
 ```
 
 ---
