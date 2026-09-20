@@ -49,7 +49,8 @@ param(
     [switch]$RenameComputer,
     [string]$ComputerNamePrefix = '',
     [string]$ComputerNameTemplate = '',
-    [switch]$ResumeFromRestart
+    [switch]$ResumeFromRestart,
+    [switch]$ReplacingInstance
 )
 
 # 0. Central Environment & Configuration Engine (.env)
@@ -129,6 +130,16 @@ function Import-EnvConfig {
             $candidates.Add((Join-Path -Path $userProfile -ChildPath '.env'))
         }
 
+        # Lowest priority: the shipped .env.example (carries public defaults like the Dell warranty key)
+        # so a cloned/downloaded copy works with zero setup. A real .env always wins over it.
+        if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+            $candidates.Add((Join-Path -Path $PSScriptRoot -ChildPath '.env.example'))
+        }
+        try {
+            $curEx = (Get-Location -ErrorAction SilentlyContinue).Path
+            if (-not [string]::IsNullOrWhiteSpace($curEx)) { $candidates.Add((Join-Path -Path $curEx -ChildPath '.env.example')) }
+        } catch { }
+
         foreach ($c in $candidates) {
             if (-not [string]::IsNullOrWhiteSpace($c)) {
                 try {
@@ -155,6 +166,30 @@ function Import-EnvConfig {
             }
             $script:LoadedEnvPath = $targetFile
             return $targetFile
+        } catch { }
+    }
+
+    # Remote fallback: under `irm https://onyachamp.com/autopilot | iex` there is no file on disk, so
+    # pull the shipped .env.example (public defaults such as the Dell warranty key) from the bootstrap host.
+    if (-not $targetFile) {
+        try {
+            $envUrl = if ($env:DOTENV_URL) { $env:DOTENV_URL } else { 'https://onyachamp.com/.env.example' }
+            try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch { }
+            $resp = Invoke-RestMethod -Uri $envUrl -TimeoutSec 8 -ErrorAction Stop
+            $text = if ($resp -is [string]) { $resp } else { [string]$resp }
+            $applied = 0
+            foreach ($line in ($text -split "`r?`n")) {
+                if ($line -match '^\s*([^#=]+?)\s*=\s*(.*)$') {
+                    $k = $Matches[1].Trim()
+                    $v = $Matches[2].Trim().Trim('"').Trim("'")
+                    # Non-destructive: never override a value already provided by the real environment
+                    if (-not [string]::IsNullOrWhiteSpace($k) -and [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($k, 'Process'))) {
+                        [Environment]::SetEnvironmentVariable($k, $v, 'Process')
+                        $applied++
+                    }
+                }
+            }
+            if ($applied -gt 0) { $script:LoadedEnvPath = $envUrl; return $envUrl }
         } catch { }
     }
     return $null
@@ -320,19 +355,29 @@ function Save-HubSelfCopy {
 }
 
 function Get-HubRelaunchArguments {
-    param([Parameter(Mandatory = $true)][string]$ScriptPath, [switch]$Resume)
+    param([Parameter(Mandatory = $true)][string]$ScriptPath, [switch]$Resume, [switch]$Replacing)
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', "`"$ScriptPath`"")
     $envCandidate = Join-Path (Split-Path $ScriptPath -Parent) '.env'
     if (Test-Path $envCandidate) { $argList += @('-EnvFile', "`"$envCandidate`"") }
     if ($Resume) { $argList += '-ResumeFromRestart' }
+    if ($Replacing) { $argList += '-ReplacingInstance' }
     return ($argList -join ' ')
 }
 
 # --- Function: Invoke-HubElevatedRelaunch (UAC relaunch of this exact script) ---
 function Invoke-HubElevatedRelaunch {
     $path = Save-HubSelfCopy
-    $argLine = Get-HubRelaunchArguments -ScriptPath $path
+    # -Replacing tells the elevated child this is a hand-off, so it waits for our single-instance mutex
+    # instead of bailing out with "already running" (the old Catch-22 where the elevated window never showed).
+    $argLine = Get-HubRelaunchArguments -ScriptPath $path -Replacing
     Start-Process -FilePath $script:RuntimeContext.HostPath -ArgumentList $argLine -Verb RunAs -ErrorAction Stop | Out-Null
+    # Release our instance mutex now so the elevated child can take it as this window closes.
+    try {
+        if ($script:InstanceMutex) {
+            try { $script:InstanceMutex.ReleaseMutex() } catch { }
+            $script:InstanceMutex.Dispose(); $script:InstanceMutex = $null
+        }
+    } catch { }
     return $true
 }
 
@@ -2175,8 +2220,11 @@ function Get-DellWarrantyInfo {
         Import-EnvConfig -Path $EnvFile | Out-Null
     }
 
-    $effClientId = if ($ClientId) { $ClientId } elseif ($env:DELL_CLIENT_ID) { $env:DELL_CLIENT_ID } else { 'l71df1d39771064ce8a49569b4b56b67c5' }
-    $effClientSecret = if ($ClientSecret) { $ClientSecret } elseif ($env:DELL_CLIENT_SECRET) { $env:DELL_CLIENT_SECRET } else { 'c4ec5f7556fa4bc6bb1a5164878f5e2c' }
+    $effClientId = if ($ClientId) { $ClientId } elseif ($env:DELL_CLIENT_ID) { $env:DELL_CLIENT_ID } else { '' }
+    $effClientSecret = if ($ClientSecret) { $ClientSecret } elseif ($env:DELL_CLIENT_SECRET) { $env:DELL_CLIENT_SECRET } else { '' }
+    if ([string]::IsNullOrWhiteSpace($effClientId) -or [string]::IsNullOrWhiteSpace($effClientSecret)) {
+        throw "Dell warranty credentials not configured. Set DELL_CLIENT_ID and DELL_CLIENT_SECRET in your .env (see .env.example), or pass -ClientId/-ClientSecret."
+    }
     $tokenUrl = if ($env:DELL_TOKEN_URL) { $env:DELL_TOKEN_URL } else { 'https://apigtwb2c.us.dell.com/auth/oauth/v2/token' }
     $warrantyUrl = if ($env:DELL_WARRANTY_URL) { $env:DELL_WARRANTY_URL } else { 'https://apigtwb2c.us.dell.com/PROD/sbil/eapi/v5/asset-entitlements' }
 
@@ -4877,8 +4925,16 @@ if (-not $NoGui) {
         $mutexCreated = $false
         $script:InstanceMutex = [System.Threading.Mutex]::new($true, 'Global\AutopilotCommandHub', [ref]$mutexCreated)
         if (-not $mutexCreated) {
-            Write-Host "Autopilot Command Hub is already running in this session - use that window." -ForegroundColor Yellow
-            return
+            if ($ReplacingInstance) {
+                # Elevated hand-off: the window we are replacing is still closing. Wait for it to release
+                # the mutex (AbandonedMutexException still means we acquired it) so this instance can show.
+                try { [void]$script:InstanceMutex.WaitOne([TimeSpan]::FromSeconds(12)) } catch { }
+            } else {
+                $msg = "Autopilot Command Hub is already running - use the window that is already open."
+                try { [System.Windows.MessageBox]::Show($msg, "Already Running", 'OK', 'Information') | Out-Null }
+                catch { Write-Host $msg -ForegroundColor Yellow }
+                return
+            }
         }
         if ($ResumeFromRestart) { Unregister-HubResumeAfterRestart | Out-Null }
     }

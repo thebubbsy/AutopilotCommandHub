@@ -92,8 +92,11 @@ function Import-EnvConfigFile {
 Import-EnvConfigFile -Path $EnvFile
 
 # 3. Resolve API Credentials
-$effClientId = if ($ClientId) { $ClientId } elseif ($env:DELL_CLIENT_ID) { $env:DELL_CLIENT_ID } else { 'l71df1d39771064ce8a49569b4b56b67c5' }
-$effClientSecret = if ($ClientSecret) { $ClientSecret } elseif ($env:DELL_CLIENT_SECRET) { $env:DELL_CLIENT_SECRET } else { 'c4ec5f7556fa4bc6bb1a5164878f5e2c' }
+$effClientId = if ($ClientId) { $ClientId } elseif ($env:DELL_CLIENT_ID) { $env:DELL_CLIENT_ID } else { '' }
+$effClientSecret = if ($ClientSecret) { $ClientSecret } elseif ($env:DELL_CLIENT_SECRET) { $env:DELL_CLIENT_SECRET } else { '' }
+if ([string]::IsNullOrWhiteSpace($effClientId) -or [string]::IsNullOrWhiteSpace($effClientSecret)) {
+    throw "Dell warranty credentials not configured. Set DELL_CLIENT_ID and DELL_CLIENT_SECRET (env or .env), or pass -ClientId/-ClientSecret."
+}
 $tokenUrl = if ($env:DELL_TOKEN_URL) { $env:DELL_TOKEN_URL } else { 'https://apigtwb2c.us.dell.com/auth/oauth/v2/token' }
 $warrantyUrl = if ($env:DELL_WARRANTY_URL) { $env:DELL_WARRANTY_URL } else { 'https://apigtwb2c.us.dell.com/PROD/sbil/eapi/v5/asset-entitlements' }
 
