@@ -14,6 +14,7 @@ on:
       - 'build_autopilot.py'
       - 'autopilot.ps1'
       - 'autopilot'
+      - '.env.example'
       - '.github/workflows/deploy-website.yml'
   workflow_dispatch:
 
@@ -56,16 +57,17 @@ jobs:
         run: |
           cp autopilot.ps1 site/autopilot.ps1
           cp autopilot     site/autopilot
+          cp .env.example  site/.env.example
 
       - name: Commit and push to onyachamp
         working-directory: site
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- autopilot autopilot.ps1; then
+          if git diff --quiet -- autopilot autopilot.ps1 .env.example; then
             echo "Website already up to date; nothing to publish."
             exit 0
           fi
-          git add autopilot autopilot.ps1
+          git add autopilot autopilot.ps1 .env.example
           git commit -m "deploy: sync autopilot bootstrap from AutopilotCommandHub@${GITHUB_SHA::7}"
           git push

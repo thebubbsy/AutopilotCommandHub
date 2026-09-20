@@ -375,6 +375,131 @@ function Invoke-HubElevatedRelaunch {
     return $true
 }
 
+# --- Function: Close-ExistingHubInstances (Terminate prior running Hub instances) ---
+function Close-ExistingHubInstances {
+    [CmdletBinding()]
+    param()
+
+    $currentPid = $PID
+    $targetPids = [System.Collections.Generic.HashSet[int]]::new()
+
+    # 1. Inspect PID file in Temp and ProgramData
+    foreach ($pPath in @(
+        (Join-Path ([System.IO.Path]::GetTempPath()) 'AutopilotCommandHub.pid'),
+        (Join-Path $env:ProgramData 'AutopilotCommandHub\hub.pid')
+    )) {
+        if (Test-Path $pPath) {
+            try {
+                $raw = (Get-Content -Path $pPath -Raw -ErrorAction SilentlyContinue).Trim()
+                $val = 0
+                if ([int]::TryParse($raw, [ref]$val) -and $val -gt 0 -and $val -ne $currentPid) {
+                    [void]$targetPids.Add($val)
+                }
+            } catch { }
+        }
+    }
+
+    # 2. Enumerate existing Hub windows and post WM_CLOSE for graceful UI shutdown
+    try {
+        if (-not ('HubWinUtil' -as [type])) {
+            Add-Type @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public class HubWinUtil {
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll")]
+    public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+}
+"@ -ErrorAction SilentlyContinue
+        }
+
+        if ('HubWinUtil' -as [type]) {
+            $windowCallback = [HubWinUtil+EnumWindowsProc]{
+                param($hWnd, $lParam)
+                try {
+                    $sb = [System.Text.StringBuilder]::new(256)
+                    [void][HubWinUtil]::GetWindowText($hWnd, $sb, 256)
+                    $title = $sb.ToString()
+                    if ($title -like '*Autopilot Provisioning Hub*' -or $title -like '*Privilege Check*') {
+                        $wPid = 0
+                        [void][HubWinUtil]::GetWindowThreadProcessId($hWnd, [ref]$wPid)
+                        if ($wPid -and $wPid -ne $currentPid) {
+                            [void]$targetPids.Add($wPid)
+                            # WM_CLOSE = 0x0010
+                            [void][HubWinUtil]::PostMessage($hWnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+                        }
+                    }
+                } catch { }
+                return $true
+            }
+            [void][HubWinUtil]::EnumWindows($windowCallback, [IntPtr]::Zero)
+        }
+    } catch { }
+
+    # 3. Query Win32_Process for any lingering PowerShell processes executing AutopilotCommandHub
+    try {
+        $candidateProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            ($_.Name -in @('powershell.exe', 'pwsh.exe')) -and
+            ($_.ProcessId -ne $currentPid) -and
+            (
+                $_.CommandLine -like '*autopilot.ps1*' -or
+                $_.CommandLine -like '*AutopilotCommandHub*' -or
+                $_.CommandLine -like '*onyachamp.com/autopilot*'
+            ) -and
+            (
+                $_.CommandLine -notlike '*python*' -and
+                $_.CommandLine -notlike '*git*' -and
+                $_.CommandLine -notlike '*antigravity*' -and
+                $_.CommandLine -notlike '*code.exe*'
+            )
+        }
+        foreach ($cp in $candidateProcs) {
+            [void]$targetPids.Add([int]$cp.ProcessId)
+        }
+    } catch { }
+
+    # 4. Gracefully await exit, then force terminate any still running
+    if ($targetPids.Count -gt 0) {
+        Write-Host "Closing $($targetPids.Count) existing Autopilot Command Hub instance(s) [PID(s): $($targetPids -join ', ')]..." -ForegroundColor Yellow
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($sw.ElapsedMilliseconds -lt 300) {
+            $anyAlive = $false
+            foreach ($tPid in $targetPids) {
+                if (Get-Process -Id $tPid -ErrorAction SilentlyContinue) {
+                    $anyAlive = $true
+                    break
+                }
+            }
+            if (-not $anyAlive) { break }
+            Start-Sleep -Milliseconds 50
+        }
+
+        foreach ($tPid in $targetPids) {
+            try {
+                $proc = Get-Process -Id $tPid -ErrorAction SilentlyContinue
+                if ($proc) {
+                    Stop-Process -Id $tPid -Force -ErrorAction SilentlyContinue
+                }
+            } catch { }
+        }
+    }
+
+    # Clean up stale PID file references
+    foreach ($pPath in @(
+        (Join-Path ([System.IO.Path]::GetTempPath()) 'AutopilotCommandHub.pid'),
+        (Join-Path $env:ProgramData 'AutopilotCommandHub\hub.pid')
+    )) {
+        try { if (Test-Path $pPath) { Remove-Item -Path $pPath -Force -ErrorAction SilentlyContinue } } catch { }
+    }
+}
+
 # --- Function: Register-HubResumeAfterRestart (re-open the Hub when OOBE / the desktop comes back) ---
 function Register-HubResumeAfterRestart {
     $ctx = $script:RuntimeContext
@@ -3824,7 +3949,12 @@ function Start-AutopilotHubGui {
             $window.Close()
         }
     })
-    $badgePrivilege.Add_MouseLeftButtonUp({ Show-PrivilegeGuide -Owner $window | Out-Null })
+    $badgePrivilege.Add_MouseLeftButtonUp({
+        if (Show-PrivilegeGuide -Owner $window) {
+            Write-HubLog "Elevated Hub launched. Closing this non-elevated window." "SUCCESS"
+            $window.Close()
+        }
+    })
 
     if ($script:ResumeFromRestart) {
         Write-HubLog "Hub resumed automatically after restart; the one-shot resume task has been consumed and removed." "SUCCESS"
@@ -4913,49 +5043,71 @@ if ($ExportCsv) {
 
 # Launch GUI in STA Apartment State
 if (-not $NoGui) {
-    # Single-instance guard: the restart-resume task and its RunOnce fallback may both fire on the desktop.
-    # The inner STA runspace (below) re-runs this script in the same process and must skip the check.
+    # Single-instance lifecycle: Automatically close prior lingering instances instead of blocking
     if ($env:AUTOPILOT_HUB_STA_CHILD -ne '1') {
         $mutexCreated = $false
         $script:InstanceMutex = [System.Threading.Mutex]::new($true, 'Global\AutopilotCommandHub', [ref]$mutexCreated)
         if (-not $mutexCreated) {
-            if ($ReplacingInstance) {
-                # Elevated hand-off: the window we are replacing is still closing. Wait for it to release
-                # the mutex (AbandonedMutexException still means we acquired it) so this instance can show.
-                try { [void]$script:InstanceMutex.WaitOne([TimeSpan]::FromSeconds(12)) } catch { }
-            } else {
-                $msg = "Autopilot Command Hub is already running - use the window that is already open."
-                try { [System.Windows.MessageBox]::Show($msg, "Already Running", 'OK', 'Information') | Out-Null }
-                catch { Write-Host $msg -ForegroundColor Yellow }
-                return
+            # Cleanly close and terminate any previous instance(s)
+            Close-ExistingHubInstances
+
+            # Acquire ownership of the released/abandoned mutex
+            try {
+                [void]$script:InstanceMutex.WaitOne([TimeSpan]::FromSeconds(3))
+            } catch {
+                # AbandonedMutexException in .NET means previous holder terminated; ownership is granted to this thread
             }
         }
+
+        # Record this process PID for clean lifecycle tracking
+        try {
+            $pidFile = Join-Path ([System.IO.Path]::GetTempPath()) 'AutopilotCommandHub.pid'
+            [System.IO.File]::WriteAllText($pidFile, $PID.ToString())
+        } catch { }
+
         if ($ResumeFromRestart) { Unregister-HubResumeAfterRestart | Out-Null }
     }
 
-    if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -eq [System.Threading.ApartmentState]::STA) {
-        Start-AutopilotHubGui
-    } else {
-        # WPF needs STA. A raw [System.Threading.Thread] cannot execute PowerShell script blocks (no runspace
-        # on that thread), so re-run this script inside a dedicated STA runspace with the same parameters.
-        $source = if ($script:SelfScriptPath -and (Test-Path $script:SelfScriptPath)) { Get-Content -Path $script:SelfScriptPath -Raw } else { $script:SelfSource }
-        if (-not $source) { throw "Cannot relaunch in STA: the running script's source is unavailable." }
-        $staRunspace = [runspacefactory]::CreateRunspace()
-        $staRunspace.ApartmentState = 'STA'
-        $staRunspace.ThreadOptions = 'ReuseThread'
-        $staRunspace.Open()
-        $staHost = [powershell]::Create()
-        $staHost.Runspace = $staRunspace
-        [void]$staHost.AddScript($source)
-        foreach ($k in $PSBoundParameters.Keys) { [void]$staHost.AddParameter($k, $PSBoundParameters[$k]) }
-        $env:AUTOPILOT_HUB_STA_CHILD = '1'
-        try {
-            $staHost.Invoke() | Out-Null
-            foreach ($e in $staHost.Streams.Error) { Write-Host "[STA] $e" -ForegroundColor Red }
-        } finally {
-            $env:AUTOPILOT_HUB_STA_CHILD = $null
-            $staHost.Dispose()
-            $staRunspace.Dispose()
+    try {
+        if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -eq [System.Threading.ApartmentState]::STA) {
+            Start-AutopilotHubGui
+        } else {
+            # WPF needs STA. A raw [System.Threading.Thread] cannot execute PowerShell script blocks (no runspace
+            # on that thread), so re-run this script inside a dedicated STA runspace with the same parameters.
+            $source = if ($script:SelfScriptPath -and (Test-Path $script:SelfScriptPath)) { Get-Content -Path $script:SelfScriptPath -Raw } else { $script:SelfSource }
+            if (-not $source) { throw "Cannot relaunch in STA: the running script's source is unavailable." }
+            $staRunspace = [runspacefactory]::CreateRunspace()
+            $staRunspace.ApartmentState = 'STA'
+            $staRunspace.ThreadOptions = 'ReuseThread'
+            $staRunspace.Open()
+            $staHost = [powershell]::Create()
+            $staHost.Runspace = $staRunspace
+            [void]$staHost.AddScript($source)
+            foreach ($k in $PSBoundParameters.Keys) { [void]$staHost.AddParameter($k, $PSBoundParameters[$k]) }
+            $env:AUTOPILOT_HUB_STA_CHILD = '1'
+            try {
+                $staHost.Invoke() | Out-Null
+                foreach ($e in $staHost.Streams.Error) { Write-Host "[STA] $e" -ForegroundColor Red }
+            } finally {
+                $env:AUTOPILOT_HUB_STA_CHILD = $null
+                $staHost.Dispose()
+                $staRunspace.Dispose()
+            }
+        }
+    } finally {
+        # Clean up PID file and release single-instance mutex when the GUI session exits
+        if ($env:AUTOPILOT_HUB_STA_CHILD -ne '1') {
+            try {
+                $pidFile = Join-Path ([System.IO.Path]::GetTempPath()) 'AutopilotCommandHub.pid'
+                if (Test-Path $pidFile) { Remove-Item -Path $pidFile -Force -ErrorAction SilentlyContinue }
+            } catch { }
+            try {
+                if ($script:InstanceMutex) {
+                    try { $script:InstanceMutex.ReleaseMutex() } catch { }
+                    $script:InstanceMutex.Dispose()
+                    $script:InstanceMutex = $null
+                }
+            } catch { }
         }
     }
 }
