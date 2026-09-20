@@ -141,6 +141,21 @@ For hybrid (on-prem domain-joined **and** Entra-registered) and co-managed (Conf
 * **Policy & Connectivity**: DC line-of-sight (`nltest /dsgetdc`), `gpupdate /force`, and domain time resync (`w32tm`) for the Kerberos/cert failures that clock skew causes.
 * **Compliance / Security / Diagnostics**: Conditional Access readiness (Entra join + PRT + MDM enrollment) so you know *why* a device is blocked; one-click BitLocker recovery-key escrow to Entra (and AD); a legacy-dependency scan (SMBv1, NTLM level, Credential Guard, mapped drives) for what security baselines will break; machine certificate expiry (802.1x/VPN/SCEP); and a **Collect Hybrid Diagnostics** bundle (`dsregcmd`, `gpresult`, `mdmdiagnosticstool`, IME logs) zipped for the helpdesk.
 
+### 4b. Multi-Vendor Hardware Health & Lenovo Warranty
+* **Lenovo warranty** alongside Dell (`Assess Lenovo` / `-LenovoWarranty [-LenovoSerialNumber]`) via Lenovo's public warranty API.
+* **Battery wear** from the authoritative `root\wmi` counters (`BatteryStaticData` / `BatteryFullChargedCapacity`) with `Win32_PortableBattery` fallback - `Win32_Battery` alone reads 0/0 on most firmware. Verdict is `Unknown` when the counters are not exposed, never a false "Good".
+* **NVMe/SSD reliability** (`Get-StorageReliabilityCounter`: wear, temperature, read errors) - needs elevation.
+* CLI: `-HardwareHealth` prints both.
+
+### 4c. ESP Diagnostics & Lifecycle
+* **Win32App ESP registry status** and a live **IME log tail**; `mdmdiagnosticstool` CAB export.
+* **Cloud lifecycle**: in-place PATCH of an existing Autopilot identity (group tag / assigned user), instant tenant Autopilot sync, and a **local decommission** that purges the cached profile, Provisioning diagnostics and local MDM enrollment keys. It does *not* retire the device in Intune - do that in the portal, or the tenant still thinks it is managed (`-Decommission` on the CLI asks you to type `DECOMMISSION`).
+* **OOBE Wi-Fi manager** (scan/connect, 802.1X XML profile import) and **USB driver injection** (`pnputil`) for hardware that OOBE cannot see.
+* **Windows edition & OEM key** inspector with a guarded Enterprise edition switch (generic KMS client key - only activates against a KMS host or M365 E3/E5 subscription activation; the dialog says so).
+* **Offline Autopilot JSON** (`AutopilotConfigurationFile.json`) generate + inject for air-gapped provisioning; `-OfflineJson [-OfflineJsonPath]` on the CLI (tenant from `AZURE_TENANT_ID` / `AUTOPILOT_TENANT_DOMAIN` or the device's cached profile).
+* **Tenant branding** in the header: resolved without a token from the device's cached tenant domain, refined after Graph sign-in; a red banner flags a mismatch between the device's tenant and the signed-in tenant.
+* Success/error chimes on harvest, registration and CSV export.
+
 ### 5. 7-Stage Pre-Flight Network & Hardware Ladder
 1. **Network Interface**: Verifies active physical adapter is in `Up` status.
 2. **Default Gateway**: Pings dynamic default gateway (or fallback router IP).
@@ -172,7 +187,19 @@ powershell -File .\autopilot.ps1 -DellWarranty -ExportCsv -CsvPath "C:\temp\Warr
 # 5. Rename computer using template
 powershell -File .\autopilot.ps1 -RenameComputer -ComputerNamePrefix "WS" -ComputerNameTemplate "WS-%SERIAL%"
 
-# 6. (internal) What the restart-resume scheduled task runs - cleans itself up on start
+# 6. Lenovo warranty (serial auto-detected from BIOS unless given), optional CSV
+powershell -File .\autopilot.ps1 -LenovoWarranty -LenovoSerialNumber "PF1ABC23" -ExportCsv
+
+# 7. Battery wear + SSD reliability
+powershell -File .\autopilot.ps1 -HardwareHealth
+
+# 8. Offline Autopilot JSON profile (tenant from env / .env or the cached device profile)
+powershell -File .\autopilot.ps1 -OfflineJson -OfflineJsonPath "E:\AutopilotConfigurationFile.json"
+
+# 9. Purge local Autopilot / MDM state (elevated; prompts for confirmation; does not touch the tenant)
+powershell -File .\autopilot.ps1 -Decommission
+
+# 10. (internal) What the restart-resume scheduled task runs - cleans itself up on start
 powershell -NoProfile -ExecutionPolicy Bypass -STA -File "C:\ProgramData\AutopilotCommandHub\autopilot.ps1" -EnvFile "C:\ProgramData\AutopilotCommandHub\.env" -ResumeFromRestart
 ```
 

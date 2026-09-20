@@ -19,6 +19,9 @@
     - Device enrollment awareness on launch: cached Autopilot profile, Intune MDM enrollment, Entra join,
       plus a tenant-side Autopilot identity lookup once signed in to Graph
     - Restart with persistence: re-opens the Hub automatically when OOBE (or the desktop) comes back
+    - Skip Autopilot in OOBE, Hybrid Join & Co-Management toolset, ESP Diagnostics & Lifecycle tab
+    - Multi-vendor hardware health (Dell/Lenovo warranty, battery wear, SSD reliability), offline JSON
+      profiles, Wi-Fi / 802.1X / driver injection for OOBE, tenant branding in the header
 
     Bootstrap Invocation:
         irm https://onyachamp.com/autopilot | iex
@@ -44,7 +47,13 @@ param(
     [string]$ComputerNamePrefix = '',
     [string]$ComputerNameTemplate = '',
     [switch]$ResumeFromRestart,
-    [switch]$ReplacingInstance
+    [switch]$ReplacingInstance,
+    [switch]$LenovoWarranty,
+    [string]$LenovoSerialNumber = '',
+    [switch]$HardwareHealth,
+    [switch]$OfflineJson,
+    [string]$OfflineJsonPath = '',
+    [switch]$Decommission
 )
 
 # 0. Central Environment & Configuration Engine (.env)
@@ -265,6 +274,8 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
 $script:CachedHashInfo = $null
 $script:GraphAuthContext = $null
 $script:DeviceState = $null
+$script:CachedDsregStatus = $null
+$script:BypassDisabledAdapters = [System.Collections.Generic.List[string]]::new()
 
 # 5. Self-Source Capture. Under `irm <url> | iex` there is no $PSCommandPath, but the script block that is
 #    executing still carries the full source - that is what makes an elevated relaunch and the post-restart
@@ -594,6 +605,8 @@ function Invoke-AutopilotBypass {
         } catch { $actions.Add("Could not enumerate network adapters: $($_.Exception.Message)") }
     }
 
+    $script:BypassDisabledAdapters = $disabledAdapters
+
     [PSCustomObject]@{
         Actions          = $actions
         DisabledAdapters = $disabledAdapters
@@ -602,10 +615,75 @@ function Invoke-AutopilotBypass {
 
 function Enable-HubNetworkAdapters {
     $enabled = [System.Collections.Generic.List[string]]::new()
-    foreach ($ad in @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Disabled' })) {
-        try { Enable-NetAdapter -Name $ad.Name -Confirm:$false -ErrorAction Stop; $enabled.Add($ad.Name) } catch { }
+    if ($script:BypassDisabledAdapters -and $script:BypassDisabledAdapters.Count -gt 0) {
+        foreach ($adapterName in $script:BypassDisabledAdapters) {
+            try {
+                $ad = Get-NetAdapter -Name $adapterName -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Disabled' }
+                if ($ad) {
+                    Enable-NetAdapter -Name $adapterName -Confirm:$false -ErrorAction Stop
+                    $enabled.Add($adapterName)
+                }
+            } catch { }
+        }
+        $script:BypassDisabledAdapters = [System.Collections.Generic.List[string]]::new()
+    } else {
+        foreach ($ad in @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Disabled' })) {
+            try { Enable-NetAdapter -Name $ad.Name -Confirm:$false -ErrorAction Stop; $enabled.Add($ad.Name) } catch { }
+        }
     }
     return ,$enabled
+}
+
+# --- Function: Invoke-DsregStatus (parse dsregcmd /status into case-insensitive hashtable) ---
+function Invoke-DsregStatus {
+    param([switch]$Force)
+    if (-not $Force -and $script:CachedDsregStatus) {
+        return $script:CachedDsregStatus
+    }
+    $map = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+    try {
+        $exe = Join-Path $env:SystemRoot 'System32\dsregcmd.exe'
+        if (Test-Path $exe) {
+            foreach ($line in (& $exe /status 2>$null)) {
+                if ($line -match '^\s*([A-Za-z0-9_ ]+?)\s*:\s*(.+?)\s*$') {
+                    $k = $Matches[1].Trim()
+                    $v = $Matches[2].Trim()
+                    if (-not $map.ContainsKey($k)) {
+                        $map[$k] = $v
+                    }
+                }
+            }
+        }
+    } catch { }
+    $script:CachedDsregStatus = $map
+    return $map
+}
+
+# --- Function: Get-MdmEnrollmentInfo (query HKLM Enrollments for MS DM Server) ---
+function Get-MdmEnrollmentInfo {
+    $info = [PSCustomObject]@{
+        Enrolled     = $false
+        EnrollmentId = ''
+        Provider     = ''
+        Upn          = ''
+        MdmUrl       = ''
+        TenantId     = ''
+    }
+    try {
+        foreach ($k in @(Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue)) {
+            $pv = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
+            if ($pv -and $pv.ProviderID -eq 'MS DM Server') {
+                $info.Enrolled     = $true
+                $info.EnrollmentId = $k.PSChildName
+                $info.Provider     = $pv.ProviderID
+                if ($pv.UPN)                     { $info.Upn = [string]$pv.UPN }
+                if ($pv.DiscoveryServiceFullURL) { $info.MdmUrl = [string]$pv.DiscoveryServiceFullURL }
+                if ($pv.AADTenantID)             { $info.TenantId = [string]$pv.AADTenantID }
+                break
+            }
+        }
+    } catch { }
+    return $info
 }
 
 # --- Function: Get-DeviceEnrollmentState (is this PC already Autopilot / Intune / Entra managed?) ---
@@ -636,7 +714,6 @@ function Get-DeviceEnrollmentState {
     }
 
     # 1. The Autopilot profile the device itself fetched from the Deployment Service during OOBE.
-    #    This is what makes a registered PC boot into the branded, company-logo OOBE - and it is cached here.
     foreach ($jsonPath in @("$env:SystemRoot\ServiceState\wmansvc\AutopilotDDSZTDFile.json", "$env:SystemRoot\Provisioning\Autopilot\AutopilotConfigurationFile.json")) {
         if (-not (Test-Path $jsonPath)) { continue }
         try {
@@ -656,47 +733,43 @@ function Get-DeviceEnrollmentState {
     }
 
     # 2. Provisioning diagnostics written by the Autopilot client
+    $isBypassed = $false
     try {
         $diag = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Provisioning\Diagnostics\AutoPilot' -ErrorAction SilentlyContinue
-        if ($diag -and ($diag.CloudAssignedTenantDomain -or $diag.CloudAssignedTenantId)) {
-            $state.AutopilotProfileCached = $true
-            if (-not $state.AutopilotTenantDomain -and $diag.CloudAssignedTenantDomain) { $state.AutopilotTenantDomain = [string]$diag.CloudAssignedTenantDomain }
-            if (-not $state.AutopilotTenantId -and $diag.CloudAssignedTenantId)         { $state.AutopilotTenantId = [string]$diag.CloudAssignedTenantId }
-            if (-not $state.AutopilotCorrelationId -and $diag.AutopilotServiceCorrelationId) { $state.AutopilotCorrelationId = [string]$diag.AutopilotServiceCorrelationId }
-            $evidence.Add('Registry: HKLM\SOFTWARE\Microsoft\Provisioning\Diagnostics\AutoPilot')
-        }
-    } catch { }
-
-    # 3. MDM enrollment - Intune is provider 'MS DM Server'
-    try {
-        foreach ($k in @(Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue)) {
-            $pv = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
-            if ($pv -and $pv.ProviderID -eq 'MS DM Server') {
-                $state.IntuneEnrolled = $true
-                $state.EnrollmentId = $k.PSChildName
-                if ($pv.UPN)         { $state.EnrollmentUpn = [string]$pv.UPN }
-                if ($pv.AADTenantID) { $state.EnrollmentTenantId = [string]$pv.AADTenantID }
-                $evidence.Add("Registry: HKLM\SOFTWARE\Microsoft\Enrollments\$($k.PSChildName) (MS DM Server)")
-                break
+        if ($diag) {
+            if ($diag.IsAutopilotDisabled -eq 1) {
+                $isBypassed = $true
+                $evidence.Add('Registry: HKLM\SOFTWARE\Microsoft\Provisioning\Diagnostics\AutoPilot (IsAutopilotDisabled=1)')
+            }
+            if (-not $isBypassed -and ($diag.CloudAssignedTenantDomain -or $diag.CloudAssignedTenantId)) {
+                $state.AutopilotProfileCached = $true
+                if (-not $state.AutopilotTenantDomain -and $diag.CloudAssignedTenantDomain) { $state.AutopilotTenantDomain = [string]$diag.CloudAssignedTenantDomain }
+                if (-not $state.AutopilotTenantId -and $diag.CloudAssignedTenantId)         { $state.AutopilotTenantId = [string]$diag.CloudAssignedTenantId }
+                if (-not $state.AutopilotCorrelationId -and $diag.AutopilotServiceCorrelationId) { $state.AutopilotCorrelationId = [string]$diag.AutopilotServiceCorrelationId }
+                $evidence.Add('Registry: HKLM\SOFTWARE\Microsoft\Provisioning\Diagnostics\AutoPilot')
             }
         }
     } catch { }
 
-    # 4. Entra / domain join state
+    # 3. MDM enrollment - Intune is provider 'MS DM Server' (unified via Get-MdmEnrollmentInfo)
+    $mdm = Get-MdmEnrollmentInfo
+    if ($mdm.Enrolled) {
+        $state.IntuneEnrolled = $true
+        $state.EnrollmentId = $mdm.EnrollmentId
+        if ($mdm.Upn)      { $state.EnrollmentUpn = $mdm.Upn }
+        if ($mdm.TenantId) { $state.EnrollmentTenantId = $mdm.TenantId }
+        $evidence.Add("Registry: HKLM\SOFTWARE\Microsoft\Enrollments\$($mdm.EnrollmentId) (MS DM Server)")
+    }
+
+    # 4. Entra / domain join state (unified via Invoke-DsregStatus)
     try {
-        $dsregPath = Join-Path $env:SystemRoot 'System32\dsregcmd.exe'
-        if (Test-Path $dsregPath) {
-            $ds = @(& $dsregPath /status 2>$null)
-            $getField = {
-                param($name)
-                foreach ($line in $ds) { if ($line -match "^\s*$name\s*:\s*(.+)$") { return $Matches[1].Trim() } }
-                return ''
-            }
-            $state.AzureAdJoined   = ((& $getField 'AzureAdJoined') -eq 'YES')
-            $state.DomainJoined    = ((& $getField 'DomainJoined') -eq 'YES')
-            $state.EntraTenantName = & $getField 'TenantName'
-            $state.EntraTenantId   = & $getField 'TenantId'
-            $state.MdmUrl          = & $getField 'MdmUrl'
+        $ds = Invoke-DsregStatus
+        if ($ds -and $ds.Count -gt 0) {
+            $state.AzureAdJoined   = ($ds['AzureAdJoined'] -eq 'YES')
+            $state.DomainJoined    = ($ds['DomainJoined'] -eq 'YES')
+            $state.EntraTenantName = [string]$ds['TenantName']
+            $state.EntraTenantId   = [string]$ds['TenantId']
+            $state.MdmUrl          = [string]$ds['MdmUrl']
             if ($state.AzureAdJoined) { $evidence.Add("dsregcmd: AzureAdJoined=YES, tenant '$($state.EntraTenantName)'") }
             if ($state.MdmUrl)        { $evidence.Add("dsregcmd: MdmUrl $($state.MdmUrl)") }
         }
@@ -708,10 +781,13 @@ function Get-DeviceEnrollmentState {
                    elseif ($state.EnrollmentTenantId){ $state.EnrollmentTenantId }
                    else { 'unknown tenant' }
 
-    if ($state.AutopilotProfileCached) {
+    if ($state.AutopilotProfileCached -and -not $isBypassed) {
         $state.Verdict = 'AutopilotRegistered'
         $profileNote = if ($state.AutopilotProfileName) { " (profile: $($state.AutopilotProfileName))" } else { '' }
         $state.Summary = "Autopilot-registered to $tenantLabel$profileNote"
+    } elseif ($isBypassed) {
+        $state.Verdict = 'Bypassed'
+        $state.Summary = 'Autopilot skipped (IsAutopilotDisabled=1, profile removed)'
     } elseif ($state.IntuneEnrolled) {
         $state.Verdict = 'IntuneEnrolled'
         $upnNote = if ($state.EnrollmentUpn) { " as $($state.EnrollmentUpn)" } else { '' }
@@ -834,21 +910,6 @@ function Show-PrivilegeGuide {
 # so the Hub still runs on a workgroup bench machine.
 # ==============================================================================
 
-function Invoke-DsregStatus {
-    # Parse `dsregcmd /status` into a case-insensitive hashtable of Key = Value.
-    $map = @{}
-    try {
-        $exe = Join-Path $env:SystemRoot 'System32\dsregcmd.exe'
-        if (-not (Test-Path $exe)) { return $map }
-        foreach ($line in (& $exe /status 2>$null)) {
-            if ($line -match '^\s*([A-Za-z0-9_ ]+?)\s*:\s*(.+?)\s*$') {
-                $map[$Matches[1].Trim()] = $Matches[2].Trim()
-            }
-        }
-    } catch { }
-    return $map
-}
-
 function Get-HybridJoinState {
     $d = Invoke-DsregStatus
     $aadj   = ($d['AzureAdJoined'] -eq 'YES')
@@ -862,6 +923,18 @@ function Get-HybridJoinState {
                 elseif ($entJoined)     { 'Enterprise (ADFS) Joined' }
                 else                    { 'Workgroup / Not joined' }
 
+    $dc = if ($d['DomainController']) { $d['DomainController'] }
+          elseif ($d['DomainControllerName']) { $d['DomainControllerName'] }
+          elseif ($d['DcName']) { $d['DcName'] }
+          else {
+              try {
+                  $ntDomain = @(Get-CimInstance Win32_NTDomain -ErrorAction SilentlyContinue | Where-Object { $_.DnsForestName })
+                  if ($ntDomain.Count -gt 0 -and $ntDomain[0].DomainControllerName) {
+                      $ntDomain[0].DomainControllerName.TrimStart('\')
+                  } else { '' }
+              } catch { '' }
+          }
+
     [PSCustomObject]@{
         JoinType       = $joinType
         AzureAdJoined  = $aadj
@@ -874,27 +947,11 @@ function Get-HybridJoinState {
         IdpDomain      = $d['IdpDomain']
         MdmUrl         = $d['MdmUrl']
         DomainName     = $d['DomainName']
-        DcName         = $d['KeySignTest'] # placeholder; DC comes from Test-DomainConnectivity
+        DcName         = $dc
         PrtAuthority   = $d['AzureAdPrtAuthority']
         Raw            = $d
         IsHybrid       = ($aadj -and $domain)
     }
-}
-
-function Get-MdmEnrollmentInfo {
-    $info = [PSCustomObject]@{ Enrolled = $false; EnrollmentId = ''; Provider = ''; Upn = ''; MdmUrl = '' }
-    try {
-        foreach ($k in @(Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue)) {
-            $pv = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
-            if ($pv -and $pv.ProviderID -eq 'MS DM Server') {
-                $info.Enrolled = $true; $info.EnrollmentId = $k.PSChildName; $info.Provider = $pv.ProviderID
-                if ($pv.UPN) { $info.Upn = [string]$pv.UPN }
-                if ($pv.DiscoveryServiceFullURL) { $info.MdmUrl = [string]$pv.DiscoveryServiceFullURL }
-                break
-            }
-        }
-    } catch { }
-    return $info
 }
 
 function Invoke-MdmSync {
@@ -1266,9 +1323,11 @@ function Test-StagedNetwork {
     $stages.Add([PSCustomObject]@{ Stage = 4; Name = "TLS 1.2/1.3 Handshake"; Success = $tlsSuccess; Details = if ($tlsSuccess) { "Authenticated with login.microsoftonline.com:443" } else { "TLS handshake failed" } })
     if (-not $tlsSuccess) { $overallReady = $false }
 
-    # Stage 5: HTTPS Clock Skew Verification
+    # Stage 5: HTTPS Clock Skew Verification & Auto-Remediation Candidate
     $clockSuccess = $false
     $clockDetails = "Unable to verify time"
+    $serverTimeObj = $null
+    $skewSeconds = $null
     try {
         $req = [System.Net.HttpWebRequest]::Create("https://login.microsoftonline.com")
         $req.Method = "HEAD"
@@ -1278,17 +1337,17 @@ function Test-StagedNetwork {
             $resp = $req.GetResponse()
             $dateHeader = $resp.Headers["Date"]
             if ($dateHeader) {
-                $serverTime = [DateTime]::Parse($dateHeader).ToUniversalTime()
+                $serverTimeObj = [DateTime]::Parse($dateHeader).ToUniversalTime()
                 $localTime = [DateTime]::UtcNow
-                $skewSeconds = [Math]::Abs(($localTime - $serverTime).TotalSeconds)
+                $skewSeconds = [Math]::Abs(($localTime - $serverTimeObj).TotalSeconds)
                 $clockSuccess = ($skewSeconds -lt 300)
-                $clockDetails = "Clock skew: $([Math]::Round($skewSeconds, 1))s (Server: $serverTime UTC)"
+                $clockDetails = "Clock skew: $([Math]::Round($skewSeconds, 1))s (Server: $serverTimeObj UTC)"
             }
         } finally {
             if ($resp) { $resp.Dispose() }
         }
     } catch { }
-    $stages.Add([PSCustomObject]@{ Stage = 5; Name = "HTTPS Clock Sync"; Success = $clockSuccess; Details = $clockDetails })
+    $stages.Add([PSCustomObject]@{ Stage = 5; Name = "HTTPS Clock Sync"; Success = $clockSuccess; Details = $clockDetails; ServerTime = $serverTimeObj; SkewSeconds = $skewSeconds })
 
     # Stage 6: Autopilot Endpoint (ztd.dds.microsoft.com)
     $ztdSuccess = $false
@@ -1298,14 +1357,20 @@ function Test-StagedNetwork {
     } catch { }
     $stages.Add([PSCustomObject]@{ Stage = 6; Name = "Autopilot Attestation DNS"; Success = $ztdSuccess; Details = if ($ztdSuccess) { "Resolved ztd.dds.microsoft.com" } else { "Attestation endpoint unresolvable" } })
 
-    # Stage 7: TPM 2.0 State
+    # Stage 7: TPM 2.0 State & EK Pre-Flight Attestation
     $tpmSuccess = $false
     $tpmDetails = "TPM not detected"
     try {
         $tpm = Get-Tpm -ErrorAction SilentlyContinue
         if ($tpm) {
+            $ekCertCount = 0
+            try {
+                $ek = Get-TpmEndorsementKeyInfo -ErrorAction SilentlyContinue
+                if ($ek -and $ek.ManufacturerCertificates) { $ekCertCount = $ek.ManufacturerCertificates.Count }
+            } catch { }
+            $ekCertNote = if ($ekCertCount -gt 0) { "EK Certs: $ekCertCount" } else { "No EK Cert in NVRAM" }
             $tpmSuccess = ($tpm.TpmPresent -and $tpm.TpmReady)
-            $tpmDetails = "Present: $($tpm.TpmPresent), Ready: $($tpm.TpmReady), Enabled: $($tpm.TpmEnabled)"
+            $tpmDetails = "Present: $($tpm.TpmPresent), Ready: $($tpm.TpmReady), Enabled: $($tpm.TpmEnabled) ($ekCertNote)"
         }
     } catch { }
     $stages.Add([PSCustomObject]@{ Stage = 7; Name = "TPM 2.0 Security State"; Success = $tpmSuccess; Details = $tpmDetails })
@@ -1642,7 +1707,7 @@ function Connect-GraphToken {
     $dcEndpoint = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/devicecode"
     $dcBody = @{
         client_id = $ClientId
-        scope     = 'DeviceManagementServiceConfig.ReadWrite.All DeviceManagementManagedDevices.ReadWrite.All openid offline_access'
+        scope     = 'DeviceManagementServiceConfig.ReadWrite.All DeviceManagementManagedDevices.ReadWrite.All Organization.Read.All openid offline_access'
     }
 
     try {
@@ -2171,14 +2236,36 @@ function Register-AutopilotDevice {
                 # e.g. 806 ZtdDeviceAlreadyAssigned, 808 ZtdDeviceAssignedToOtherTenant - polling further never helps
                 throw "Autopilot import failed: $($statusCheck.state.deviceErrorCode) - $($statusCheck.state.deviceErrorName)"
             }
-            if ($statusCheck.state.deviceImportStatus -eq 'complete' -or $statusCheck.deploymentProfileAssignmentStatus -eq 'assigned') {
-                return [PSCustomObject]@{
-                    Success          = $true
-                    ImportId         = $importedId
-                    Status           = 'Assigned'
-                    ProfileAssigned  = $statusCheck.deploymentProfileAssignmentStatus
-                    SerialNumber     = $hashObj.SerialNumber
+            if ($statusCheck.state.deviceImportStatus -eq 'complete') {
+                # Device import complete; verify deploymentProfileAssignmentStatus before declaring ready
+                if ($statusCheck.deploymentProfileAssignmentStatus -eq 'assigned') {
+                    return [PSCustomObject]@{
+                        Success          = $true
+                        ImportId         = $importedId
+                        Status           = 'Assigned'
+                        ProfileAssigned  = 'assigned'
+                        SerialNumber     = $hashObj.SerialNumber
+                    }
                 }
+
+                # Poll windowsAutopilotDeviceIdentities to confirm profile assignment
+                $escapedSerial = $hashObj.SerialNumber.Replace("'", "''")
+                $identUri = "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities?`$filter=serialNumber eq '$escapedSerial'"
+                try {
+                    $identResp = Invoke-RestMethod -Uri $identUri -Method GET -Headers $headers -ErrorAction SilentlyContinue
+                    if ($identResp.value -and $identResp.value.Count -gt 0) {
+                        $devIdent = $identResp.value[0]
+                        if ($devIdent.deploymentProfileAssignmentStatus -eq 'assigned') {
+                            return [PSCustomObject]@{
+                                Success          = $true
+                                ImportId         = $importedId
+                                Status           = 'Assigned'
+                                ProfileAssigned  = 'assigned'
+                                SerialNumber     = $hashObj.SerialNumber
+                            }
+                        }
+                    }
+                } catch { }
             }
         }
     }
@@ -2462,6 +2549,759 @@ function Get-DellWarrantyInfo {
         Entitlements            = $entitlementList
         QueriedAt               = $nowUtc.ToString('yyyy-MM-dd HH:mm:ss UTC')
     }
+}
+
+# ==============================================================================
+# SECTION A.5: EXTENDED ENTERPRISE CAPABILITIES & FIELD POLISH ENGINES
+# ==============================================================================
+
+# --- Function: Play-HubAudio (Audio Completion & Error Chimes) ---
+function Play-HubAudio {
+    param([string]$Type = 'Success')
+    try {
+        switch ($Type.ToLowerInvariant()) {
+            'success' { [System.Media.SystemSounds]::Asterisk.Play() }
+            'error'   { [System.Media.SystemSounds]::Hand.Play() }
+            'warning' { [System.Media.SystemSounds]::Exclamation.Play() }
+            default   { [System.Media.SystemSounds]::Beep.Play() }
+        }
+    } catch { }
+}
+
+# --- Function: Sync-HubSystemClock (One-Click Clock Skew Auto-Remediation) ---
+function Sync-HubSystemClock {
+    [CmdletBinding()]
+    param([int]$TimeoutSeconds = 5)
+
+    $result = [PSCustomObject]@{
+        Success      = $false
+        ServerTime   = $null
+        PreviousSkew = $null
+        Message      = ''
+    }
+
+    try {
+        $req = [System.Net.HttpWebRequest]::Create("https://login.microsoftonline.com")
+        $req.Method = "HEAD"
+        $req.Timeout = $TimeoutSeconds * 1000
+        $resp = $req.GetResponse()
+        $dateHeader = $resp.Headers["Date"]
+        $resp.Dispose()
+        if ($dateHeader) {
+            $serverTime = [DateTime]::Parse($dateHeader).ToUniversalTime()
+            $skew = [Math]::Abs(([DateTime]::UtcNow - $serverTime).TotalSeconds)
+            $result.PreviousSkew = $skew
+            $result.ServerTime = $serverTime
+            try {
+                Set-Date -Date $serverTime -ErrorAction Stop
+                $result.Success = $true
+            } catch {
+                $result.Message = "Set-Date requires Administrator privilege: $($_.Exception.Message)"
+            }
+        }
+    } catch {
+        $result.Message = "HTTPS probe failed: $($_.Exception.Message)"
+    }
+
+    try {
+        Start-Process -FilePath "w32tm.exe" -ArgumentList "/resync /force" -Wait -NoNewWindow -ErrorAction SilentlyContinue
+        $result.Success = $true
+        $result.Message = "Synchronized to server time $($result.ServerTime) and triggered w32tm /resync /force"
+    } catch { }
+
+    return $result
+}
+
+# --- Function: Test-TpmManufacturerCaReachability (TPM EK CA Reachability Engine) ---
+function Test-TpmManufacturerCaReachability {
+    [CmdletBinding()]
+    param([int]$TimeoutMs = 2500)
+
+    $caList = @(
+        @{ Manufacturer = 'Intel'; Host = 'ekop.intel.com'; Port = 443 },
+        @{ Manufacturer = 'AMD'; Host = 'ftpm.amd.com'; Port = 443 },
+        @{ Manufacturer = 'Infineon'; Host = 'tpm.infineon.com'; Port = 443 },
+        @{ Manufacturer = 'Microsoft'; Host = 'global.azure-devices-provisioning.net'; Port = 443 }
+    )
+
+    $results = [System.Collections.Generic.List[PSCustomObject]]::new()
+    foreach ($ca in $caList) {
+        $reachable = $false
+        try {
+            $tcp = [System.Net.Sockets.TcpClient]::new()
+            $iar = $tcp.BeginConnect($ca.Host, $ca.Port, $null, $null)
+            if ($iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
+                $tcp.EndConnect($iar)
+                $reachable = $true
+            }
+            $tcp.Close()
+        } catch { }
+
+        $results.Add([PSCustomObject]@{
+            Manufacturer = $ca.Manufacturer
+            Host         = $ca.Host
+            Port         = $ca.Port
+            Reachable    = $reachable
+        })
+    }
+    return $results
+}
+
+# --- Function: Get-PreAuthTenantBranding (Channel 1: Zero-Token Pre-Auth Discovery) ---
+function Get-PreAuthTenantBranding {
+    [CmdletBinding()]
+    param([string]$Domain)
+
+    if ([string]::IsNullOrWhiteSpace($Domain)) { return $null }
+    try {
+        $probe = if ($Domain.Contains('@')) { $Domain } else { "probe@$Domain" }
+        $body = @{ username = $probe } | ConvertTo-Json
+        $resp = Invoke-RestMethod -Uri "https://login.microsoftonline.com/common/GetCredentialType" -Method POST -Body $body -ContentType 'application/json' -TimeoutSec 6 -ErrorAction Stop
+
+        $branding = $null
+        if ($resp.TenantBranding) {
+            $branding = $resp.TenantBranding
+        } elseif ($resp -and ($resp.BannerLogo -or $resp.TileLogo -or $resp.Illustration -or $resp.BackgroundColor)) {
+            $branding = $resp
+        }
+
+        $bannerLogo = if ($branding -and $branding.BannerLogoUrl) { $branding.BannerLogoUrl } elseif ($branding -and $branding.BannerLogo) { $branding.BannerLogo } else { '' }
+        $tileLogo   = if ($branding -and $branding.TileLogoUrl) { $branding.TileLogoUrl } elseif ($branding -and $branding.TileLogo) { $branding.TileLogo } else { '' }
+        $illustration = if ($branding -and $branding.IllustrationUrl) { $branding.IllustrationUrl } elseif ($branding -and $branding.Illustration) { $branding.Illustration } else { '' }
+        $bgColor    = if ($branding -and $branding.BackgroundColor) { $branding.BackgroundColor } else { '' }
+        $displayName = if ($resp.FederationBrandName) { $resp.FederationBrandName } elseif ($branding -and $branding.DisplayName) { $branding.DisplayName } else { $Domain }
+
+        return [PSCustomObject]@{
+            Domain          = $Domain
+            DisplayName     = $displayName
+            BannerLogoUrl   = $bannerLogo
+            TileLogoUrl     = $tileLogo
+            IllustrationUrl = $illustration
+            BackgroundColor = $bgColor
+            Source          = 'PreAuth'
+        }
+    } catch {
+        return $null
+    }
+}
+
+# --- Function: Get-GraphTenantBranding (Channel 2: Post-Auth Organization & Branding) ---
+function Get-GraphTenantBranding {
+    [CmdletBinding()]
+    param([string]$AccessToken)
+
+    if (-not $AccessToken) { return $null }
+    $headers = @{ 'Authorization' = "Bearer $AccessToken"; 'Accept' = 'application/json' }
+    try {
+        $orgResp = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/organization" -Headers $headers -TimeoutSec 8 -ErrorAction Stop
+        $org = if ($orgResp.value) { $orgResp.value[0] } else { $null }
+        if (-not $org) { return $null }
+        $orgId = $org.id
+        $displayName = $org.displayName
+        $verifiedDomain = ($org.verifiedDomains | Where-Object { $_.isDefault -eq $true } | Select-Object -First 1).name
+        if (-not $verifiedDomain -and $org.verifiedDomains) { $verifiedDomain = $org.verifiedDomains[0].name }
+
+        $brandingData = $null
+        try {
+            $brandingResp = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/organization/$orgId/branding" -Headers $headers -TimeoutSec 6 -ErrorAction Stop
+            $brandingData = $brandingResp
+        } catch {
+            try {
+                $brandingResp = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/organization/$orgId/branding/localizations/default" -Headers $headers -TimeoutSec 6 -ErrorAction SilentlyContinue
+                $brandingData = $brandingResp
+            } catch { }
+        }
+
+        return [PSCustomObject]@{
+            TenantId        = $orgId
+            DisplayName     = $displayName
+            VerifiedDomain  = $verifiedDomain
+            BannerLogoUrl   = if ($brandingData) { $brandingData.bannerLogo } else { '' }
+            TileLogoUrl     = if ($brandingData) { $brandingData.squareLogo } else { '' }
+            BackgroundColor = if ($brandingData) { $brandingData.backgroundColor } else { '' }
+            Source          = 'Graph'
+        }
+    } catch {
+        return $null
+    }
+}
+
+# --- Function: Set-HubBrandingImageAsync (Asynchronous WPF Image Loader with SVG Safety Guard) ---
+function Set-HubBrandingImageAsync {
+    param(
+        [System.Windows.Controls.Image]$TargetImage,
+        [System.Windows.Controls.Border]$LogoContainer,
+        [string]$ImageUrl
+    )
+    if ([string]::IsNullOrWhiteSpace($ImageUrl)) { return }
+    # SVG Safety Guard: WPF BitmapImage throws NotSupportedException on SVG files
+    if ($ImageUrl -match '\.svg(\?|$)' -or $ImageUrl -match 'image/svg\+xml') { return }
+
+    # A PowerShell script block cannot run on a ThreadPool thread (no runspace there - it throws and can take
+    # the host down). The download itself is async on the .NET side; only the wait is on the UI thread,
+    # capped at 4 seconds, and this runs once per sign-in / startup.
+    try {
+        $client = [System.Net.Http.HttpClient]::new()
+        $client.Timeout = [TimeSpan]::FromSeconds(4)
+        $task = $client.GetByteArrayAsync($ImageUrl)
+        if (-not $task.Wait(4000)) { return }
+        $bytes = $task.Result
+        if (-not $bytes -or $bytes.Length -lt 16) { return }
+
+        # Safety check magic header for XML/SVG text
+        $head = [System.Text.Encoding]::ASCII.GetString($bytes, 0, [Math]::Min($bytes.Length, 80))
+        if ($head -match '<\?xml' -or $head -match '<svg') { return }
+
+        $stream = [System.IO.MemoryStream]::new($bytes)
+        $bmp = [System.Windows.Media.Imaging.BitmapImage]::new()
+        $bmp.BeginInit()
+        $bmp.StreamSource = $stream
+        $bmp.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+        $bmp.EndInit()
+        $bmp.Freeze()
+
+        $TargetImage.Source = $bmp
+        $TargetImage.Visibility = [System.Windows.Visibility]::Visible
+        if ($LogoContainer) { $LogoContainer.Visibility = [System.Windows.Visibility]::Visible }
+    } catch { }
+    finally { if ($client) { $client.Dispose() } }
+}
+
+# --- Function: Get-DecodedAutopilotPolicy (CloudAssignedOobeConfig Bitmask & Join Inspector) ---
+function Get-DecodedAutopilotPolicy {
+    [CmdletBinding()]
+    param([string]$JsonPath = '')
+
+    $raw = $null
+    if ($JsonPath -and (Test-Path $JsonPath)) {
+        $raw = Get-Content -Path $JsonPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
+    } else {
+        foreach ($p in @("$env:SystemRoot\ServiceState\wmansvc\AutopilotDDSZTDFile.json", "$env:SystemRoot\Provisioning\Autopilot\AutopilotConfigurationFile.json")) {
+            if (Test-Path $p) {
+                try { $raw = Get-Content -Path $p -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json; break } catch { }
+            }
+        }
+    }
+    if (-not $raw) { return $null }
+
+    $oobe = if ($raw.CloudAssignedOobeConfig) { [int]$raw.CloudAssignedOobeConfig } else { 0 }
+    $join = if ($null -ne $raw.CloudAssignedDomainJoinMethod) { [int]$raw.CloudAssignedDomainJoinMethod } else { 0 }
+
+    return [ordered]@{
+        'Join Type'                    = if ($join -eq 1) { 'Hybrid Azure AD Join (Active Directory)' } else { 'Direct Microsoft Entra Join' }
+        'Account Type'                 = if (($oobe -band 8) -ne 0) { 'Standard User' } else { 'Local Administrator' }
+        'Skip EULA'                    = if (($oobe -band 2) -ne 0) { 'Yes (Bypassed)' } else { 'No' }
+        'Skip OEM Registration'        = if (($oobe -band 4) -ne 0) { 'Yes (Bypassed)' } else { 'No' }
+        'Skip Privacy Settings'        = if (($oobe -band 32) -ne 0) { 'Yes (Bypassed)' } else { 'No' }
+        'Block Personal MSA Sign-in'   = if (($oobe -band 64) -ne 0) { 'Yes (Enforced)' } else { 'No' }
+        'Pre-Provisioning / WhiteGlove' = if (($oobe -band 256) -ne 0) { 'Enabled' } else { 'Disabled' }
+        'Skip Cortana Voice'           = if (($oobe -band 1) -ne 0) { 'Yes' } else { 'No' }
+        'Forced MDM Enrollment'        = if ($raw.CloudAssignedForcedEnrollment -eq 1) { 'Yes (Mandatory)' } else { 'Standard' }
+        'Cloud Assigned Tenant Domain' = [string]$raw.CloudAssignedTenantDomain
+        'Cloud Assigned Tenant ID'     = [string]$raw.CloudAssignedTenantId
+        'Device Name Template'         = [string]$raw.CloudAssignedDeviceName
+        'Deployment Profile Name'      = [string]$raw.DeploymentProfileName
+        'Ztd Correlation ID'           = [string]$raw.ZtdCorrelationId
+    }
+}
+
+# --- Function: Export-AutopilotConfigurationFile (Offline JSON Profile Generator) ---
+function Export-AutopilotConfigurationFile {
+    [CmdletBinding()]
+    param(
+        [string]$Path = '',
+        [string]$TenantId = '',
+        [string]$TenantDomain = '',
+        [int]$OobeConfig = 1310,
+        [int]$DomainJoinMethod = 0,
+        [string]$DeviceName = ''
+    )
+    if (-not $Path) {
+        $usb = Get-CimInstance Win32_Volume -Filter "DriveType = 2" -ErrorAction SilentlyContinue | Select-Object -First 1
+        $dir = if ($usb -and $usb.DriveLetter) { "$($usb.DriveLetter)\" } else { [System.IO.Path]::GetTempPath() }
+        $Path = Join-Path $dir 'AutopilotConfigurationFile.json'
+    }
+    $cfg = [ordered]@{
+        CloudAssignedTenantId         = $TenantId
+        CloudAssignedTenantDomain     = $TenantDomain
+        CloudAssignedOobeConfig       = $OobeConfig
+        CloudAssignedDomainJoinMethod = $DomainJoinMethod
+        CloudAssignedForcedEnrollment = 1
+        ZtdCorrelationId              = [Guid]::NewGuid().ToString()
+    }
+    if ($DeviceName) { $cfg['CloudAssignedDeviceName'] = ($DeviceName -replace '%RAND%', '%RAND:4%') }
+
+    $json = $cfg | ConvertTo-Json -Depth 3
+    [System.IO.File]::WriteAllText($Path, $json, (Get-ScriptEncoding))
+    return $Path
+}
+
+# --- Function: Import-AutopilotConfigurationFile (Offline JSON Injector) ---
+function Import-AutopilotConfigurationFile {
+    [CmdletBinding()]
+    param([Parameter(Mandatory=$true)][string]$SourceJsonPath)
+
+    if (-not (Test-Path $SourceJsonPath)) { throw "Source JSON not found: $SourceJsonPath" }
+    $destDir = "$env:SystemRoot\Provisioning\Autopilot"
+    if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
+    $destPath = Join-Path $destDir "AutopilotConfigurationFile.json"
+    Copy-Item -Path $SourceJsonPath -Destination $destPath -Force
+    return $destPath
+}
+
+# --- Function: Get-LenovoWarrantyInfo (Lenovo Public Warranty API) ---
+function Get-LenovoWarrantyInfo {
+    [CmdletBinding()]
+    param([string]$SerialNumber = '')
+
+    $targetTag = $SerialNumber.Trim()
+    if ([string]::IsNullOrWhiteSpace($targetTag)) {
+        try {
+            $targetTag = (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber.Trim()
+        } catch { }
+    }
+    if ([string]::IsNullOrWhiteSpace($targetTag)) {
+        throw "Unable to detect host BIOS Serial Number. Please supply a valid Lenovo Serial Number."
+    }
+
+    $url = "https://pcsupport.lenovo.com/us/en/api/v4/upsell/redport/warrantyInfo?serialNumber=$targetTag"
+    $headers = @{
+        'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        'Accept'     = 'application/json'
+    }
+    $resp = Invoke-RestMethod -Uri $url -Headers $headers -TimeoutSec 10 -ErrorAction Stop
+
+    $inWarranty = $false
+    $endDateStr = 'N/A'
+    $product = if ($resp.baseData -and $resp.baseData.productName) { $resp.baseData.productName } else { "Lenovo Device" }
+    $shipDateStr = if ($resp.baseData -and $resp.baseData.shipDate) { $resp.baseData.shipDate } else { "N/A" }
+    $daysRemaining = 0
+    $nowUtc = [DateTime]::UtcNow
+
+    if ($resp.purchasedWarrantyList) {
+        foreach ($w in $resp.purchasedWarrantyList) {
+            if ($w.endDate) {
+                try {
+                    $dt = [DateTime]::Parse($w.endDate)
+                    if ($dt -gt $nowUtc) {
+                        $inWarranty = $true
+                        $endDateStr = $dt.ToString('yyyy-MM-dd')
+                        $daysRemaining = [Math]::Max($daysRemaining, [int][Math]::Round(($dt - $nowUtc).TotalDays))
+                    } elseif ($endDateStr -eq 'N/A') {
+                        $endDateStr = $dt.ToString('yyyy-MM-dd')
+                    }
+                } catch { }
+            }
+        }
+    }
+
+    $verdict = if ($inWarranty) { 'ELIGIBLE FOR DEPLOYMENT (DO NOT REFRESH)' } else { 'REFRESH RECOMMENDED (OUT OF WARRANTY)' }
+    $status = if ($inWarranty) { "Active ($daysRemaining days remaining)" } else { "Expired" }
+
+    return [PSCustomObject]@{
+        ServiceTag              = $targetTag
+        SystemModel             = $product
+        ProductFamily           = "Lenovo"
+        ProductLineDescription  = $product
+        ProductLobDescription   = "Lenovo Client"
+        CountryCode             = "US"
+        ShipDate                = $shipDateStr
+        DeviceAgeYears          = $null
+        DeviceAgeDays           = $null
+        IsUnderWarranty         = $inWarranty
+        WarrantyStatus          = $status
+        DaysRemaining           = $daysRemaining
+        WarrantyEndDate         = $endDateStr
+        PrimaryServiceLevel     = if ($inWarranty) { "Lenovo Standard / Premier Support" } else { "Expired" }
+        RefreshVerdict          = $verdict
+        RefreshRecommendation   = if ($inWarranty) { "Lenovo hardware is under active warranty coverage until $endDateStr." } else { "Lenovo hardware warranty expired on $endDateStr. Recommend hardware refresh." }
+        Entitlements            = @()
+        QueriedAt               = $nowUtc.ToString('yyyy-MM-dd HH:mm:ss UTC')
+    }
+}
+
+# --- Function: Get-BatteryHealthInfo (Multi-Vendor Battery Wear Assessment) ---
+function Get-BatteryHealthInfo {
+    [CmdletBinding()]
+    param()
+
+    try {
+        $bat = Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $bat) { return $null }
+
+        # Win32_Battery rarely populates DesignCapacity / FullChargeCapacity (they read 0 on most OEM firmware).
+        # The authoritative counters live in root\wmi; Win32_PortableBattery is the next best for design capacity.
+        $design = 0
+        $full = 0
+        try { $sd = Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryStaticData -ErrorAction Stop | Select-Object -First 1; if ($sd) { $design = [int]$sd.DesignedCapacity } } catch { }
+        if ($design -le 0) { try { $pb = Get-CimInstance -ClassName Win32_PortableBattery -ErrorAction Stop | Select-Object -First 1; if ($pb -and $pb.DesignCapacity) { $design = [int]$pb.DesignCapacity } } catch { } }
+        if ($design -le 0 -and $bat.DesignCapacity) { $design = [int]$bat.DesignCapacity }
+        try { $fc = Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryFullChargedCapacity -ErrorAction Stop | Select-Object -First 1; if ($fc) { $full = [int]$fc.FullChargedCapacity } } catch { }
+        if ($full -le 0 -and $bat.FullChargeCapacity) { $full = [int]$bat.FullChargeCapacity }
+
+        $wearPct = $null
+        if ($design -gt 0 -and $full -gt 0) {
+            $wearPct = [Math]::Max(0, [Math]::Round((1.0 - ($full / $design)) * 100, 1))
+        }
+
+        # Never report "Good" when we simply could not read the capacities
+        $verdict = if ($null -eq $wearPct) { "Unknown (capacity counters not exposed by this firmware)" }
+                   elseif ($wearPct -lt 20) { "Good (Low Wear)" }
+                   elseif ($wearPct -lt 40) { "Degraded (Moderate Wear)" }
+                   else { "Replace Recommended (High Wear)" }
+
+        return [PSCustomObject]@{
+            Present            = $true
+            DesignCapacity     = if ($design -gt 0) { "$design mWh" } else { 'n/a' }
+            FullChargeCapacity = if ($full -gt 0) { "$full mWh" } else { 'n/a' }
+            WearPercent        = if ($null -ne $wearPct) { "$wearPct%" } else { 'n/a' }
+            HealthVerdict      = $verdict
+            Status             = $bat.Status
+            BatteryStatus      = $bat.BatteryStatus
+            EstimatedCharge    = "$($bat.EstimatedChargeRemaining)%"
+        }
+    } catch {
+        return $null
+    }
+}
+
+# --- Function: Get-StorageReliabilityInfo (NVMe SSD SMART Reliability Counter) ---
+function Get-StorageReliabilityInfo {
+    [CmdletBinding()]
+    param()
+
+    $list = [System.Collections.Generic.List[PSCustomObject]]::new()
+    try {
+        $disks = Get-PhysicalDisk -ErrorAction SilentlyContinue
+        foreach ($d in $disks) {
+            $counter = $d | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
+            if ($counter) {
+                $wearVal = if ($counter.Wear) { "$($counter.Wear)%" } else { "0%" }
+                $tempVal = if ($counter.Temperature) { "$($counter.Temperature) C" } else { "Normal" }
+                $list.Add([PSCustomObject]@{
+                    DeviceId         = $d.DeviceId
+                    Model            = $d.FriendlyName
+                    MediaType        = $d.MediaType
+                    Wear             = $wearVal
+                    Temperature      = $tempVal
+                    ReadErrors       = $counter.ReadErrorsTotal
+                    WriteErrors      = $counter.WriteErrorsTotal
+                    PowerOnHours     = $counter.PowerOnHours
+                })
+            }
+        }
+    } catch { }
+    return $list
+}
+
+# --- Function: Get-Win32AppDiagnostics (Real-Time IME Win32App Registry Status) ---
+function Get-Win32AppDiagnostics {
+    [CmdletBinding()]
+    param()
+
+    $apps = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $basePath = "HKLM:\SOFTWARE\Microsoft\IntuneManagementExtension\Win32Apps"
+    if (Test-Path $basePath) {
+        try {
+            foreach ($sub in (Get-ChildItem -Path $basePath -ErrorAction SilentlyContinue)) {
+                foreach ($appKey in (Get-ChildItem -Path $sub.PSPath -ErrorAction SilentlyContinue)) {
+                    $p = Get-ItemProperty -Path $appKey.PSPath -ErrorAction SilentlyContinue
+                    $state = switch ($p.InstallState) {
+                        1 { "Not Installed" }
+                        2 { "In Progress" }
+                        3 { "Completed" }
+                        4 { "Failed" }
+                        default { "State: $($p.InstallState)" }
+                    }
+                    $appName = if ($p.Name) { $p.Name } else { $appKey.PSChildName }
+                    $apps.Add([PSCustomObject]@{
+                        AppId        = $appKey.PSChildName
+                        Name         = $appName
+                        InstallState = $state
+                        ExitCode     = $p.ExitCode
+                        SubState     = $p.SubState
+                        LastUpdated  = $p.LastStateUpdateTime
+                    })
+                }
+            }
+        } catch { }
+    }
+    return $apps
+}
+
+# --- Function: Get-ImeLogTail (Real-Time IME Log Tail Streamer) ---
+function Get-ImeLogTail {
+    [CmdletBinding()]
+    param([int]$Lines = 100)
+
+    $logPath = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\IntuneManagementExtension.log"
+    if (Test-Path $logPath) {
+        try {
+            return (Get-Content -Path $logPath -Tail $Lines -ErrorAction SilentlyContinue) -join "`r`n"
+        } catch {
+            return "Unable to read IME log: $($_.Exception.Message)"
+        }
+    }
+    return "Intune Management Extension log not found ($logPath)."
+}
+
+# --- Function: Export-MdmDiagnosticsCab (Autopilot & MDM Diagnostic CAB Exporter) ---
+function Export-MdmDiagnosticsCab {
+    [CmdletBinding()]
+    param([string]$DestinationDir = '')
+
+    if (-not $DestinationDir) {
+        $usb = Get-CimInstance Win32_Volume -Filter "DriveType = 2" -ErrorAction SilentlyContinue | Select-Object -First 1
+        $DestinationDir = if ($usb -and $usb.DriveLetter) { "$($usb.DriveLetter)\" } else { [System.IO.Path]::GetTempPath() }
+    }
+    $cabFile = Join-Path $DestinationDir "AutopilotDiagnostics_$([DateTime]::UtcNow.ToString('yyyyMMdd_HHmmss')).cab"
+    try {
+        $proc = Start-Process -FilePath "mdmdiagnosticstool.exe" -ArgumentList "-area Autopilot;DeviceEnrollment;TPM -cab `"$cabFile`"" -Wait -NoNewWindow -PassThru -ErrorAction Stop
+        if (Test-Path $cabFile) {
+            return $cabFile
+        }
+    } catch { }
+    return $null
+}
+
+# --- Function: Set-AutopilotDeviceIdentityPatch (In-Place Group Tag & UPN Patch) ---
+function Set-AutopilotDeviceIdentityPatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][string]$IdentityId,
+        [string]$GroupTag = '',
+        [string]$AssignedUser = '',
+        [Parameter(Mandatory=$true)][string]$AccessToken
+    )
+
+    $headers = @{
+        'Authorization' = "Bearer $AccessToken"
+        'Content-Type'  = 'application/json'
+    }
+    $body = @{
+        groupTag                  = $GroupTag
+        userPrincipalName         = $AssignedUser
+    } | ConvertTo-Json
+
+    $uri = "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities/$IdentityId"
+    Invoke-RestMethod -Uri $uri -Method PATCH -Headers $headers -Body $body -ErrorAction Stop
+}
+
+# --- Function: Invoke-AutopilotTenantSync (Instant Tenant Autopilot Sync POST) ---
+function Invoke-AutopilotTenantSync {
+    [CmdletBinding()]
+    param([Parameter(Mandatory=$true)][string]$AccessToken)
+
+    $headers = @{ 'Authorization' = "Bearer $AccessToken" }
+    $uri = "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotSettings/sync"
+    Invoke-RestMethod -Uri $uri -Method POST -Headers $headers -ErrorAction Stop
+}
+
+# --- Function: Invoke-AutopilotCleanDecommission (3-Registry Clean Decommission) ---
+function Invoke-AutopilotCleanDecommission {
+    [CmdletBinding()]
+    param()
+
+    $actions = [System.Collections.Generic.List[string]]::new()
+    # 1. Decommission registry keys
+    foreach ($reg in @('HKLM:\SOFTWARE\Microsoft\Provisioning\Diagnostics\AutoPilot', 'HKLM:\SOFTWARE\Microsoft\Provisioning\AutopilotPolicyCache')) {
+        if (Test-Path $reg) {
+            try {
+                Remove-Item -Path $reg -Recurse -Force -ErrorAction Stop
+                $actions.Add("Purged registry: $reg")
+            } catch {
+                $actions.Add("Failed to purge $reg : $($_.Exception.Message)")
+            }
+        }
+    }
+    # 2. Decommission MDM enrollment keys
+    try {
+        foreach ($k in @(Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue)) {
+            $pv = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
+            if ($pv -and $pv.ProviderID -eq 'MS DM Server') {
+                Remove-Item -Path $k.PSPath -Recurse -Force -ErrorAction Stop
+                $actions.Add("Purged MDM Enrollment key $($k.PSChildName)")
+            }
+        }
+    } catch { }
+    # 3. Purge cached Autopilot profile JSONs
+    foreach ($j in @("$env:SystemRoot\ServiceState\wmansvc\AutopilotDDSZTDFile.json", "$env:SystemRoot\Provisioning\Autopilot\AutopilotConfigurationFile.json")) {
+        if (Test-Path $j) {
+            try {
+                Remove-Item -Path $j -Force -ErrorAction Stop
+                $actions.Add("Removed cached Autopilot profile: $j")
+            } catch {
+                $actions.Add("Failed to remove $j : $($_.Exception.Message)")
+            }
+        }
+    }
+    return $actions
+}
+
+# --- Function: Get-HubWifiNetworks (OOBE Wi-Fi Scanner) ---
+function Get-HubWifiNetworks {
+    [CmdletBinding()]
+    param()
+
+    $ssids = [System.Collections.Generic.List[string]]::new()
+    try {
+        $netOut = & netsh.exe wlan show networks 2>$null
+        foreach ($line in $netOut) {
+            if ($line -match "^\s*SSID\s+\d+\s*:\s*(.+)$") {
+                $name = $Matches[1].Trim()
+                if ($name -and -not $ssids.Contains($name)) { $ssids.Add($name) }
+            }
+        }
+    } catch { }
+    return $ssids
+}
+
+# --- Function: Connect-HubWifiNetwork (OOBE Wi-Fi Connector) ---
+function Connect-HubWifiNetwork {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][string]$Ssid,
+        [Parameter(Mandatory=$true)][string]$Password
+    )
+
+    $profileXml = @"
+<?xml version="1.0"?>
+<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">
+    <name>$Ssid</name>
+    <SSIDConfig>
+        <SSID>
+            <name>$Ssid</name>
+        </SSID>
+    </SSIDConfig>
+    <connectionType>ESS</connectionType>
+    <connectionMode>auto</connectionMode>
+    <MSM>
+        <security>
+            <authEncryption>
+                <authentication>WPA2PSK</authentication>
+                <encryption>AES</encryption>
+                <useOneX>false</useOneX>
+            </authEncryption>
+            <sharedKey>
+                <keyType>passPhrase</keyType>
+                <protected>false</protected>
+                <keyMaterial>$Password</keyMaterial>
+            </sharedKey>
+        </security>
+    </MSM>
+</WLANProfile>
+"@
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "wifi_$Ssid.xml"
+    [System.IO.File]::WriteAllText($tmp, $profileXml, [System.Text.Encoding]::UTF8)
+    try {
+        & netsh.exe wlan add profile filename="$tmp" user=all | Out-Null
+        & netsh.exe wlan connect name="$Ssid" | Out-Null
+        return $true
+    } finally {
+        if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# --- Function: Import-Hub8021xProfile (802.1X XML Profile Importer) ---
+function Import-Hub8021xProfile {
+    [CmdletBinding()]
+    param([Parameter(Mandatory=$true)][string]$XmlPath)
+
+    if (-not (Test-Path $XmlPath)) { throw "Wi-Fi XML profile not found: $XmlPath" }
+    $res = & netsh.exe wlan add profile filename="$XmlPath" user=all 2>&1
+    return ($LASTEXITCODE -eq 0)
+}
+
+# --- Function: Invoke-HubUsbDriverInjection (pnputil Driver Injection) ---
+function Invoke-HubUsbDriverInjection {
+    [CmdletBinding()]
+    param()
+
+    $results = [System.Collections.Generic.List[string]]::new()
+    $usbDrives = Get-CimInstance Win32_Volume -Filter "DriveType = 2" -ErrorAction SilentlyContinue
+    $count = 0
+    foreach ($usb in $usbDrives) {
+        if ($usb.DriveLetter) {
+            $infs = Get-ChildItem -Path "$($usb.DriveLetter)\" -Filter "*.inf" -Recurse -ErrorAction SilentlyContinue
+            if ($infs -and $infs.Count -gt 0) {
+                $pnp = & pnputil.exe /add-driver "$($usb.DriveLetter)\*.inf" /subdirs /install 2>&1
+                $results.Add("Injected $($infs.Count) driver(s) from $($usb.DriveLetter)\")
+                $count += $infs.Count
+            }
+        }
+    }
+    return [PSCustomObject]@{
+        InjectedCount = $count
+        Log           = $results
+    }
+}
+
+# --- Function: Get-WindowsLicensingInfo (Windows Edition & OEM Key Inspector) ---
+function Get-WindowsLicensingInfo {
+    [CmdletBinding()]
+    param()
+
+    $caption = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+    $oemKey = $null
+    try {
+        $oemKey = (Get-CimInstance -Namespace root/cimv2 -ClassName SoftwareLicensingService -ErrorAction SilentlyContinue).OA3xOriginalProductKey
+    } catch { }
+
+    $isEnterprise = ($caption -match 'Enterprise')
+    return [PSCustomObject]@{
+        Caption      = $caption
+        OemKey       = if ($oemKey) { $oemKey } else { "No OA3 Key in ACPI MSDM" }
+        IsEnterprise = $isEnterprise
+    }
+}
+
+# --- Function: Invoke-WindowsEnterpriseUpgrade (1-Click KMS Enterprise Upgrade) ---
+function Invoke-WindowsEnterpriseUpgrade {
+    [CmdletBinding()]
+    param()
+
+    # Microsoft Generic KMS Client Setup Key for Windows 10/11 Enterprise
+    $genericKmsKey = "NPPR9-FWDCX-D2C8J-H872K-2YT43"
+    $proc = Start-Process -FilePath "changepk.exe" -ArgumentList "/ProductKey $genericKmsKey" -Wait -NoNewWindow -PassThru -ErrorAction SilentlyContinue
+    return ($proc.ExitCode -eq 0)
+}
+
+# --- Function: Export-HubWindowScreenshot (One-Click Staging Proof Exporter) ---
+function Export-HubWindowScreenshot {
+    [CmdletBinding()]
+    param(
+        [System.Windows.Window]$TargetWindow,
+        [string]$SerialNumber = ''
+    )
+
+    if (-not $TargetWindow) { return $null }
+    $usb = Get-CimInstance Win32_Volume -Filter "DriveType = 2" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $destDir = if ($usb -and $usb.DriveLetter) { "$($usb.DriveLetter)\" } else { [System.IO.Path]::GetTempPath() }
+
+    $serialSafe = if ($SerialNumber -and $SerialNumber -notmatch 'Detecting|UNKNOWN') { $SerialNumber.Trim() } else { 'Device' }
+    $fileName = "AutopilotProof_${serialSafe}_$([DateTime]::UtcNow.ToString('yyyyMMdd_HHmmss')).png"
+    $fullPath = Join-Path $destDir $fileName
+
+    $TargetWindow.Dispatcher.Invoke([Action]{
+        $TargetWindow.UpdateLayout()
+        $w = [int]$TargetWindow.ActualWidth
+        $h = [int]$TargetWindow.ActualHeight
+        if ($w -le 0) { $w = 1400 }
+        if ($h -le 0) { $h = 850 }
+
+        $rtb = [System.Windows.Media.Imaging.RenderTargetBitmap]::new(
+            $w, $h, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32
+        )
+        $rtb.Render($TargetWindow)
+
+        $enc = [System.Windows.Media.Imaging.PngBitmapEncoder]::new()
+        $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($rtb))
+        $fs = [System.IO.FileStream]::new($fullPath, [System.IO.FileMode]::Create)
+        $enc.Save($fs)
+        $fs.Close()
+    })
+
+    return $fullPath
 }
 
 # ==============================================================================
@@ -2978,12 +3818,24 @@ function Start-AutopilotHubGui {
             </Grid.ColumnDefinitions>
 
             <StackPanel Grid.Row="0" Grid.Column="0" Orientation="Vertical" VerticalAlignment="Center">
-                <TextBlock Text="Autopilot Provisioning Hub" FontSize="20" FontWeight="Bold" Foreground="#FFFFFF"/>
-                <TextBlock Text="Microsoft Intune &amp; Windows Autopilot Automated Deployment Engine" FontSize="11.5" Foreground="#8A8A8A" Margin="0,2,0,0"/>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Border Name="BorderTenantLogo" CornerRadius="4" Background="#2B2B2B" BorderBrush="#383838" BorderThickness="1" Padding="4" Margin="0,0,10,0" Visibility="Collapsed">
+                        <Image Name="ImgTenantLogo" Width="28" Height="28" Stretch="Uniform"/>
+                    </Border>
+                    <StackPanel Orientation="Vertical">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="Autopilot Provisioning Hub" FontSize="20" FontWeight="Bold" Foreground="#FFFFFF"/>
+                            <Border Name="BadgeTenantBrand" Background="#182A3A" BorderBrush="#234863" BorderThickness="1" CornerRadius="3" Padding="6,2" Margin="10,0,0,0" VerticalAlignment="Center" Visibility="Collapsed">
+                                <TextBlock Name="TxtTenantBrand" Text="TENANT" FontSize="10.5" FontWeight="Bold" Foreground="#60CDFF"/>
+                            </Border>
+                        </StackPanel>
+                        <TextBlock Text="Microsoft Intune &amp; Windows Autopilot Automated Deployment Engine" FontSize="11.5" Foreground="#8A8A8A" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </StackPanel>
             </StackPanel>
 
             <StackPanel Grid.Row="1" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,10,0,0">
-                    <!-- Live privilege / session badge (replaces the old static OOBE pill - it is wrong on the desktop) -->
+                    <!-- Live privilege / session badge -->
                     <Border Name="BadgePrivilege" Background="#2E2221" CornerRadius="3" Padding="8,3" Margin="0,0,0,0" VerticalAlignment="Center" BorderBrush="#542E2A" BorderThickness="1" Cursor="Hand"
                             ToolTip="The privilege level this window is running with. Click for details. Hash harvest, rename, app installs, clock sync and restart-resume all need elevation.">
                         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
@@ -2993,6 +3845,11 @@ function Start-AutopilotHubGui {
                     </Border>
                     <Button Name="BtnFixPrivilege" Content="Fix Privileges" Style="{StaticResource DestructiveBtn}" Margin="6,0,0,0" Padding="8,3" FontSize="11" Visibility="Collapsed"
                             ToolTip="Walks you through relaunching the Hub with the privilege level it needs."/>
+                    <!-- Power & Battery Posture Monitor Badge -->
+                    <Border Name="BadgePower" Background="#1F2822" CornerRadius="3" Padding="8,3" Margin="6,0,0,0" VerticalAlignment="Center" BorderBrush="#2A5435" BorderThickness="1"
+                            ToolTip="Hardware power posture (AC line vs battery status). Red warning on low battery.">
+                        <TextBlock Name="TxtPowerStatus" Text="POWER: PROBING" FontSize="10.5" FontWeight="SemiBold" Foreground="#6CCB5F" VerticalAlignment="Center"/>
+                    </Border>
                     <!-- Graph Authentication Session Badge -->
                     <Border Name="BadgeGraphAuth" Background="#2E2221" CornerRadius="3" Padding="8,3" Margin="6,0,0,0" VerticalAlignment="Center" BorderBrush="#542E2A" BorderThickness="1">
                         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
@@ -3006,12 +3863,14 @@ function Start-AutopilotHubGui {
             </StackPanel>
 
             <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                <Button Name="BtnConnectGraph" Content="Sign In to Intune" Style="{StaticResource AccentBtn}" Margin="0,0,8,0"/>
-
-                <Button Name="BtnInstallPwsh" Content="Install PS7" Margin="0,0,8,0"
+                <Button Name="BtnConnectGraph" Content="Sign In to Intune" Style="{StaticResource AccentBtn}" Margin="0,0,6,0"/>
+                <Button Name="BtnLaunchEdge" Content="Edge / Portal" Margin="0,0,6,0" ToolTip="Launch Microsoft Edge to authenticate against staging dock captive portals"/>
+                <Button Name="BtnScreenshotUsb" Content="Capture Proof" Margin="0,0,6,0" ToolTip="Export a high-res staging proof screenshot directly to USB flash drive"/>
+                <Button Name="BtnToggleDpi" Content="Scale: 100%" Margin="0,0,6,0" ToolTip="Toggle High-DPI UI scaling between 100% and 125%"/>
+                <Button Name="BtnInstallPwsh" Content="Install PS7" Margin="0,0,6,0"
                         ToolTip="Cause fuck Microsoft for still shipping Windows with the outta date garbage that is PowerShell 5.1."/>
-                <Button Name="BtnQuickCmd" Content="Cmd (Shift+F10)" ToolTip="Open a command prompt (same as Shift+F10 in OOBE)" Margin="0,0,8,0"/>
-                <Button Name="BtnTimeSync" Content="Sync Clock" Margin="0,0,8,0"/>
+                <Button Name="BtnQuickCmd" Content="Cmd (Shift+F10)" ToolTip="Open a command prompt (same as Shift+F10 in OOBE)" Margin="0,0,6,0"/>
+                <Button Name="BtnTimeSync" Content="Sync Clock" Margin="0,0,6,0"/>
                 <Button Name="BtnReboot" Content="Restart System" Style="{StaticResource DestructiveBtn}"/>
             </StackPanel>
         </Grid>
@@ -3103,6 +3962,21 @@ function Start-AutopilotHubGui {
                         <ColumnDefinition Width="*"/>
                     </Grid.ColumnDefinitions>
 
+                    <!-- Tenant Mismatch Warning Banner -->
+                    <Border Name="BannerTenantMismatch" Grid.Row="0" Grid.ColumnSpan="2" Background="#442726" BorderBrush="#FF99A4" BorderThickness="1" CornerRadius="4" Padding="12,8" Margin="0,0,0,8" Visibility="Collapsed">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel>
+                                <TextBlock Text="TENANT MISMATCH DETECTED" FontSize="11" FontWeight="Bold" Foreground="#FF99A4"/>
+                                <TextBlock Name="TxtTenantMismatch" Text="Device cached profile does not match signed-in operator tenant." FontSize="11.5" Foreground="#E0E0E0" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <Button Name="BtnDismissMismatch" Grid.Column="1" Content="Dismiss" VerticalAlignment="Center" Padding="8,4" FontSize="11"/>
+                        </Grid>
+                    </Border>
+
                     <!-- Device Enrollment State Banner (drives what the operator is asked to do) -->
                     <Border Name="BannerDeviceState" Grid.Row="0" Grid.ColumnSpan="2" Background="#262626" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12,8" Margin="0,0,0,12">
                         <Grid>
@@ -3174,7 +4048,22 @@ function Start-AutopilotHubGui {
                                 <Button Name="BtnPersonalInstall" Content="Skip Autopilot in OOBE" Style="{StaticResource AccentBtn}" Height="34" Margin="0,0,0,6"/>
                                 <Button Name="BtnReenableNet" Content="Re-enable Network Adapters" Height="28" Margin="0,0,0,14"/>
 
-                                <Button Name="BtnSaveEnvDefaults" Content="Save Current Settings to .env" Height="30"/>
+                                <Button Name="BtnSaveEnvDefaults" Content="Save Current Settings to .env" Height="30" Margin="0,0,0,14"/>
+
+                                <!-- Profile Policy & Offline Provisioning -->
+                                <TextBlock Text="PROFILE &amp; OFFLINE PROVISIONING" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,0,0,6"/>
+                                <Button Name="BtnInspectPolicy" Content="Inspect Decoded Autopilot Policy" Height="30" Margin="0,0,0,6"
+                                        ToolTip="Decodes CloudAssignedOobeConfig bitmask (EULA, OEM registration, account type, privacy settings)"/>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Button Name="BtnExportOfflineJson" Grid.Column="0" Content="Export Offline JSON" Margin="0,0,4,0" Height="30"
+                                            ToolTip="Export AutopilotConfigurationFile.json to USB flash drive for air-gapped provisioning"/>
+                                    <Button Name="BtnInjectOfflineJson" Grid.Column="1" Content="Inject Offline JSON" Margin="4,0,0,0" Height="30"
+                                            ToolTip="Inject AutopilotConfigurationFile.json into Windows Provisioning folder"/>
+                                </Grid>
                             </StackPanel>
                         </ScrollViewer>
                     </Border>
@@ -3419,33 +4308,56 @@ function Start-AutopilotHubGui {
                             <Button Name="BtnRunDiag" Grid.Column="1" Content="Run Diagnostics" Padding="12,5"/>
                         </Grid>
 
-                        <ListBox Name="LstDiagStages" Grid.Row="1" Background="#1F1F1F" BorderBrush="#383838">
-                            <ListBox.ItemTemplate>
-                                <DataTemplate>
-                                    <Border Padding="10,6" BorderBrush="#2E2E2E" BorderThickness="0,0,0,1">
-                                        <Grid>
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="35"/>
-                                                <ColumnDefinition Width="180"/>
-                                                <ColumnDefinition Width="*"/>
-                                            </Grid.ColumnDefinitions>
-                                            <TextBlock Text="{Binding Stage}" FontWeight="Bold" Foreground="#60CDFF"/>
-                                            <TextBlock Grid.Column="1" Text="{Binding Name}" FontWeight="SemiBold" Foreground="#FFFFFF"/>
-                                            <TextBlock Grid.Column="2" Text="{Binding Details}" Foreground="#8A8A8A"/>
-                                        </Grid>
-                                    </Border>
-                                </DataTemplate>
-                            </ListBox.ItemTemplate>
-                        </ListBox>
+                        <Grid Grid.Row="1">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <ListBox Name="LstDiagStages" Grid.Row="0" Background="#1F1F1F" BorderBrush="#383838">
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border Padding="10,6" BorderBrush="#2E2E2E" BorderThickness="0,0,0,1">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="35"/>
+                                                    <ColumnDefinition Width="180"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Text="{Binding Stage}" FontWeight="Bold" Foreground="#60CDFF"/>
+                                                <TextBlock Grid.Column="1" Text="{Binding Name}" FontWeight="SemiBold" Foreground="#FFFFFF"/>
+                                                <TextBlock Grid.Column="2" Text="{Binding Details}" Foreground="#8A8A8A"/>
+                                            </Grid>
+                                        </Border>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                            <!-- Pre-Flight Remediation Action Bar -->
+                            <Grid Grid.Row="1" Margin="0,10,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="PRE-FLIGHT REMEDIATION &amp; DRIVERS" FontSize="11" FontWeight="SemiBold" Foreground="#8A8A8A" VerticalAlignment="Center"/>
+                                <Button Name="BtnFixClockSkew" Grid.Column="1" Content="Auto-Remediate Clock Skew" Margin="0,0,8,0" Padding="10,5"
+                                        ToolTip="Queries Microsoft Online date header and forces local time + w32tm /resync"/>
+                                <Button Name="BtnTpmAttestation" Grid.Column="2" Content="TPM 2.0 &amp; EK Attestation Engine" Margin="0,0,8,0" Padding="10,5"
+                                        ToolTip="Tests Endorsement Key (EK) certificates and manufacturer EK CA server reachability"/>
+                                <Button Name="BtnInjectDriversPreflight" Grid.Column="3" Content="Inject USB Drivers (pnputil)" Padding="10,5"
+                                        ToolTip="Scans USB drives for .inf network and chipset driver packages and installs them"/>
+                            </Grid>
+                        </Grid>
                     </Grid>
                 </Border>
             </TabItem>
 
             <!-- TAB 5: DELL ASSET WARRANTY & REFRESH ASSESSMENT -->
-            <TabItem Header="Dell Warranty &amp; Refresh">
+            <TabItem Header="Dell Warranty &amp; Hardware Health">
                 <Border Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="16" Margin="0,12,0,0">
                     <Grid>
                         <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="Auto"/>
@@ -3462,10 +4374,13 @@ function Start-AutopilotHubGui {
                                 <ColumnDefinition Width="Auto"/>
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
-                            <TextBlock Text="Service Tag:" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,10,0" Foreground="#FFFFFF"/>
+                            <TextBlock Text="Service Tag / Serial:" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,8,0" Foreground="#FFFFFF"/>
                             <TextBox Name="TxtDellServiceTag" Grid.Column="1" VerticalAlignment="Center" CharacterCasing="Upper" FontFamily="Consolas" FontWeight="Bold" FontSize="13" Margin="0,0,8,0"/>
-                            <Button Name="BtnDetectDellTag" Grid.Column="2" Content="Detect BIOS Tag" Margin="0,0,8,0"/>
-                            <Button Name="BtnCheckDellWarranty" Grid.Column="3" HorizontalAlignment="Left" Content="Assess Lifecycle &amp; Warranty" Style="{StaticResource AccentBtn}" Margin="0,0,8,0"/>
+                            <Button Name="BtnDetectDellTag" Grid.Column="2" Content="Detect BIOS Tag" Margin="0,0,6,0"/>
+                            <StackPanel Grid.Column="3" Orientation="Horizontal">
+                                <Button Name="BtnCheckDellWarranty" Content="Assess Dell Warranty" Style="{StaticResource AccentBtn}" Margin="0,0,6,0"/>
+                                <Button Name="BtnCheckLenovoWarranty" Content="Assess Lenovo" Margin="0,0,8,0"/>
+                            </StackPanel>
                             <Button Name="BtnCopyDellReport" Grid.Column="4" Content="Copy Report" Margin="0,0,6,0"/>
                             <Button Name="BtnExportDellCsv" Grid.Column="5" Content="Export CSV"/>
                         </Grid>
@@ -3529,8 +4444,60 @@ function Start-AutopilotHubGui {
                             </Border>
                         </Grid>
 
-                        <!-- Row 3: Entitlements Table -->
-                        <Grid Grid.Row="3">
+                        <!-- Row 3: Multi-Vendor Hardware Health Cards (Battery Wear & NVMe SMART) -->
+                        <Grid Grid.Row="3" Margin="0,0,0,12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+
+                            <!-- Battery Wear Card -->
+                            <Border Grid.Column="0" Background="#242424" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="10,8" Margin="0,0,6,0">
+                                <Grid>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="Auto"/>
+                                    </Grid.RowDefinitions>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="BATTERY WEAR &amp; HEALTH" FontSize="10" FontWeight="SemiBold" Foreground="#8A8A8A"/>
+                                    <Button Name="BtnRefreshBattery" Grid.Column="1" Content="Refresh Battery" Padding="6,2" FontSize="10"/>
+                                    <StackPanel Grid.Row="1" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,2">
+                                        <TextBlock Name="TxtBatteryWear" Text="Wear: Probing..." FontSize="12.5" FontWeight="Bold" Foreground="#60CDFF" Margin="0,0,12,0"/>
+                                        <TextBlock Name="TxtBatteryVerdict" Text="Status: Normal" FontSize="12" Foreground="#D0D0D0" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                    <TextBlock Name="TxtBatteryCapacity" Grid.Row="2" Grid.ColumnSpan="2" Text="Design: - | Full: -" FontSize="10.5" Foreground="#8A8A8A"/>
+                                </Grid>
+                            </Border>
+
+                            <!-- NVMe SSD SMART Reliability Card -->
+                            <Border Grid.Column="1" Background="#242424" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="10,8" Margin="6,0,0,0">
+                                <Grid>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="Auto"/>
+                                    </Grid.RowDefinitions>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="NVME SSD SMART RELIABILITY COUNTER" FontSize="10" FontWeight="SemiBold" Foreground="#8A8A8A"/>
+                                    <Button Name="BtnRefreshStorage" Grid.Column="1" Content="Inspect SMART" Padding="6,2" FontSize="10"/>
+                                    <StackPanel Grid.Row="1" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,2">
+                                        <TextBlock Name="TxtStorageWear" Text="SSD Wear: Probing..." FontSize="12.5" FontWeight="Bold" Foreground="#6CCB5F" Margin="0,0,12,0"/>
+                                        <TextBlock Name="TxtStorageTemp" Text="Temp: -" FontSize="12" Foreground="#D0D0D0" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                    <TextBlock Name="TxtStorageMeta" Grid.Row="2" Grid.ColumnSpan="2" Text="Read Errors: 0 | Write Errors: 0 | Power-On Hours: -" FontSize="10.5" Foreground="#8A8A8A"/>
+                                </Grid>
+                            </Border>
+                        </Grid>
+
+                        <!-- Row 4: Entitlements Table -->
+                        <Grid Grid.Row="4">
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="Auto"/>
                                 <RowDefinition Height="*"/>
@@ -3665,6 +4632,159 @@ function Start-AutopilotHubGui {
                 </Grid>
             </TabItem>
 
+            <!-- TAB 7: ESP DIAGNOSTICS & LIFECYCLE TOOLS -->
+            <TabItem Header="ESP Diagnostics &amp; Lifecycle">
+                <Grid Margin="0,12,0,0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="130"/>
+                    </Grid.RowDefinitions>
+                    <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+
+                            <!-- Card 1: Win32App Registry Status & Diagnostics -->
+                            <Border Grid.Row="0" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                                <StackPanel>
+                                    <Grid Margin="0,0,0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="WIN32APP ESP REGISTRY STATUS" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" VerticalAlignment="Center"/>
+                                        <Button Name="BtnRefreshWin32Apps" Grid.Column="1" Content="Refresh Apps" Margin="0,0,6,0" Padding="8,3" FontSize="11"/>
+                                        <Button Name="BtnExportMdmCab" Grid.Column="2" Content="Export CAB" Padding="8,3" FontSize="11" ToolTip="Runs mdmdiagnosticstool.exe -area Autopilot;DeviceEnrollment;TPM -cab"/>
+                                    </Grid>
+                                    <ListBox Name="LstWin32Apps" Height="140" Background="#1F1F1F" BorderBrush="#383838">
+                                        <ListBox.ItemTemplate>
+                                            <DataTemplate>
+                                                <Grid Margin="2">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*"/>
+                                                        <ColumnDefinition Width="110"/>
+                                                        <ColumnDefinition Width="65"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock Text="{Binding Name}" Foreground="#FFFFFF" FontWeight="SemiBold" FontSize="11" TextTrimming="CharacterEllipsis"/>
+                                                    <TextBlock Grid.Column="1" Text="{Binding InstallState}" Foreground="#6CCB5F" FontSize="10.5"/>
+                                                    <TextBlock Grid.Column="2" Text="{Binding ExitCode}" Foreground="#8A8A8A" FontSize="10.5"/>
+                                                </Grid>
+                                            </DataTemplate>
+                                        </ListBox.ItemTemplate>
+                                    </ListBox>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card 2: Autopilot Cloud Device Lifecycle -->
+                            <Border Grid.Row="0" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                                <StackPanel>
+                                    <TextBlock Text="AUTOPILOT CLOUD LIFECYCLE &amp; DECOMMISSION" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
+                                    <Grid Margin="0,0,0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="90"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="New Group Tag:" Foreground="#D0D0D0" VerticalAlignment="Center" FontSize="11"/>
+                                        <TextBox Name="TxtLifecycleGroupTag" Grid.Column="1" Height="26" FontSize="11"/>
+                                    </Grid>
+                                    <Grid Margin="0,0,0,8">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="90"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="New User UPN:" Foreground="#D0D0D0" VerticalAlignment="Center" FontSize="11"/>
+                                        <TextBox Name="TxtLifecycleUser" Grid.Column="1" Height="26" FontSize="11"/>
+                                    </Grid>
+                                    <WrapPanel>
+                                        <Button Name="BtnPatchLifecycle" Content="In-Place PATCH" Style="{StaticResource AccentBtn}" Margin="0,0,6,6" Padding="8,4" FontSize="11"
+                                                ToolTip="Patches group tag and assigned user directly on Graph Autopilot device identity"/>
+                                        <Button Name="BtnSyncAutopilot" Content="Instant Tenant Sync" Margin="0,0,6,6" Padding="8,4" FontSize="11"
+                                                ToolTip="Triggers POST /deviceManagement/windowsAutopilotSettings/sync"/>
+                                        <Button Name="BtnDecommission" Content="3-Registry Decommission" Style="{StaticResource DestructiveBtn}" Margin="0,0,6,6" Padding="8,4" FontSize="11"
+                                                ToolTip="Purges Autopilot diagnostics registry, MDM enrollment keys, and cached profile JSONs"/>
+                                    </WrapPanel>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card 3: OOBE Wi-Fi Manager & 802.1X XML Profile Import -->
+                            <Border Grid.Row="1" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                                <StackPanel>
+                                    <TextBlock Text="OOBE WI-FI MANAGER &amp; 802.1X PROFILES" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
+                                    <Grid Margin="0,0,0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <ComboBox Name="CmbWifiSsids" IsEditable="True" Height="26" FontSize="11"/>
+                                        <Button Name="BtnScanWifi" Grid.Column="1" Content="Scan SSIDs" Margin="6,0,0,0" Padding="8,3" FontSize="11"/>
+                                    </Grid>
+                                    <Grid Margin="0,0,0,8">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="70"/>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="Password:" Foreground="#D0D0D0" VerticalAlignment="Center" FontSize="11"/>
+                                        <TextBox Name="TxtWifiPassword" Grid.Column="1" Height="26" FontSize="11"/>
+                                        <Button Name="BtnConnectWifi" Grid.Column="2" Content="Connect" Style="{StaticResource AccentBtn}" Margin="6,0,0,0" Padding="8,3" FontSize="11"/>
+                                    </Grid>
+                                    <WrapPanel>
+                                        <Button Name="BtnImportWifiXml" Content="Import 802.1X XML Profile" Margin="0,0,6,0" Padding="8,4" FontSize="11"
+                                                ToolTip="Imports enterprise WPA2-Enterprise/802.1X Wi-Fi XML profile via netsh wlan add profile"/>
+                                    </WrapPanel>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card 4: Windows Edition & 1-Click KMS Upgrade -->
+                            <Border Grid.Row="1" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                                <StackPanel>
+                                    <TextBlock Text="WINDOWS EDITION &amp; OEM LICENSE" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
+                                    <StackPanel Margin="0,0,0,8">
+                                        <TextBlock Name="TxtOsCaption" Text="Edition: Detecting..." FontSize="11.5" Foreground="#FFFFFF" FontWeight="SemiBold"/>
+                                        <TextBlock Name="TxtOemKey" Text="OEM Key: Reading ACPI MSDM..." FontSize="11" Foreground="#8A8A8A" FontFamily="Consolas" Margin="0,2,0,0"/>
+                                    </StackPanel>
+                                    <WrapPanel>
+                                        <Button Name="BtnUpgradeEnterprise" Content="1-Click Upgrade to Enterprise (KMS)" Style="{StaticResource AccentBtn}" Margin="0,0,6,0" Padding="8,4" FontSize="11"
+                                                ToolTip="Upgrades Windows Home/Pro to Windows Enterprise using official Microsoft KMS setup key"/>
+                                        <Button Name="BtnRefreshLicensing" Content="Refresh Edition" Padding="8,4" FontSize="11"/>
+                                    </WrapPanel>
+                                </StackPanel>
+                            </Border>
+                        </Grid>
+                    </ScrollViewer>
+
+                    <!-- Tab-local log / tail pane -->
+                    <Border Grid.Row="1" Background="#161616" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Margin="0,4,0,0">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            <Border Grid.Row="0" Background="#202020" Padding="6,3">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="INTUNEMANAGEMENTEXTENSION.LOG STREAM (LAST 100 LINES)" FontSize="10" FontWeight="SemiBold" Foreground="#8A8A8A" VerticalAlignment="Center"/>
+                                    <Button Name="BtnTailImeLog" Grid.Column="1" Content="Tail IME Log" Padding="6,2" FontSize="10"/>
+                                </Grid>
+                            </Border>
+                            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                                <TextBox Name="TxtImeLog" Background="Transparent" Foreground="#D0D0D0" BorderThickness="0" FontFamily="Consolas" FontSize="10.5" IsReadOnly="True" TextWrapping="Wrap" Padding="6" Text="Click 'Tail IME Log' to read the real-time Intune Management Extension agent log..."/>
+                            </ScrollViewer>
+                        </Grid>
+                    </Border>
+                </Grid>
+            </TabItem>
+
         </TabControl>
 
         <!-- PROGRESS BAR & STATUS -->
@@ -3759,6 +4879,62 @@ function Start-AutopilotHubGui {
     $bannerAppAdvisory     = $window.FindName('BannerAppAdvisory')
     $txtAppAdvisory        = $window.FindName('TxtAppAdvisory')
 
+    # Additional Controls: Header & Tab 1
+    $bannerTenantMismatch  = $window.FindName('BannerTenantMismatch')
+    $txtTenantMismatch     = $window.FindName('TxtTenantMismatch')
+    $btnDismissMismatch    = $window.FindName('BtnDismissMismatch')
+    $btnInspectPolicy      = $window.FindName('BtnInspectPolicy')
+    $btnExportOfflineJson  = $window.FindName('BtnExportOfflineJson')
+    $btnInjectOfflineJson  = $window.FindName('BtnInjectOfflineJson')
+    $btnSkipAutopilot      = if ($window.FindName('BtnSkipAutopilot')) { $window.FindName('BtnSkipAutopilot') } else { $btnPersonalInstall }
+
+    $borderTenantLogo      = $window.FindName('BorderTenantLogo')
+    $imgTenantLogo         = $window.FindName('ImgTenantLogo')
+    $badgeTenantBrand      = $window.FindName('BadgeTenantBrand')
+    $txtTenantBrand        = $window.FindName('TxtTenantBrand')
+    $badgePower            = $window.FindName('BadgePower')
+    $txtPowerStatus        = $window.FindName('TxtPowerStatus')
+    $btnLaunchEdge         = $window.FindName('BtnLaunchEdge')
+    $btnScreenshotUsb      = $window.FindName('BtnScreenshotUsb')
+    $btnToggleDpi          = $window.FindName('BtnToggleDpi')
+
+    # Additional Controls: Tab 4 Pre-Flight
+    $btnFixClockSkew       = $window.FindName('BtnFixClockSkew')
+    $btnTpmAttestation     = $window.FindName('BtnTpmAttestation')
+    $btnInjectDriversPreflight = $window.FindName('BtnInjectDriversPreflight')
+
+    # Additional Controls: Tab 5 Warranty & Hardware Health
+    $btnCheckLenovoWarranty = $window.FindName('BtnCheckLenovoWarranty')
+    $btnRefreshBattery     = $window.FindName('BtnRefreshBattery')
+    $txtBatteryWear        = $window.FindName('TxtBatteryWear')
+    $txtBatteryVerdict     = $window.FindName('TxtBatteryVerdict')
+    $txtBatteryCapacity    = $window.FindName('TxtBatteryCapacity')
+    $btnRefreshStorage     = $window.FindName('BtnRefreshStorage')
+    $txtStorageWear        = $window.FindName('TxtStorageWear')
+    $txtStorageTemp        = $window.FindName('TxtStorageTemp')
+    $txtStorageMeta        = $window.FindName('TxtStorageMeta')
+
+    # Additional Controls: Tab 7 ESP & Lifecycle
+    $lstWin32Apps          = $window.FindName('LstWin32Apps')
+    $btnRefreshWin32Apps   = $window.FindName('BtnRefreshWin32Apps')
+    $btnExportMdmCab       = $window.FindName('BtnExportMdmCab')
+    $txtLifecycleGroupTag  = $window.FindName('TxtLifecycleGroupTag')
+    $txtLifecycleUser      = $window.FindName('TxtLifecycleUser')
+    $btnPatchLifecycle     = $window.FindName('BtnPatchLifecycle')
+    $btnSyncAutopilot      = $window.FindName('BtnSyncAutopilot')
+    $btnDecommission       = $window.FindName('BtnDecommission')
+    $cmbWifiSsids          = $window.FindName('CmbWifiSsids')
+    $btnScanWifi           = $window.FindName('BtnScanWifi')
+    $txtWifiPassword       = $window.FindName('TxtWifiPassword')
+    $btnConnectWifi        = $window.FindName('BtnConnectWifi')
+    $btnImportWifiXml      = $window.FindName('BtnImportWifiXml')
+    $txtOsCaption          = $window.FindName('TxtOsCaption')
+    $txtOemKey             = $window.FindName('TxtOemKey')
+    $btnUpgradeEnterprise  = $window.FindName('BtnUpgradeEnterprise')
+    $btnRefreshLicensing   = $window.FindName('BtnRefreshLicensing')
+    $btnTailImeLog         = $window.FindName('BtnTailImeLog')
+    $txtImeLog             = $window.FindName('TxtImeLog')
+
     function Update-GraphAuthHeader {
         if ($script:GraphAuthContext -and $script:GraphAuthContext.AccessToken -and $script:GraphAuthContext.ExpiresOn -gt [datetime]::UtcNow.AddMinutes(2)) {
             $dotGraphStatus.Fill = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#6CCB5F")
@@ -3777,6 +4953,26 @@ function Start-AutopilotHubGui {
             $txtGraphStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#6CCB5F")
             $btnConnectGraph.Content = "Disconnect"
             $btnConnectGraph.Style = [System.Windows.Style]$window.Resources['DestructiveBtn']
+
+            # Tenant Branding & Mismatch Check
+            try {
+                $tb = Get-GraphTenantBranding -AccessToken $script:GraphAuthContext.AccessToken
+                if ($tb -and $tb.DisplayName -and $txtTenantBrand) {
+                    $txtTenantBrand.Text = $tb.DisplayName.ToUpper()
+                    if ($badgeTenantBrand) { $badgeTenantBrand.Visibility = [System.Windows.Visibility]::Visible }
+                }
+                if ($tb -and $tb.SquareLogoUrl -and $imgTenantLogo -and $borderTenantLogo) {
+                    Set-HubBrandingImageAsync -TargetImage $imgTenantLogo -LogoContainer $borderTenantLogo -ImageUrl $tb.SquareLogoUrl
+                }
+            } catch { }
+
+            if ($bannerTenantMismatch -and $txtTenantMismatch -and $script:DeviceState -and $script:DeviceState.AutopilotTenantId -and $script:GraphAuthContext.TenantId) {
+                if ($script:DeviceState.AutopilotTenantId -ne $script:GraphAuthContext.TenantId) {
+                    $txtTenantMismatch.Text = "Device cached profile belongs to tenant '$($script:DeviceState.AutopilotTenantDomain)' ($($script:DeviceState.AutopilotTenantId)), but the active session is signed into tenant '$($script:GraphAuthContext.TenantId)'."
+                    $bannerTenantMismatch.Visibility = [System.Windows.Visibility]::Visible
+                }
+            }
+
             Invoke-TenantAutopilotLookup
         } else {
             $dotGraphStatus.Fill = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FFAA99")
@@ -3998,6 +5194,12 @@ function Start-AutopilotHubGui {
 
         $showAction = $true
         switch ($ds.Verdict) {
+            'Bypassed' {
+                $title = "DEVICE STATE: AUTOPILOT BYPASSED (LOCAL INSTALL)"
+                $detail = "$($ds.Summary). Autopilot has been skipped on this install. OOBE will finish as a normal Windows with a local account.$cloudNote"
+                $bg = '#252B35'; $border = '#355070'; $fg = '#60CDFF'; $showAction = $false
+                $txtDeviceState.Text = "AUTOPILOT BYPASSED"; $txtDeviceState.Foreground = $bc.ConvertFromString('#60CDFF')
+            }
             'AutopilotRegistered' {
                 $title = "DEVICE STATE: AUTOPILOT REGISTERED"
                 $detail = "$($ds.Summary). This PC already received its deployment profile from the Autopilot Deployment Service - that is why it boots into the branded OOBE. Registration is NOT required; use this tab only to export a CSV or change the group tag.$cloudNote"
@@ -4217,6 +5419,7 @@ function Start-AutopilotHubGui {
             $txtHashMeta.Text = "Serial: $($hashInfo.SerialNumber) | Length: $($hashInfo.HashLengthBytes) bytes | GroupTag: '$($hashInfo.GroupTag)'"
             Write-HubLog "Hardware hash harvested successfully ($($hashInfo.HashLengthBytes) bytes)." "SUCCESS"
             Set-HubProgress -Percent 100 -Status "Hash Ready"
+            Play-HubAudio -Type Success
         } else {
             $txtHashBox.Text = ''
             $txtHashStatus.Text = "HASH UNAVAILABLE"
@@ -4226,13 +5429,14 @@ function Start-AutopilotHubGui {
             $txtHashMeta.Text = "Serial: $($hashInfo.SerialNumber) | No genuine hardware hash - registration and CSV export are blocked"
             Write-HubLog "Hardware hash unavailable: $reason" "ERROR"
             Set-HubProgress -Percent 0 -Status "Harvest Failed"
+            Play-HubAudio -Type Error
         }
     }
     $btnHarvestHash.Add_Click({ Invoke-HubHarvest })
     $btnDeviceStateAction.Add_Click({ Invoke-HubHarvest })
 
     # --- ACTION: Skip Autopilot in OOBE ---
-    $btnPersonalInstall.Add_Click({
+    $skipAutopilotAction = {
         $ctx = $script:RuntimeContext
         if (-not $ctx.MeetsPreferred) {
             [System.Windows.MessageBox]::Show("This needs elevation (it edits HKLM and can disable network adapters). Use 'Fix Privileges' first.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
@@ -4251,13 +5455,21 @@ function Start-AutopilotHubGui {
         Write-HubLog "Applying Autopilot bypass so OOBE finishes as a normal Windows..." "WARN"
         $res = Invoke-AutopilotBypass -DisableNetwork:$disableNet
         foreach ($a in $res.Actions) { Write-HubLog "  $a" $(if ($a -like 'FAILED*') { 'ERROR' } else { 'INFO' }) }
+
+        # Immediately refresh device state and update banner/header
+        $script:DeviceState = Get-DeviceEnrollmentState
+        Update-DeviceStateUi
+        Write-HubLog "Device state updated: $($script:DeviceState.Summary)" "INFO"
+
         if ($ctx.IsOobe) {
             Write-HubLog "Done. Close this window, continue OOBE and pick 'I don't have internet' / local account. If the build offers no offline option, run  start ms-cxh:localonly  from Shift+F10." "SUCCESS"
             try { Start-Process 'ms-cxh:localonly' -ErrorAction Stop; Write-HubLog "Launched the local-account OOBE page (ms-cxh:localonly)." "INFO" } catch { }
         } else {
             Write-HubLog "Flags applied. Remember: this only matters during OOBE of a fresh install." "SUCCESS"
         }
-    })
+    }
+    if ($btnPersonalInstall) { $btnPersonalInstall.Add_Click($skipAutopilotAction) }
+    if ($btnSkipAutopilot -and $btnSkipAutopilot -ne $btnPersonalInstall) { $btnSkipAutopilot.Add_Click($skipAutopilotAction) }
 
     $btnReenableNet.Add_Click({
         if (-not $script:RuntimeContext.MeetsPreferred) {
@@ -4278,6 +5490,7 @@ function Start-AutopilotHubGui {
         $res = Export-AutopilotCsv -AutoDetectUsb:$chkAutoDetectUsb.IsChecked -GroupTag $gt -AssignedUser $usr -DeviceName $deviceName
         if ($res.Success) {
             Write-HubLog "Autopilot CSV '$($res.FileName)' written to: $($res.Path)" "SUCCESS"
+            Play-HubAudio -Type Success
             [System.Windows.MessageBox]::Show("Autopilot CSV exported successfully!`n`nFile: $($res.FileName)`nDestination: $($res.Path)", "CSV Export Succeeded", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
         }
     })
@@ -4340,6 +5553,7 @@ function Start-AutopilotHubGui {
             if ($reg.Success) {
                 Write-HubLog "Device registered to Intune! Import ID: $($reg.ImportId)" "SUCCESS"
                 Set-HubProgress -Percent 100 -Status "Registration Complete"
+                Play-HubAudio -Type Success
 
                 if ($chkAutoReboot.IsChecked) {
                     Write-HubLog "Auto-reboot scheduled in 10 seconds..." "WARN"
@@ -4349,6 +5563,7 @@ function Start-AutopilotHubGui {
         } catch {
             Write-HubLog "Intune Registration Error: $($_.Exception.Message)" "ERROR"
             Set-HubProgress -Percent 0 -Status "Registration Failed"
+            Play-HubAudio -Type Error
         }
     })
 
@@ -4937,6 +6152,423 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
         [System.Windows.MessageBox]::Show("Dell warranty audit exported successfully to:`n$destPath", "CSV Exported", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
     })
 
+    # --- HEADER ACTIONS ---
+    if ($btnDismissMismatch) {
+        $btnDismissMismatch.Add_Click({
+            if ($bannerTenantMismatch) { $bannerTenantMismatch.Visibility = [System.Windows.Visibility]::Collapsed }
+        })
+    }
+
+    if ($btnLaunchEdge) {
+        $btnLaunchEdge.Add_Click({
+            try {
+                Start-Process "msedge.exe" -ArgumentList "https://login.microsoftonline.com" -ErrorAction Stop
+                Write-HubLog "Launched Microsoft Edge for network authentication / captive portal." "SUCCESS"
+            } catch {
+                try { Start-Process "explorer.exe" -ArgumentList "https://login.microsoftonline.com" } catch { }
+                Write-HubLog "Edge not found, opened default browser." "INFO"
+            }
+        })
+    }
+
+    if ($btnScreenshotUsb) {
+        $btnScreenshotUsb.Add_Click({
+            try {
+                $serial = if ($txtSerial) { $txtSerial.Text } else { '' }
+                $saved = Export-HubWindowScreenshot -TargetWindow $window -SerialNumber $serial
+                if ($saved) {
+                    Write-HubLog "Window screenshot saved as staging proof: $saved" "SUCCESS"
+                    [System.Windows.MessageBox]::Show("Screenshot saved to:`n$saved", "Staging Proof Saved", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+                }
+            } catch {
+                Write-HubLog "Failed to capture screenshot: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+
+    $script:HubScale = 1.0
+    if ($btnToggleDpi) {
+        $btnToggleDpi.Add_Click({
+            if ($script:HubScale -eq 1.0) {
+                $script:HubScale = 1.25
+                $btnToggleDpi.Content = "Scale: 125%"
+            } else {
+                $script:HubScale = 1.0
+                $btnToggleDpi.Content = "Scale: 100%"
+            }
+            $window.LayoutTransform = [System.Windows.Media.ScaleTransform]::new($script:HubScale, $script:HubScale)
+            Write-HubLog "UI Scaling set to $($btnToggleDpi.Content)" "INFO"
+        })
+    }
+
+    function Update-PowerStatusUi {
+        try {
+            $batInfo = Get-BatteryHealthInfo
+            if ($batInfo -and $batInfo.Present) {
+                if ($txtPowerStatus) { $txtPowerStatus.Text = "POWER: BATTERY ($($batInfo.EstimatedCharge))" }
+                if ($badgePower) {
+                    $badgePower.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#2E2A1F")
+                    $badgePower.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#5C4A29")
+                }
+                if ($txtPowerStatus) { $txtPowerStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FCE100") }
+            } else {
+                if ($txtPowerStatus) { $txtPowerStatus.Text = "POWER: AC MAINS" }
+                if ($badgePower) {
+                    $badgePower.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#1F2822")
+                    $badgePower.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#2A5435")
+                }
+                if ($txtPowerStatus) { $txtPowerStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#6CCB5F") }
+            }
+        } catch {
+            if ($txtPowerStatus) { $txtPowerStatus.Text = "POWER: ONLINE" }
+        }
+    }
+    Update-PowerStatusUi
+
+    # --- TAB 1 ACTIONS (Policy & Offline JSON) ---
+    if ($btnInspectPolicy) {
+        $btnInspectPolicy.Add_Click({
+            Write-HubLog "Inspecting local Autopilot configuration policy..."
+            $pol = Get-DecodedAutopilotPolicy
+            if ($pol.Configured) {
+                Write-HubLog "Autopilot Policy: Tenant=$($pol.CloudAssignedTenantDomain) SkipEula=$($pol.SkipEula) SkipOem=$($pol.SkipOemRegistration) UserType=$($pol.UserType) DeviceName=$($pol.CloudAssignedDeviceName)" "SUCCESS"
+                $summary = "Tenant Domain: $($pol.CloudAssignedTenantDomain)`nTenant ID: $($pol.CloudAssignedTenantId)`nDevice Name: $($pol.CloudAssignedDeviceName)`nSkip EULA: $($pol.SkipEula)`nSkip OEM Reg: $($pol.SkipOemRegistration)`nAccount Type: $($pol.UserType)`nDiagnostics: $($pol.DiagnosticsLevel)"
+                [System.Windows.MessageBox]::Show($summary, "Decoded Autopilot Policy", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+            } else {
+                Write-HubLog "No local Autopilot policy configuration found." "WARN"
+                [System.Windows.MessageBox]::Show("No cached Autopilot profile found on this machine.", "No Policy", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+            }
+        })
+    }
+
+    if ($btnExportOfflineJson) {
+        $btnExportOfflineJson.Add_Click({
+            try {
+                $tenant = if ($script:GraphAuthContext -and $script:GraphAuthContext.TenantId) { $script:GraphAuthContext.TenantId } else { '' }
+                $exported = Export-AutopilotConfigurationFile -TenantId $tenant
+                if ($exported) {
+                    Write-HubLog "Exported AutopilotConfigurationFile.json to: $exported" "SUCCESS"
+                    [System.Windows.MessageBox]::Show("Offline Autopilot JSON exported to:`n$exported", "Export Successful", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+                }
+            } catch {
+                Write-HubLog "Export offline JSON failed: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+
+    if ($btnInjectOfflineJson) {
+        $btnInjectOfflineJson.Add_Click({
+            if (-not $script:RuntimeContext.MeetsPreferred) {
+                [System.Windows.MessageBox]::Show("Injecting offline provisioning files requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                return
+            }
+            try {
+                $dlg = [Microsoft.Win32.OpenFileDialog]::new()
+                $dlg.Filter = "Autopilot JSON (AutopilotConfigurationFile.json)|*.json|All Files (*.*)|*.*"
+                $dlg.Title = "Select AutopilotConfigurationFile.json to Inject"
+                if ($dlg.ShowDialog() -eq $true) {
+                    $injected = Import-AutopilotConfigurationFile -SourceJsonPath $dlg.FileName
+                    if ($injected) {
+                        Write-HubLog "Injected offline Autopilot profile to Windows Provisioning: $injected" "SUCCESS"
+                        $script:DeviceState = Get-DeviceEnrollmentState
+                        Update-DeviceStateUi
+                        [System.Windows.MessageBox]::Show("Autopilot offline profile injected successfully.`nDestination: $injected", "Injection Succeeded", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+                    }
+                }
+            } catch {
+                Write-HubLog "Inject offline JSON failed: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+
+    # --- TAB 4 ACTIONS (Pre-Flight Clock Skew, TPM Attestation & Driver Injection) ---
+    if ($btnFixClockSkew) {
+        $btnFixClockSkew.Add_Click({
+            if (-not $script:RuntimeContext.MeetsPreferred) {
+                [System.Windows.MessageBox]::Show("Clock synchronization requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                return
+            }
+            Write-HubLog "Auto-remediating HTTPS clock skew against Microsoft Online..."
+            $syncRes = Sync-HubSystemClock
+            if ($syncRes.Success) {
+                Write-HubLog "Clock remediated! Server time: $($syncRes.ServerTimeUtc) UTC. Skew: $($syncRes.ClockSkewSeconds)s" "SUCCESS"
+                $lstDiagStages.ItemsSource = (Test-StagedNetwork).Stages
+            } else {
+                Write-HubLog "Clock remediation failed: $($syncRes.Message)" "ERROR"
+            }
+        })
+    }
+
+    if ($btnTpmAttestation) {
+        $btnTpmAttestation.Add_Click({
+            Write-HubLog "Testing TPM 2.0 Manufacturer Endorsement Key (EK) CA server reachability..."
+            $tpmRes = Test-TpmManufacturerCaReachability
+            foreach ($s in $tpmRes) {
+                $lvl = if ($s.Reachable) { "SUCCESS" } else { "WARN" }
+                Write-HubLog "TPM CA [$($s.Manufacturer)] $($s.Host):$($s.Port) - Reachable=$($s.Reachable) ($($s.LatencyMs)ms)" $lvl
+            }
+        })
+    }
+
+    if ($btnInjectDriversPreflight) {
+        $btnInjectDriversPreflight.Add_Click({
+            if (-not $script:RuntimeContext.MeetsPreferred) {
+                [System.Windows.MessageBox]::Show("Injecting drivers via pnputil requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                return
+            }
+            Write-HubLog "Scanning USB drives for .inf driver packages to inject..."
+            $pnpRes = Invoke-HubUsbDriverInjection
+            if ($pnpRes.InjectedCount -gt 0) {
+                Write-HubLog "Successfully injected $($pnpRes.InjectedCount) driver package(s)." "SUCCESS"
+                foreach ($l in $pnpRes.Log) { Write-HubLog "  $l" "INFO" }
+            } else {
+                Write-HubLog "No driver packages (.inf) found on connected USB drives." "INFO"
+            }
+        })
+    }
+
+    # --- TAB 5 ACTIONS (Lenovo Warranty, Battery Wear & Storage SMART) ---
+    if ($btnCheckLenovoWarranty) {
+        $btnCheckLenovoWarranty.Add_Click({
+            $serial = if ($txtDellServiceTag -and -not [string]::IsNullOrWhiteSpace($txtDellServiceTag.Text)) { $txtDellServiceTag.Text.Trim() } else { $txtSerial.Text.Trim() }
+            Write-HubLog "Checking Lenovo warranty for serial: $serial..."
+            $lenovo = Get-LenovoWarrantyInfo -SerialNumber $serial
+            if ($lenovo.Success) {
+                Write-HubLog "Lenovo Warranty: Product=$($lenovo.ProductName) Status=$($lenovo.Status) EndDate=$($lenovo.EndDate)" "SUCCESS"
+                if ($txtDellEndDate) { $txtDellEndDate.Text = "$($lenovo.EndDate)" }
+                if ($txtDellDaysRemaining) { $txtDellDaysRemaining.Text = "Status: $($lenovo.Status) ($($lenovo.DaysRemaining) days)" }
+            } else {
+                Write-HubLog "Lenovo warranty query failed: $($lenovo.ErrorMessage)" "ERROR"
+            }
+        })
+    }
+
+    function Update-BatteryUi {
+        try {
+            $bat = Get-BatteryHealthInfo
+            if ($bat -and $bat.Present) {
+                if ($txtBatteryWear)     { $txtBatteryWear.Text     = "Wear: $($bat.WearPercent)" }
+                if ($txtBatteryVerdict)  { $txtBatteryVerdict.Text  = "Status: $($bat.HealthVerdict)" }
+                if ($txtBatteryCapacity) { $txtBatteryCapacity.Text = "Design: $($bat.DesignCapacity) | Full: $($bat.FullChargeCapacity)" }
+            } else {
+                if ($txtBatteryWear)     { $txtBatteryWear.Text     = "No Battery" }
+                if ($txtBatteryVerdict)  { $txtBatteryVerdict.Text  = "Desktop / AC" }
+                if ($txtBatteryCapacity) { $txtBatteryCapacity.Text = "Design: N/A | Full: N/A" }
+            }
+        } catch { }
+    }
+    Update-BatteryUi
+    if ($btnRefreshBattery) {
+        $btnRefreshBattery.Add_Click({ Update-BatteryUi; Write-HubLog "Battery wear and capacity refreshed." "INFO" })
+    }
+
+    function Update-StorageUi {
+        try {
+            $disks = Get-StorageReliabilityInfo
+            if ($disks -and $disks.Count -gt 0) {
+                $primary = $disks[0]
+                if ($txtStorageWear) { $txtStorageWear.Text = "SSD Wear: $($primary.Wear)" }
+                if ($txtStorageTemp) { $txtStorageTemp.Text = "Temp: $($primary.Temperature)" }
+                if ($txtStorageMeta) { $txtStorageMeta.Text = "Read Err: $($primary.ReadErrors) | Write Err: $($primary.WriteErrors) | POH: $($primary.PowerOnHours)h" }
+            } else {
+                if ($txtStorageWear) { $txtStorageWear.Text = "SSD Wear: N/A" }
+                if ($txtStorageTemp) { $txtStorageTemp.Text = "Temp: Normal" }
+                if ($txtStorageMeta) { $txtStorageMeta.Text = "Storage reliability counter not supported or no physical NVMe disks found." }
+            }
+        } catch { }
+    }
+    Update-StorageUi
+    if ($btnRefreshStorage) {
+        $btnRefreshStorage.Add_Click({ Update-StorageUi; Write-HubLog "Storage SMART reliability counter refreshed." "INFO" })
+    }
+
+    # --- TAB 7 ACTIONS (ESP Win32Apps, Lifecycle, Wi-Fi, Licensing, IME Tail) ---
+    function Update-Win32AppsUi {
+        try {
+            $apps = Get-Win32AppDiagnostics
+            if ($lstWin32Apps) {
+                $lstWin32Apps.ItemsSource = @($apps)
+            }
+            Write-HubLog "Loaded $($apps.Count) Win32 app ESP tracking state(s) from registry." "INFO"
+        } catch {
+            Write-HubLog "Failed to read Win32App state: $($_.Exception.Message)" "WARN"
+        }
+    }
+    Update-Win32AppsUi
+    if ($btnRefreshWin32Apps) {
+        $btnRefreshWin32Apps.Add_Click({ Update-Win32AppsUi })
+    }
+
+    if ($btnExportMdmCab) {
+        $btnExportMdmCab.Add_Click({
+            if (-not $script:RuntimeContext.MeetsPreferred) {
+                [System.Windows.MessageBox]::Show("mdmdiagnosticstool requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                return
+            }
+            Write-HubLog "Exporting MDM & Autopilot diagnostic CAB bundle..."
+            $cab = Export-MdmDiagnosticsCab
+            if ($cab) {
+                Write-HubLog "MDM Diagnostics CAB created: $cab" "SUCCESS"
+                [System.Windows.MessageBox]::Show("Diagnostic CAB bundle exported to:`n$cab", "CAB Export Succeeded", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+            } else {
+                Write-HubLog "Failed to export MDM diagnostic CAB." "ERROR"
+            }
+        })
+    }
+
+    if ($btnPatchLifecycle) {
+        $btnPatchLifecycle.Add_Click({
+            if (-not ($script:GraphAuthContext -and $script:GraphAuthContext.AccessToken)) {
+                [System.Windows.MessageBox]::Show("Please sign in to Microsoft Graph first.", "Authentication Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                return
+            }
+            $ident = if ($script:DeviceState -and $script:DeviceState.CloudIdentity) { $script:DeviceState.CloudIdentity.id } else { '' }
+            if (-not $ident) {
+                $serial = if ($txtSerial) { $txtSerial.Text.Trim() } else { '' }
+                $found = Find-AutopilotIdentityInTenant -SerialNumber $serial -AccessToken $script:GraphAuthContext.AccessToken
+                if ($found) { $ident = $found.id }
+            }
+            if (-not $ident) {
+                [System.Windows.MessageBox]::Show("No Autopilot device identity found in tenant for serial $($txtSerial.Text).", "Device Not Found", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                return
+            }
+            $gt = if ($txtLifecycleGroupTag) { $txtLifecycleGroupTag.Text } else { '' }
+            $user = if ($txtLifecycleUser) { $txtLifecycleUser.Text } else { '' }
+            Write-HubLog "Patching Autopilot identity $ident (Tag='$gt', User='$user')..."
+            $ok = Set-AutopilotDeviceIdentityPatch -IdentityId $ident -GroupTag $gt -AssignedUser $user -AccessToken $script:GraphAuthContext.AccessToken
+            if ($ok) {
+                Write-HubLog "Successfully patched Autopilot identity in tenant." "SUCCESS"
+            } else {
+                Write-HubLog "Failed to patch Autopilot identity." "ERROR"
+            }
+        })
+    }
+
+    if ($btnSyncAutopilot) {
+        $btnSyncAutopilot.Add_Click({
+            if (-not ($script:GraphAuthContext -and $script:GraphAuthContext.AccessToken)) {
+                [System.Windows.MessageBox]::Show("Please sign in to Microsoft Graph first.", "Authentication Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                return
+            }
+            Write-HubLog "Triggering instant Windows Autopilot tenant sync..."
+            $syncOk = Invoke-AutopilotTenantSync -AccessToken $script:GraphAuthContext.AccessToken
+            if ($syncOk) {
+                Write-HubLog "Autopilot sync request accepted by Microsoft Graph." "SUCCESS"
+            } else {
+                Write-HubLog "Failed to trigger Autopilot sync." "ERROR"
+            }
+        })
+    }
+
+    if ($btnDecommission) {
+        $btnDecommission.Add_Click({
+            if (-not $script:RuntimeContext.MeetsPreferred) {
+                [System.Windows.MessageBox]::Show("Decommissioning device requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                return
+            }
+            $ans = [System.Windows.MessageBox]::Show("Decommission this device's LOCAL Autopilot / MDM state?`n`nThis purges on this machine only:`n- the cached Autopilot profile and Provisioning diagnostics`n- the local MDM (Intune) enrollment keys`n`nIt does NOT remove the device from Intune or Autopilot in the tenant - retire/delete it in the portal for that, otherwise the tenant still believes it is managed.`n`nThis action cannot be undone.", "Confirm Local Decommission", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+            if ($ans -eq [System.Windows.MessageBoxResult]::Yes) {
+                Write-HubLog "Executing clean local Autopilot decommission..." "WARN"
+                foreach ($act in @(Invoke-AutopilotCleanDecommission)) { Write-HubLog "  $act" $(if ($act -like 'Failed*') { 'ERROR' } else { 'INFO' }) }
+                $script:DeviceState = Get-DeviceEnrollmentState
+                Update-DeviceStateUi
+                Write-HubLog "Decommission complete." "SUCCESS"
+            }
+        })
+    }
+
+    if ($btnScanWifi) {
+        $btnScanWifi.Add_Click({
+            Write-HubLog "Scanning for available Wi-Fi SSIDs..."
+            $ssids = Get-HubWifiNetworks
+            if ($cmbWifiSsids) {
+                $cmbWifiSsids.ItemsSource = @($ssids)
+                if ($ssids.Count -gt 0) { $cmbWifiSsids.SelectedIndex = 0 }
+            }
+            Write-HubLog "Found $($ssids.Count) Wi-Fi network(s)." "INFO"
+        })
+    }
+
+    if ($btnConnectWifi) {
+        $btnConnectWifi.Add_Click({
+            $ssid = if ($cmbWifiSsids) { $cmbWifiSsids.Text } else { '' }
+            $pwd = if ($txtWifiPassword) { $txtWifiPassword.Text } else { '' }
+            if (-not $ssid) {
+                [System.Windows.MessageBox]::Show("Please select or enter an SSID.", "SSID Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                return
+            }
+            Write-HubLog "Connecting to Wi-Fi SSID '$ssid'..."
+            $connRes = Connect-HubWifiNetwork -Ssid $ssid -Password $pwd
+            if ($connRes) {
+                Write-HubLog "Connected successfully to Wi-Fi '$ssid'." "SUCCESS"
+            } else {
+                Write-HubLog "Failed to connect to Wi-Fi '$ssid'." "ERROR"
+            }
+        })
+    }
+
+    if ($btnImportWifiXml) {
+        $btnImportWifiXml.Add_Click({
+            try {
+                $dlg = [Microsoft.Win32.OpenFileDialog]::new()
+                $dlg.Filter = "Wi-Fi Profile XML (*.xml)|*.xml|All Files (*.*)|*.*"
+                $dlg.Title = "Select 802.1X Wi-Fi XML Profile"
+                if ($dlg.ShowDialog() -eq $true) {
+                    $impRes = Import-Hub8021xProfile -XmlPath $dlg.FileName
+                    if ($impRes) {
+                        Write-HubLog "Imported Wi-Fi profile from $($dlg.FileName)." "SUCCESS"
+                    } else {
+                        Write-HubLog "Failed to import Wi-Fi profile from $($dlg.FileName)." "ERROR"
+                    }
+                }
+            } catch {
+                Write-HubLog "Import 802.1X XML profile error: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+
+    function Update-LicensingUi {
+        try {
+            $lic = Get-WindowsLicensingInfo
+            if ($txtOsCaption) { $txtOsCaption.Text = "Edition: $($lic.Caption)" }
+            if ($txtOemKey)    { $txtOemKey.Text    = "OEM Key: $($lic.OemKey)" }
+        } catch { }
+    }
+    Update-LicensingUi
+    if ($btnRefreshLicensing) {
+        $btnRefreshLicensing.Add_Click({ Update-LicensingUi; Write-HubLog "Refreshed Windows edition and OEM key." "INFO" })
+    }
+
+    if ($btnUpgradeEnterprise) {
+        $btnUpgradeEnterprise.Add_Click({
+            if (-not $script:RuntimeContext.MeetsPreferred) {
+                [System.Windows.MessageBox]::Show("Windows Edition upgrade requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                return
+            }
+            $ans = [System.Windows.MessageBox]::Show("Change the Windows edition to Enterprise with Microsoft's generic KMS client setup key?`n`nCommand: changepk.exe /ProductKey NPPR9-FWDCX-D2C8J-H872K-2YT43`n`nThis key only ACTIVATES against a KMS host on your network (or a Microsoft 365 E3/E5 subscription activation). On a machine with neither, Windows becomes an unactivated Enterprise install - and going back to Pro means re-entering the Pro key.`n`nContinue?", "Upgrade to Enterprise", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+            if ($ans -eq [System.Windows.MessageBoxResult]::Yes) {
+                Write-HubLog "Upgrading Windows to Enterprise via changepk.exe..." "WARN"
+                $upOk = Invoke-WindowsEnterpriseUpgrade
+                Update-LicensingUi
+                if ($upOk) {
+                    Write-HubLog "Windows Enterprise upgrade command finished successfully." "SUCCESS"
+                } else {
+                    Write-HubLog "changepk exited with non-zero status. Check Windows Activation Settings." "WARN"
+                }
+            }
+        })
+    }
+
+    if ($btnTailImeLog) {
+        $btnTailImeLog.Add_Click({
+            Write-HubLog "Tailing last 100 lines of IntuneManagementExtension.log..."
+            $tail = Get-ImeLogTail -Lines 100
+            if ($txtImeLog) {
+                $txtImeLog.Text = $tail
+            }
+        })
+    }
+
     # Initial Diagnostic Run
     $initialDiag = Test-StagedNetwork
     $lstDiagStages.ItemsSource = $initialDiag.Stages
@@ -4951,6 +6583,25 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
         Write-HubLog "Device state inspection failed: $($_.Exception.Message)" "WARN"
     }
     Update-DeviceStateUi
+
+    # Channel 1: zero-token tenant branding. If the device already carries a tenant domain from its cached
+    # Autopilot profile, show that tenant's name/logo in the header before anyone signs in.
+    if ($script:DeviceState -and $script:DeviceState.AutopilotTenantDomain) {
+        try {
+            $pb = Get-PreAuthTenantBranding -Domain $script:DeviceState.AutopilotTenantDomain
+            if ($pb) {
+                if ($pb.DisplayName -and $txtTenantBrand) {
+                    $txtTenantBrand.Text = $pb.DisplayName.ToUpper()
+                    if ($badgeTenantBrand) { $badgeTenantBrand.Visibility = [System.Windows.Visibility]::Visible }
+                }
+                $logoUrl = if ($pb.TileLogoUrl) { $pb.TileLogoUrl } else { $pb.BannerLogoUrl }
+                if ($logoUrl -and $imgTenantLogo -and $borderTenantLogo) {
+                    Set-HubBrandingImageAsync -TargetImage $imgTenantLogo -LogoContainer $borderTenantLogo -ImageUrl $logoUrl
+                }
+                Write-HubLog "Tenant branding resolved without sign-in: $($pb.DisplayName) ($($pb.Domain))." "INFO"
+            }
+        } catch { }
+    }
 
     # Check for Existing / Silent Graph Session (.env) - also triggers the tenant-side Autopilot lookup
     $silentToken = Get-CurrentGraphToken
@@ -5049,6 +6700,58 @@ if ($DellWarranty) {
         $flatObj | Export-Csv -Path $path -NoTypeInformation -Force
         Write-Host "Exported audit CSV to: $path" -ForegroundColor Green
     }
+    return
+}
+
+if ($LenovoWarranty) {
+    Write-Host "`nLenovo Warranty Lookup" -ForegroundColor Cyan
+    $lw = Get-LenovoWarrantyInfo -SerialNumber $LenovoSerialNumber
+    $lw | Format-List
+    if ($ExportCsv) {
+        $path = if ($CsvPath) { $CsvPath } else { Join-Path $env:TEMP "LenovoWarranty-$($lw.SerialNumber).csv" }
+        $lw | Select-Object -Property * -ExcludeProperty Entitlements | Export-Csv -Path $path -NoTypeInformation -Force
+        Write-Host "Exported warranty CSV to: $path" -ForegroundColor Green
+    }
+    return
+}
+
+if ($HardwareHealth) {
+    Write-Host "`nHardware Health (battery wear + storage reliability)" -ForegroundColor Cyan
+    $bat = Get-BatteryHealthInfo
+    if ($bat) { Write-Host "Battery:" -ForegroundColor White; $bat | Format-List } else { Write-Host "Battery: none detected (desktop or no ACPI battery)" -ForegroundColor Gray }
+    $disks = @(Get-StorageReliabilityInfo)
+    if ($disks.Count -gt 0) { Write-Host "Storage:" -ForegroundColor White; $disks | Format-Table -AutoSize } else { Write-Host "Storage: no reliability counters available (needs elevation or unsupported controller)" -ForegroundColor Gray }
+    return
+}
+
+if ($OfflineJson) {
+    Write-Host "`nOffline Autopilot JSON Profile (AutopilotConfigurationFile.json)" -ForegroundColor Cyan
+    # Tenant identity: explicit env, else what the device already knows from a cached profile
+    $tenantId = $env:AZURE_TENANT_ID
+    $tenantDomain = $env:AUTOPILOT_TENANT_DOMAIN
+    if (-not $tenantId -or -not $tenantDomain) {
+        $ds = Get-DeviceEnrollmentState
+        if (-not $tenantId -and $ds.AutopilotTenantId) { $tenantId = $ds.AutopilotTenantId }
+        if (-not $tenantDomain -and $ds.AutopilotTenantDomain) { $tenantDomain = $ds.AutopilotTenantDomain }
+    }
+    if (-not $tenantId -or -not $tenantDomain) {
+        Write-Host "Set AZURE_TENANT_ID and AUTOPILOT_TENANT_DOMAIN (env or .env) - the offline profile must name the tenant it belongs to." -ForegroundColor Red
+        return
+    }
+    $out = Export-AutopilotConfigurationFile -Path $OfflineJsonPath -TenantId $tenantId -TenantDomain $tenantDomain -DeviceName $ComputerNameTemplate
+    Write-Host "Offline profile written to: $out" -ForegroundColor Green
+    Write-Host "Copy it to C:\Windows\Provisioning\Autopilot\AutopilotConfigurationFile.json on the target before OOBE (the Hub's 'Inject Offline JSON' does this)." -ForegroundColor Gray
+    return
+}
+
+if ($Decommission) {
+    Write-Host "`nAutopilot Clean Decommission (local state only)" -ForegroundColor Cyan
+    if (-not $script:IsElevated) { Write-Host "Requires elevation." -ForegroundColor Red; return }
+    Write-Host "This removes the cached Autopilot profile, Provisioning diagnostics and the local MDM enrollment keys." -ForegroundColor Yellow
+    Write-Host "It does NOT unenroll the device in Intune - retire/delete it in the portal for that." -ForegroundColor Yellow
+    $confirm = Read-Host "Type DECOMMISSION to continue"
+    if ($confirm -ne 'DECOMMISSION') { Write-Host "Aborted." -ForegroundColor Gray; return }
+    foreach ($a in @(Invoke-AutopilotCleanDecommission)) { Write-Host "  $a" -ForegroundColor White }
     return
 }
 
