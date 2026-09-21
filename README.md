@@ -154,12 +154,14 @@ For hybrid (on-prem domain-joined **and** Entra-registered) and co-managed (Conf
 * **Windows edition & OEM key** inspector with a guarded Enterprise edition switch (generic KMS client key - only activates against a KMS host or M365 E3/E5 subscription activation; the dialog says so).
 * **Offline Autopilot JSON** (`AutopilotConfigurationFile.json`) generate + inject for air-gapped provisioning; `-OfflineJson [-OfflineJsonPath]` on the CLI (tenant from `AZURE_TENANT_ID` / `AUTOPILOT_TENANT_DOMAIN` or the device's cached profile).
 * **Tenant branding** in the header: resolved without a token from the device's cached tenant domain, refined after Graph sign-in; a red banner flags a mismatch between the device's tenant and the signed-in tenant.
-### 4d. Windows Update & Hardware Driver Engine (OOBE Ready)
-Directly accessible from the header bar and Pre-Flight Diagnostics tab during Windows Setup (`Shift` + `F10`):
+### 4d. Integrated Windows Update & Autonomous Patch Cascade Engine (OOBE Ready)
+Directly integrated as a dedicated tab in the main window (and accessible from the header bar and Pre-Flight Diagnostics tab) during Windows Setup (`Shift` + `F10`):
+* **Integrated Main Tab**: Seamless cyber-dark UI tab eliminating popup dialogs; header button and pre-flight button automatically switch directly to the tab.
+* **Autonomous Multi-Pass Patch Cascade**: One-click autonomous cycle (`Start Autonomous Patch Cascade`) that scans for updates and hardware drivers, downloads, installs, reboots with persistence, and resumes automatically across multiple passes until the system is 100% patched with zero updates remaining.
+* **Countdown & Abort Affordance**: Safe 5-second reboot countdown with an explicit **Cancel Reboot** button allowing the operator to pause the cascade and inspect the system before restart.
 * **Native COM Engine (`Microsoft.Update.Session`)**: Zero third-party module dependencies (`PSWindowsUpdate` does not exist in clean OOBE); queries the local Update Session and Update Orchestrator (`usoclient.exe`).
-* **Hardware Drivers & Software Updates**: Granular selection with drivers categorized (`DRIVER` vs `SOFTWARE`), size in MB, and reboot requirements.
-* **Auto-Reboot with State Persistence**: Registers `Register-HubResumeAfterRestart` before triggering reboot; the Hub re-opens automatically on the interactive screen when the system finishes applying updates and reboots.
-* **CLI Automation**: `-WindowsUpdate -ScanOnly` for auditing, or `-WindowsUpdate -IncludeDrivers -AutoReboot` for fully unattended pre-provisioning update sweeps.
+* **Manual & Granular Controls**: Manual scan, selective installation (`Select All` / `Deselect All`), driver toggle, max passes selector (3, 5, 8, 10), and manual immediate reboot.
+* **CLI Cascade Automation**: `-PatchCascade -MaxPasses 5 -IncludeDrivers` for unattended multi-pass provisioning cascades, or `-WindowsUpdate -ScanOnly` / `-WindowsUpdate -IncludeDrivers -AutoReboot` for single-pass routines.
 
 ### 5. 7-Stage Pre-Flight Network & Hardware Ladder
 1. **Network Interface**: Verifies active physical adapter is in `Up` status.
@@ -204,11 +206,14 @@ powershell -File .\autopilot.ps1 -OfflineJson -OfflineJsonPath "E:\AutopilotConf
 # 9. Purge local Autopilot / MDM state (elevated; prompts for confirmation; does not touch the tenant)
 powershell -File .\autopilot.ps1 -Decommission
 
-# 10. OOBE Windows Update & Driver Engine (scan or install with auto-reboot resume)
+# 10. Autonomous Multi-Pass Patch Cascade (scans, installs, reboots, and resumes until 100% patched)
+powershell -File .\autopilot.ps1 -PatchCascade -MaxPasses 5 -IncludeDrivers
+
+# 11. OOBE Windows Update & Driver Engine (single-pass scan or install with auto-reboot resume)
 powershell -File .\autopilot.ps1 -WindowsUpdate -ScanOnly
 powershell -File .\autopilot.ps1 -WindowsUpdate -IncludeDrivers -AutoReboot
 
-# 11. (internal) What the restart-resume scheduled task runs - cleans itself up on start
+# 12. (internal) What the restart-resume scheduled task runs - cleans itself up on start
 powershell -NoProfile -ExecutionPolicy Bypass -STA -File "C:\ProgramData\AutopilotCommandHub\autopilot.ps1" -EnvFile "C:\ProgramData\AutopilotCommandHub\.env" -ResumeFromRestart
 ```
 

@@ -59,7 +59,9 @@ param(
     [switch]$WindowsUpdate,
     [switch]$IncludeDrivers,
     [switch]$AutoReboot,
-    [switch]$ScanOnly
+    [switch]$ScanOnly,
+    [switch]$PatchCascade,
+    [int]$MaxPasses = 5
 )
 
 # 0. Central Environment & Configuration Engine (.env)
@@ -3529,341 +3531,154 @@ function Start-HubWindowsUpdate {
     }
 }
 
-# --- Function: Show-HubWindowsUpdateDialog (Interactive OOBE Windows Update & Driver Engine) ---
-function Show-HubWindowsUpdateDialog {
+# --- Cascade State File Path ---
+$script:CascadeStateFile = Join-Path $env:ProgramData 'AutopilotCommandHub\patch_cascade.json'
+
+function Get-HubPatchCascadeState {
     [CmdletBinding()]
-    param([System.Windows.Window]$Owner = $null)
+    param()
 
-    $xamlWinUpd = @'
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Windows Update &amp; Driver Engine" Width="820" Height="590"
-        WindowStartupLocation="CenterOwner"
-        Background="#1F1F1F" Foreground="#FFFFFF" FontFamily="Segoe UI Variable Text, Segoe UI, sans-serif" ResizeMode="CanResizeWithGrip">
-    <Grid Margin="18">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
+    if (Test-Path $script:CascadeStateFile) {
+        try {
+            $raw = Get-Content -Path $script:CascadeStateFile -Raw -ErrorAction Stop
+            $obj = ConvertFrom-Json $raw -ErrorAction Stop
+            return $obj
+        } catch { }
+    }
+    return $null
+}
 
-        <!-- Header -->
-        <Grid Grid.Row="0" Margin="0,0,0,12">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="Auto"/>
-            </Grid.ColumnDefinitions>
-            <StackPanel>
-                <TextBlock Text="WINDOWS UPDATE &amp; DRIVER ENGINE (OOBE READY)" FontSize="12.5" FontWeight="Bold" Foreground="#60CDFF"/>
-                <TextBlock Text="Native COM Session + Update Orchestrator (USO) - install critical updates &amp; hardware drivers before Autopilot enrollment." FontSize="11" Foreground="#A0A0A0" Margin="0,2,0,0"/>
-            </StackPanel>
-            <Border Grid.Column="1" Background="#1F2822" CornerRadius="3" Padding="8,4" BorderBrush="#2A5435" BorderThickness="1" VerticalAlignment="Center">
-                <TextBlock Text="COM ENGINE READY" FontSize="10.5" FontWeight="SemiBold" Foreground="#6CCB5F"/>
-            </Border>
-        </Grid>
+function Set-HubPatchCascadeState {
+    [CmdletBinding()]
+    param(
+        [int]$CurrentPass = 1,
+        [int]$MaxPasses = 5,
+        [bool]$IncludeDrivers = $true,
+        [int]$TotalInstalled = 0
+    )
 
-        <!-- Controls Toolbar -->
-        <Border Grid.Row="1" Background="#262626" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12,10" Margin="0,0,0,10">
-            <Grid>
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
-                </Grid.ColumnDefinitions>
-                <CheckBox Name="ChkIncludeDrivers" Grid.Column="0" Content="Include Hardware Drivers" IsChecked="True" Foreground="#FFFFFF" VerticalAlignment="Center" Margin="0,0,16,0"/>
-                <CheckBox Name="ChkAutoReboot" Grid.Column="1" Content="Auto-Restart if required (persists Hub to resume)" IsChecked="False" Foreground="#FFFFFF" VerticalAlignment="Center" Margin="0,0,16,0"/>
-                
-                <Button Name="BtnUsoScan" Grid.Column="3" Content="Trigger USO Scan" Padding="10,5" Margin="0,0,8,0" Background="#2D2D2D" Foreground="#FFFFFF" BorderBrush="#3E3E3E" ToolTip="Triggers background usoclient.exe StartInteractiveScan"/>
-                <Button Name="BtnScan" Grid.Column="4" Content="Scan for Updates" Padding="14,5" Background="#0067C0" Foreground="#FFFFFF" BorderBrush="#0067C0" FontWeight="SemiBold"/>
-            </Grid>
-        </Border>
+    try {
+        $dir = Split-Path $script:CascadeStateFile -Parent
+        if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+        $state = [PSCustomObject]@{
+            Active         = $true
+            CurrentPass    = $CurrentPass
+            MaxPasses      = $MaxPasses
+            IncludeDrivers = $IncludeDrivers
+            TotalInstalled = $TotalInstalled
+            Timestamp      = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
+        }
+        $json = ConvertTo-Json $state -Compress
+        Set-Content -Path $script:CascadeStateFile -Value $json -Force -ErrorAction Stop
+        return $true
+    } catch {
+        Write-Warning "Failed to save patch cascade state: $($_.Exception.Message)"
+        return $false
+    }
+}
 
-        <!-- Status & Progress -->
-        <StackPanel Grid.Row="2" Margin="0,0,0,10">
-            <Grid Margin="0,0,0,4">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                </Grid.ColumnDefinitions>
-                <TextBlock Name="TxtStatus" Text="Ready. Click 'Scan for Updates' to query Microsoft Update services." FontSize="11" Foreground="#D0D0D0"/>
-                <TextBlock Name="TxtProgressPercent" Grid.Column="1" Text="" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF"/>
-            </Grid>
-            <ProgressBar Name="ProgBar" Height="4" Background="#2B2B2B" Foreground="#60CDFF" BorderThickness="0" Minimum="0" Maximum="100" Value="0"/>
-        </StackPanel>
+function Clear-HubPatchCascadeState {
+    [CmdletBinding()]
+    param()
 
-        <!-- Updates List -->
-        <Border Grid.Row="3" Background="#181818" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Margin="0,0,0,12">
-            <ListView Name="LstUpdates" Background="Transparent" BorderThickness="0" Foreground="#FFFFFF" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
-                <ListView.ItemTemplate>
-                    <DataTemplate>
-                        <Border BorderBrush="#262626" BorderThickness="0,0,0,1" Padding="4,6">
-                            <Grid>
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="Auto"/>
-                                    <ColumnDefinition Width="Auto"/>
-                                    <ColumnDefinition Width="*"/>
-                                    <ColumnDefinition Width="Auto"/>
-                                    <ColumnDefinition Width="100"/>
-                                </Grid.ColumnDefinitions>
-                                <CheckBox IsChecked="{Binding IsSelected, Mode=TwoWay}" VerticalAlignment="Center" Margin="4,0,10,0"/>
-                                <Border Grid.Column="1" Background="{Binding BadgeBackground}" CornerRadius="3" Padding="6,2" Margin="0,0,10,0" VerticalAlignment="Center">
-                                    <TextBlock Text="{Binding CategoryText}" FontSize="9.5" FontWeight="Bold" Foreground="{Binding BadgeForeground}"/>
-                                </Border>
-                                <StackPanel Grid.Column="2" VerticalAlignment="Center" Margin="0,0,8,0">
-                                    <TextBlock Text="{Binding Title}" FontSize="11.5" FontWeight="SemiBold" Foreground="#FFFFFF" TextWrapping="Wrap"/>
-                                    <TextBlock Text="{Binding Subtitle}" FontSize="10" Foreground="#8A8A8A" Margin="0,2,0,0"/>
-                                </StackPanel>
-                                <TextBlock Grid.Column="3" Text="{Binding SizeText}" FontSize="11" Foreground="#B0B0B0" VerticalAlignment="Center" Margin="8,0,12,0"/>
-                                <TextBlock Grid.Column="4" Text="{Binding StatusText}" FontSize="11" FontWeight="SemiBold" Foreground="{Binding StatusColor}" VerticalAlignment="Center" HorizontalAlignment="Right" Margin="0,0,8,0"/>
-                            </Grid>
-                        </Border>
-                    </DataTemplate>
-                </ListView.ItemTemplate>
-            </ListView>
-        </Border>
+    try {
+        if (Test-Path $script:CascadeStateFile) {
+            Remove-Item -Path $script:CascadeStateFile -Force -ErrorAction SilentlyContinue
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
 
-        <!-- Action Footer -->
-        <Grid Grid.Row="4">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="Auto"/>
-            </Grid.ColumnDefinitions>
-            <TextBlock Name="TxtSummary" Text="0 updates found." FontSize="11" Foreground="#8A8A8A" VerticalAlignment="Center"/>
-            <Button Name="BtnRestartNow" Grid.Column="1" Content="Restart System Now (Resume Hub)" Padding="12,6" Margin="0,0,8,0" Background="#442726" Foreground="#FF99A4" BorderBrush="#5C3130" Visibility="Collapsed"/>
-            <Button Name="BtnInstall" Grid.Column="2" Content="Install Selected Updates" Padding="14,6" Margin="0,0,8,0" Background="#0067C0" Foreground="#FFFFFF" BorderBrush="#0067C0" FontWeight="SemiBold" IsEnabled="False"/>
-            <Button Name="BtnClose" Grid.Column="3" Content="Close" Padding="12,6" Background="#2B2B2B" Foreground="#FFFFFF" BorderBrush="#3E3E3E"/>
-        </Grid>
-    </Grid>
-</Window>
-'@
+# --- Function: Start-HubAutonomousPatchCascade (Headless & CLI Multi-Pass Cascade Loop) ---
+function Start-HubAutonomousPatchCascade {
+    [CmdletBinding()]
+    param(
+        [int]$MaxPasses = 5,
+        [switch]$IncludeDrivers,
+        [scriptblock]$StatusCallback
+    )
 
-    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xamlWinUpd))
-    $dlg = [System.Windows.Markup.XamlReader]::Load($reader)
-    if ($Owner) { $dlg.Owner = $Owner }
+    $state = Get-HubPatchCascadeState
+    $currentPass = if ($state -and $state.Active) { [int]$state.CurrentPass } else { 1 }
+    $totalInstalled = if ($state -and $state.Active) { [int]$state.TotalInstalled } else { 0 }
 
-    $chkDrivers     = $dlg.FindName('ChkIncludeDrivers')
-    $chkAutoReboot  = $dlg.FindName('ChkAutoReboot')
-    $btnUsoScan     = $dlg.FindName('BtnUsoScan')
-    $btnScan        = $dlg.FindName('BtnScan')
-    $txtStatus      = $dlg.FindName('TxtStatus')
-    $txtProgress    = $dlg.FindName('TxtProgressPercent')
-    $progBar        = $dlg.FindName('ProgBar')
-    $lstUpdates     = $dlg.FindName('LstUpdates')
-    $txtSummary     = $dlg.FindName('TxtSummary')
-    $btnRestartNow  = $dlg.FindName('BtnRestartNow')
-    $btnInstall     = $dlg.FindName('BtnInstall')
-    $btnClose       = $dlg.FindName('BtnClose')
-
-    $dlgItems = [System.Collections.ArrayList]::new()
-    $script:DlgRebootNeeded = $false
-
-    function Update-DlgUI {
-        $frame = [System.Windows.Threading.DispatcherFrame]::new()
-        [System.Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
-            [System.Windows.Threading.DispatcherPriority]::Background,
-            [System.Action[System.Windows.Threading.DispatcherFrame]]{ param($f) $f.Continue = $false },
-            $frame
-        ) | Out-Null
-        [System.Windows.Threading.Dispatcher]::PushFrame($frame)
+    if ($StatusCallback) {
+        & $StatusCallback "Starting Autonomous Patch Cascade - Pass $currentPass of $MaxPasses (IncludeDrivers: $([bool]$IncludeDrivers))..."
     }
 
-    $btnUsoScan.Add_Click({
-        $ok = Invoke-HubUsoScan
-        if ($ok) {
-            $txtStatus.Text = "USO Interactive Scan initiated in background."
-        } else {
-            $txtStatus.Text = "usoclient.exe not found on this system."
+    $rawUpdates = Get-HubPendingWindowsUpdates -IncludeDrivers:$IncludeDrivers -StatusCallback $StatusCallback
+
+    if (-not $rawUpdates -or $rawUpdates.Count -eq 0) {
+        Clear-HubPatchCascadeState
+        if ($StatusCallback) {
+            & $StatusCallback "System is 100% up to date. Zero pending updates found! Cascade loop complete. Total updates installed: $totalInstalled."
         }
-    })
-
-    $btnScan.Add_Click({
-        $btnScan.IsEnabled = $false
-        $btnInstall.IsEnabled = $false
-        $txtStatus.Text = "Scanning Microsoft Update catalog..."
-        $progBar.IsIndeterminate = $true
-        Update-DlgUI
-
-        try {
-            $incDrivers = [bool]$chkDrivers.IsChecked
-            $rawUpdates = Get-HubPendingWindowsUpdates -IncludeDrivers:$incDrivers -StatusCallback {
-                param($m)
-                $txtStatus.Text = $m
-                Update-DlgUI
-            }
-            $dlgItems.Clear()
-            foreach ($u in $rawUpdates) {
-                $isDrv = [bool]$u.IsDriver
-                $cat = if ($isDrv) { "DRIVER" } else { "SOFTWARE" }
-                $bgBadge = if ($isDrv) { "#3E2547" } else { "#1F2D3D" }
-                $fgBadge = if ($isDrv) { "#C586C0" } else { "#60CDFF" }
-                $sub = if ($u.KB) { "$($u.KB)  |  Size: $($u.SizeMB) MB" } else { "Size: $($u.SizeMB) MB" }
-                if ($u.RebootRequired) { $sub += "  |  Reboot Required" }
-
-                $item = [PSCustomObject]@{
-                    IsSelected      = $true
-                    CategoryText    = $cat
-                    BadgeBackground = $bgBadge
-                    BadgeForeground = $fgBadge
-                    Title           = $u.Title
-                    Subtitle        = $sub
-                    SizeText        = "$($u.SizeMB) MB"
-                    StatusText      = "Pending"
-                    StatusColor     = "#D0D0D0"
-                    UpdateObject    = $u.UpdateObject
-                    RawItem         = $u
-                }
-                [void]$dlgItems.Add($item)
-            }
-            $lstUpdates.ItemsSource = $null
-            $lstUpdates.ItemsSource = $dlgItems
-            $txtSummary.Text = "$($dlgItems.Count) update(s) available."
-            if ($dlgItems.Count -gt 0) {
-                $btnInstall.IsEnabled = $true
-                $txtStatus.Text = "Found $($dlgItems.Count) update(s). Select items and click 'Install Selected Updates'."
-            } else {
-                $txtStatus.Text = "System is up to date. No pending updates found."
-            }
-        } catch {
-            $txtStatus.Text = "Scan error: $($_.Exception.Message)"
-        } finally {
-            $progBar.IsIndeterminate = $false
-            $progBar.Value = 0
-            $btnScan.IsEnabled = $true
+        return [PSCustomObject]@{
+            Completed      = $true
+            CurrentPass    = $currentPass
+            TotalInstalled = $totalInstalled
+            RebootRequired = $false
         }
-    })
+    }
 
-    $btnInstall.Add_Click({
-        $selected = @($dlgItems | Where-Object { $_.IsSelected -eq $true })
-        if ($selected.Count -eq 0) {
-            [System.Windows.MessageBox]::Show("Please select at least one update to install.", "No Updates Selected", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
-            return
-        }
+    if ($StatusCallback) {
+        & $StatusCallback "Pass $($currentPass): Found $($rawUpdates.Count) update(s) to install."
+    }
 
-        $btnScan.IsEnabled = $false
-        $btnInstall.IsEnabled = $false
-        $progBar.Value = 0
-        $txtStatus.Text = "Preparing update download session..."
-        Update-DlgUI
+    $installRes = Start-HubWindowsUpdate -IncludeDrivers:$IncludeDrivers -SelectedUpdates $rawUpdates -StatusCallback $StatusCallback
+    $totalInstalled += $installRes.InstalledCount
 
-        try {
-            Ensure-HubUpdateServices
-            $session = New-Object -ComObject Microsoft.Update.Session
-            $downloader = $session.CreateUpdateDownloader()
-            $downColl = New-Object -ComObject Microsoft.Update.UpdateColl
-
-            foreach ($it in $selected) {
-                $uObj = $it.UpdateObject
-                if ($uObj.EulaAccepted -eq $false) {
-                    try { $uObj.AcceptEula() } catch { }
-                }
-                $downColl.Add($uObj) | Out-Null
+    if ($installRes.RebootRequired) {
+        $nextPass = $currentPass + 1
+        if ($nextPass -le $MaxPasses) {
+            if ($StatusCallback) {
+                & $StatusCallback "Reboot is required. Scheduling restart-resume task for Pass $nextPass of $MaxPasses..."
             }
-
-            $downloader.Updates = $downColl
-            $txtStatus.Text = "Downloading $($downColl.Count) update package(s)..."
-            $progBar.IsIndeterminate = $true
-            Update-DlgUI
-
-            $downRes = $downloader.Download()
-            $progBar.IsIndeterminate = $false
-            $progBar.Value = 20
-
-            # Mark downloaded status
-            foreach ($it in $selected) {
-                if ($it.UpdateObject.IsDownloaded) {
-                    $it.StatusText = "Downloaded"
-                    $it.StatusColor = "#60CDFF"
-                }
-            }
-            $lstUpdates.Items.Refresh()
-            Update-DlgUI
-
-            # Sequentially install each update for real-time visual progress
-            $installer = $session.CreateUpdateInstaller()
-            $installer.ForceQuiet = $true
-            $total = $selected.Count
-            $instSucceeded = 0
-            $instFailed = 0
-
-            for ($i = 0; $i -lt $total; $i++) {
-                $it = $selected[$i]
-                $pct = 20 + [math]::Round((($i) / $total) * 75)
-                $progBar.Value = $pct
-                $txtProgress.Text = "$pct%"
-                $txtStatus.Text = "Installing ($($i+1)/$total): $($it.Title)..."
-                $it.StatusText = "Installing..."
-                $it.StatusColor = "#EAA300"
-                $lstUpdates.Items.Refresh()
-                Update-DlgUI
-
-                $singleColl = New-Object -ComObject Microsoft.Update.UpdateColl
-                $singleColl.Add($it.UpdateObject) | Out-Null
-                $installer.Updates = $singleColl
-
-                try {
-                    $instRes = $installer.Install()
-                    $code = $instRes.ResultCode
-                    if ($code -eq 2 -or $code -eq 3) {
-                        $it.StatusText = "Installed"
-                        $it.StatusColor = "#6CCB5F"
-                        $instSucceeded++
-                    } else {
-                        $it.StatusText = "Failed ($code)"
-                        $it.StatusColor = "#FF99A4"
-                        $instFailed++
-                    }
-                    if ($instRes.RebootRequired) {
-                        $script:DlgRebootNeeded = $true
-                    }
-                } catch {
-                    $it.StatusText = "Error"
-                    $it.StatusColor = "#FF99A4"
-                    $instFailed++
-                }
-                $lstUpdates.Items.Refresh()
-                Update-DlgUI
-            }
-
-            $progBar.Value = 100
-            $txtProgress.Text = "100%"
-            $txtStatus.Text = "Update complete: $instSucceeded installed, $instFailed failed."
-            try { [System.Media.SystemSounds]::Asterisk.Play() } catch { }
-
-            if ($script:DlgRebootNeeded) {
-                $btnRestartNow.Visibility = [System.Windows.Visibility]::Visible
-                $txtStatus.Text = "Updates installed successfully. System restart is REQUIRED."
-                if ($chkAutoReboot.IsChecked) {
-                    $txtStatus.Text = "Restarting system in 5 seconds (persists Hub to resume)..."
-                    Update-DlgUI
-                    Register-HubResumeAfterRestart
-                    Start-Sleep -Seconds 5
-                    Restart-Computer -Force
-                }
-            }
-        } catch {
-            $txtStatus.Text = "Installation error: $($_.Exception.Message)"
-        } finally {
-            $btnScan.IsEnabled = $true
-        }
-    })
-
-    $btnRestartNow.Add_Click({
-        $ans = [System.Windows.MessageBox]::Show("Restart system now to complete Windows Update installation?`n`nThe Hub will register a resume task and re-launch automatically when the system boots back up.", "Confirm Restart", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
-        if ($ans -eq [System.Windows.MessageBoxResult]::Yes) {
+            Set-HubPatchCascadeState -CurrentPass $nextPass -MaxPasses $MaxPasses -IncludeDrivers:$IncludeDrivers -TotalInstalled $totalInstalled
             Register-HubResumeAfterRestart
+            if ($StatusCallback) { & $StatusCallback "Restarting system in 5 seconds..." }
+            Start-Sleep -Seconds 5
             Restart-Computer -Force
+            return [PSCustomObject]@{
+                Completed      = $false
+                CurrentPass    = $currentPass
+                NextPass       = $nextPass
+                TotalInstalled = $totalInstalled
+                RebootRequired = $true
+            }
+        } else {
+            Clear-HubPatchCascadeState
+            if ($StatusCallback) {
+                & $StatusCallback "Reached MaxPasses ($MaxPasses). Final reboot is required to finish installing updates."
+            }
+            return [PSCustomObject]@{
+                Completed      = $true
+                CurrentPass    = $currentPass
+                TotalInstalled = $totalInstalled
+                RebootRequired = $true
+            }
         }
-    })
-
-    $btnClose.Add_Click({ $dlg.Close() })
-
-    $dlg.ShowDialog() | Out-Null
+    } else {
+        # No reboot needed, but updates were installed. Re-run cascade in same session
+        $nextPass = $currentPass + 1
+        if ($nextPass -le $MaxPasses) {
+            Set-HubPatchCascadeState -CurrentPass $nextPass -MaxPasses $MaxPasses -IncludeDrivers:$IncludeDrivers -TotalInstalled $totalInstalled
+            return Start-HubAutonomousPatchCascade -MaxPasses $MaxPasses -IncludeDrivers:$IncludeDrivers -StatusCallback $StatusCallback
+        } else {
+            Clear-HubPatchCascadeState
+            if ($StatusCallback) {
+                & $StatusCallback "Reached MaxPasses ($MaxPasses). Cascade complete. Total updates installed: $totalInstalled."
+            }
+            return [PSCustomObject]@{
+                Completed      = $true
+                CurrentPass    = $currentPass
+                TotalInstalled = $totalInstalled
+                RebootRequired = $false
+            }
+        }
+    }
 }
 
 # ==============================================================================
@@ -4483,7 +4298,7 @@ function Start-AutopilotHubGui {
         </Border>
 
         <!-- MAIN CONTENT TABS -->
-        <TabControl Grid.Row="2" Background="Transparent" BorderThickness="0" Margin="0,0,0,10">
+        <TabControl Name="MainTabControl" Grid.Row="2" Background="Transparent" BorderThickness="0" Margin="0,0,0,10">
             <TabControl.Resources>
                 <Style TargetType="TabItem">
                     <Setter Property="Template">
@@ -4918,7 +4733,152 @@ function Start-AutopilotHubGui {
                 </Border>
             </TabItem>
 
-            <!-- TAB 5: DELL ASSET WARRANTY & REFRESH ASSESSMENT -->
+            <!-- TAB 5: WINDOWS UPDATE & DRIVER CASCADE -->
+            <TabItem Name="TabWinUpdate" Header="Windows Update &amp; Drivers">
+                <Grid Margin="0,12,0,0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <!-- Top Card: Autonomous Multi-Pass Patch Cascade Engine -->
+                    <Border Grid.Row="0" Background="#272727" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14,10" Margin="0,0,0,10">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+
+                            <!-- Left: Cascade Telemetry & Description -->
+                            <StackPanel Grid.Row="0" Grid.Column="0">
+                                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                    <Border Name="BadgeCascadeStatus" Background="#1F2822" CornerRadius="3" Padding="8,2" Margin="0,0,10,0" BorderBrush="#2A5435" BorderThickness="1">
+                                        <TextBlock Name="TxtCascadeStatus" Text="CASCADE IDLE" FontSize="10.5" FontWeight="Bold" Foreground="#6CCB5F"/>
+                                    </Border>
+                                    <TextBlock Text="AUTONOMOUS MULTI-PASS PATCH CASCADE" FontSize="13" FontWeight="SemiBold" Foreground="#FFFFFF" VerticalAlignment="Center"/>
+                                    <TextBlock Name="TxtCascadePassInfo" Text=" (Pass 1 of 5)" FontSize="12" Foreground="#60CDFF" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                    <TextBlock Name="TxtCascadeInstalled" Text=" | 0 installed" FontSize="12" Foreground="#A0A0A0" VerticalAlignment="Center"/>
+                                </StackPanel>
+                                <TextBlock Name="TxtCascadeStateDetail" Text="Fully automated cycle: scans, downloads, installs updates/drivers, reboots with persistence, and resumes automatically until the system is 100% patched." FontSize="11" Foreground="#8A8A8A" Margin="0,4,0,0"/>
+                            </StackPanel>
+
+                            <!-- Right: Cascade Action Buttons & Abort Affordance -->
+                            <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                <Button Name="BtnAbortReboot" Content="Cancel Reboot" Style="{StaticResource DestructiveBtn}" Margin="0,0,8,0" Padding="12,5" FontWeight="Bold" Visibility="Collapsed"
+                                        ToolTip="Aborts the 5-second scheduled restart countdown and pauses cascade"/>
+                                <Button Name="BtnStopCascade" Content="Stop Cascade" Style="{StaticResource DestructiveBtn}" Margin="0,0,8,0" Padding="12,5" Visibility="Collapsed"/>
+                                <Button Name="BtnStartCascade" Content="Start Autonomous Patch Cascade" Style="{StaticResource AccentBtn}" Padding="16,6" FontWeight="Bold"
+                                        ToolTip="Repeats: Scan to Install to Reboot to Resume until zero updates remain"/>
+                            </StackPanel>
+
+                            <!-- Options Row -->
+                            <Border Grid.Row="1" Grid.ColumnSpan="2" Background="#202020" CornerRadius="3" Padding="10,6" Margin="0,8,0,0" BorderBrush="#303030" BorderThickness="1">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <CheckBox Name="ChkCascadeDrivers" Grid.Column="0" Content="Include Hardware &amp; Firmware Drivers" IsChecked="True" Foreground="#FFFFFF" VerticalAlignment="Center" Margin="0,0,16,0"/>
+                                    <CheckBox Name="ChkCascadeAutoReboot" Grid.Column="1" Content="Auto-Restart with Persistence (Re-opens Hub on boot)" IsChecked="True" Foreground="#FFFFFF" VerticalAlignment="Center" Margin="0,0,16,0"/>
+                                    <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                                        <TextBlock Text="Max Passes:" Foreground="#A0A0A0" FontSize="11" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                                        <ComboBox Name="CmbCascadeMaxPasses" Width="60" Height="24" Background="#2B2B2B" Foreground="#FFFFFF" BorderBrush="#383838" SelectedIndex="1">
+                                            <ComboBoxItem Content="3"/>
+                                            <ComboBoxItem Content="5"/>
+                                            <ComboBoxItem Content="8"/>
+                                            <ComboBoxItem Content="10"/>
+                                        </ComboBox>
+                                    </StackPanel>
+                                    <TextBlock Name="TxtWuRebootNotice" Grid.Column="3" Text="" Foreground="#EAA300" FontWeight="SemiBold" FontSize="11" VerticalAlignment="Center" HorizontalAlignment="Right" Margin="0,0,12,0"/>
+                                    <Button Name="BtnWuRebootNow" Grid.Column="4" Content="Restart System Now" Style="{StaticResource DestructiveBtn}" Padding="10,3" FontSize="11" Visibility="Collapsed"
+                                            ToolTip="Persists Hub and reboots immediately to apply installed updates"/>
+                                </Grid>
+                            </Border>
+                        </Grid>
+                    </Border>
+
+                    <!-- Manual Controls Bar & Progress Status -->
+                    <Border Grid.Row="1" Background="#242424" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12,8" Margin="0,0,0,8">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <Grid Grid.Row="0" Margin="0,0,0,6">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                    <TextBlock Text="MANUAL CONTROLS:" FontSize="10.5" FontWeight="Bold" Foreground="#8A8A8A" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                                    <Button Name="BtnWuScan" Content="Scan for Updates" Padding="10,4" Margin="0,0,6,0"/>
+                                    <Button Name="BtnWuInstall" Content="Install Selected" Style="{StaticResource AccentBtn}" Padding="10,4" Margin="0,0,6,0" IsEnabled="False"/>
+                                    <Button Name="BtnWuSelectAll" Content="Select All" Padding="8,4" Margin="0,0,4,0"/>
+                                    <Button Name="BtnWuDeselectAll" Content="Deselect All" Padding="8,4" Margin="0,0,6,0"/>
+                                    <Button Name="BtnWuTriggerUso" Content="Trigger USO Scan" Padding="8,4" ToolTip="Triggers background usoclient.exe StartInteractiveScan"/>
+                                </StackPanel>
+                                <TextBlock Name="TxtWuSummary" Grid.Column="1" Text="Ready to scan" FontSize="11" Foreground="#B0B0B0" VerticalAlignment="Center"/>
+                            </Grid>
+                            <Grid Grid.Row="1">
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+                                <Grid Grid.Row="0" Margin="0,0,0,2">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Name="TxtWuStatus" Text="Ready. Click 'Start Autonomous Patch Cascade' or 'Scan for Updates'." FontSize="11" Foreground="#D0D0D0"/>
+                                    <TextBlock Name="TxtWuProgress" Grid.Column="1" Text="" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF"/>
+                                </Grid>
+                                <ProgressBar Name="ProgWuBar" Grid.Row="1" Height="4" Background="#1A1A1A" Foreground="#0067C0" BorderThickness="0" Minimum="0" Maximum="100" Value="0"/>
+                            </Grid>
+                        </Grid>
+                    </Border>
+
+                    <!-- Updates List Grid View -->
+                    <Border Grid.Row="2" Background="#1A1A1A" CornerRadius="4" BorderBrush="#383838" BorderThickness="1">
+                        <ListView Name="LstIntegratedUpdates" Background="Transparent" BorderThickness="0" Foreground="#FFFFFF" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                            <ListView.ItemTemplate>
+                                <DataTemplate>
+                                    <Border BorderBrush="#282828" BorderThickness="0,0,0,1" Padding="6,7">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="30"/>
+                                                <ColumnDefinition Width="80"/>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="80"/>
+                                                <ColumnDefinition Width="130"/>
+                                            </Grid.ColumnDefinitions>
+                                            <CheckBox IsChecked="{Binding IsSelected}" VerticalAlignment="Center" HorizontalAlignment="Center"/>
+                                            <Border Grid.Column="1" Background="{Binding BadgeBackground}" CornerRadius="3" Padding="4,2" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                                <TextBlock Text="{Binding CategoryText}" FontSize="9.5" FontWeight="Bold" Foreground="{Binding BadgeForeground}"/>
+                                            </Border>
+                                            <StackPanel Grid.Column="2" VerticalAlignment="Center" Margin="8,0,8,0">
+                                                <TextBlock Text="{Binding Title}" FontSize="11.5" FontWeight="SemiBold" Foreground="#FFFFFF" TextWrapping="Wrap"/>
+                                                <TextBlock Text="{Binding Subtitle}" FontSize="10" Foreground="#8A8A8A" Margin="0,2,0,0"/>
+                                            </StackPanel>
+                                            <TextBlock Grid.Column="3" Text="{Binding SizeText}" FontSize="11" Foreground="#B0B0B0" VerticalAlignment="Center" HorizontalAlignment="Right" Margin="0,0,8,0"/>
+                                            <TextBlock Grid.Column="4" Text="{Binding StatusText}" FontSize="11" FontWeight="SemiBold" Foreground="{Binding StatusColor}" VerticalAlignment="Center" HorizontalAlignment="Right" Margin="0,0,8,0"/>
+                                        </Grid>
+                                    </Border>
+                                </DataTemplate>
+                            </ListView.ItemTemplate>
+                        </ListView>
+                    </Border>
+                </Grid>
+            </TabItem>
+
+            <!-- TAB 6: DELL ASSET WARRANTY & REFRESH ASSESSMENT -->
             <TabItem Header="Dell Warranty &amp; Hardware Health">
                 <Border Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="16" Margin="0,12,0,0">
                     <Grid>
@@ -5464,12 +5424,39 @@ function Start-AutopilotHubGui {
     $btnScreenshotUsb      = $window.FindName('BtnScreenshotUsb')
     $btnToggleDpi          = $window.FindName('BtnToggleDpi')
     $btnWindowsUpdate      = $window.FindName('BtnWindowsUpdate')
+    $mainTabControl        = $window.FindName('MainTabControl')
 
     # Additional Controls: Tab 4 Pre-Flight
     $btnFixClockSkew       = $window.FindName('BtnFixClockSkew')
     $btnTpmAttestation     = $window.FindName('BtnTpmAttestation')
     $btnInjectDriversPreflight = $window.FindName('BtnInjectDriversPreflight')
     $btnPreflightWinUpdate = $window.FindName('BtnPreflightWinUpdate')
+
+    # Additional Controls: Tab 5 Windows Update & Patch Cascade
+    $tabWinUpdate          = $window.FindName('TabWinUpdate')
+    $badgeCascadeStatus    = $window.FindName('BadgeCascadeStatus')
+    $txtCascadeStatus      = $window.FindName('TxtCascadeStatus')
+    $txtCascadePassInfo    = $window.FindName('TxtCascadePassInfo')
+    $txtCascadeInstalled   = $window.FindName('TxtCascadeInstalled')
+    $txtCascadeStateDetail = $window.FindName('TxtCascadeStateDetail')
+    $btnStartCascade       = $window.FindName('BtnStartCascade')
+    $btnStopCascade        = $window.FindName('BtnStopCascade')
+    $btnAbortReboot        = $window.FindName('BtnAbortReboot')
+    $chkCascadeDrivers     = $window.FindName('ChkCascadeDrivers')
+    $chkCascadeAutoReboot  = $window.FindName('ChkCascadeAutoReboot')
+    $cmbCascadeMaxPasses   = $window.FindName('CmbCascadeMaxPasses')
+    $txtWuRebootNotice     = $window.FindName('TxtWuRebootNotice')
+    $btnWuRebootNow        = $window.FindName('BtnWuRebootNow')
+    $btnWuScan             = $window.FindName('BtnWuScan')
+    $btnWuInstall          = $window.FindName('BtnWuInstall')
+    $btnWuSelectAll        = $window.FindName('BtnWuSelectAll')
+    $btnWuDeselectAll      = $window.FindName('BtnWuDeselectAll')
+    $btnWuTriggerUso       = $window.FindName('BtnWuTriggerUso')
+    $txtWuSummary          = $window.FindName('TxtWuSummary')
+    $txtWuStatus           = $window.FindName('TxtWuStatus')
+    $txtWuProgress         = $window.FindName('TxtWuProgress')
+    $progWuBar             = $window.FindName('ProgWuBar')
+    $lstIntegratedUpdates  = $window.FindName('LstIntegratedUpdates')
 
     # Additional Controls: Tab 5 Warranty & Hardware Health
     $btnCheckLenovoWarranty = $window.FindName('BtnCheckLenovoWarranty')
@@ -6729,8 +6716,10 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
 
     if ($btnWindowsUpdate) {
         $btnWindowsUpdate.Add_Click({
-            Write-HubLog "Launching Windows Update & Driver Engine..." "INFO"
-            Show-HubWindowsUpdateDialog -Owner $window
+            Write-HubLog "Switching to Windows Update & Driver Engine tab..." "INFO"
+            if ($mainTabControl -and $tabWinUpdate) {
+                $mainTabControl.SelectedItem = $tabWinUpdate
+            }
         })
     }
 
@@ -6904,12 +6893,540 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
 
     if ($btnPreflightWinUpdate) {
         $btnPreflightWinUpdate.Add_Click({
-            Write-HubLog "Launching Windows Update & Driver Engine from Pre-Flight tab..." "INFO"
-            Show-HubWindowsUpdateDialog -Owner $window
+            Write-HubLog "Switching to Windows Update & Driver Engine tab from Pre-Flight..." "INFO"
+            if ($mainTabControl -and $tabWinUpdate) {
+                $mainTabControl.SelectedItem = $tabWinUpdate
+            }
         })
     }
 
-    # --- TAB 5 ACTIONS (Lenovo Warranty, Battery Wear & Storage SMART) ---
+    # --- TAB 5 ACTIONS (Windows Update & Autonomous Patch Cascade Engine) ---
+    $integratedWuItems = [System.Collections.ArrayList]::new()
+    $script:RebootCountdownTimer = $null
+    $script:RebootCountdownSec = 5
+    $script:CascadeRunning = $false
+
+    function Update-IntegratedWuList {
+        param($rawUpdates)
+        $integratedWuItems.Clear()
+        foreach ($u in $rawUpdates) {
+            $cat = if ($u.IsDriver) { "DRIVER" } else { "UPDATE" }
+            $bg = if ($u.IsDriver) { "#1E2A38" } else { "#1F2822" }
+            $fg = if ($u.IsDriver) { "#60CDFF" } else { "#6CCB5F" }
+            $sizeStr = if ($u.SizeMB -gt 0) { "$($u.SizeMB) MB" } else { "Online" }
+            $sub = if ($u.KB) { "KB$($u.KB)" } else { "" }
+            if ($u.Description) {
+                $descShort = if ($u.Description.Length -gt 80) { $u.Description.Substring(0, 80) + '...' } else { $u.Description }
+                $sub = if ($sub) { "$sub - $descShort" } else { $descShort }
+            }
+
+            $item = [PSCustomObject]@{
+                IsSelected      = $true
+                CategoryText    = $cat
+                BadgeBackground = $bg
+                BadgeForeground = $fg
+                Title           = $u.Title
+                Subtitle        = $sub
+                SizeText        = $sizeStr
+                StatusText      = "Pending"
+                StatusColor     = "#D0D0D0"
+                UpdateObject    = $u.UpdateObject
+                RawItem         = $u
+            }
+            [void]$integratedWuItems.Add($item)
+        }
+        if ($lstIntegratedUpdates) {
+            $lstIntegratedUpdates.ItemsSource = $null
+            $lstIntegratedUpdates.ItemsSource = $integratedWuItems
+        }
+        if ($txtWuSummary) { $txtWuSummary.Text = "$($integratedWuItems.Count) update(s) available" }
+    }
+
+    function Start-RebootCountdown {
+        param([int]$Seconds = 5, [scriptblock]$OnComplete)
+        $script:RebootCountdownSec = $Seconds
+        if ($btnAbortReboot) { $btnAbortReboot.Visibility = [System.Windows.Visibility]::Visible }
+        if ($txtWuRebootNotice) { $txtWuRebootNotice.Text = "System restart in $($script:RebootCountdownSec)s... Click 'Cancel Reboot' to abort." }
+        Write-HubLog "System restart countdown initiated ($Seconds seconds). Click 'Cancel Reboot' on the Windows Update tab to abort." "WARN"
+
+        if ($script:RebootCountdownTimer) {
+            try { $script:RebootCountdownTimer.Stop() } catch { }
+        }
+
+        $script:RebootCountdownTimer = [System.Windows.Threading.DispatcherTimer]::new()
+        $script:RebootCountdownTimer.Interval = [TimeSpan]::FromSeconds(1)
+        $script:RebootCountdownTimer.Add_Tick({
+            $script:RebootCountdownSec--
+            if ($script:RebootCountdownSec -gt 0) {
+                if ($txtWuRebootNotice) { $txtWuRebootNotice.Text = "System restart in $($script:RebootCountdownSec)s... Click 'Cancel Reboot' to abort." }
+                if ($txtWuStatus) { $txtWuStatus.Text = "Restarting system in $($script:RebootCountdownSec) seconds..." }
+            } else {
+                $script:RebootCountdownTimer.Stop()
+                $script:RebootCountdownTimer = $null
+                if ($btnAbortReboot) { $btnAbortReboot.Visibility = [System.Windows.Visibility]::Collapsed }
+                if ($txtWuRebootNotice) { $txtWuRebootNotice.Text = "" }
+                if ($OnComplete) { & $OnComplete }
+            }
+        })
+        $script:RebootCountdownTimer.Start()
+    }
+
+    function Stop-RebootCountdown {
+        if ($script:RebootCountdownTimer) {
+            try { $script:RebootCountdownTimer.Stop() } catch { }
+            $script:RebootCountdownTimer = $null
+        }
+        if ($btnAbortReboot) { $btnAbortReboot.Visibility = [System.Windows.Visibility]::Collapsed }
+        if ($txtWuRebootNotice) { $txtWuRebootNotice.Text = "Restart cancelled by user." }
+        Write-HubLog "System restart countdown cancelled by operator." "WARN"
+    }
+
+    function Invoke-GuiCascadePass {
+        $state = Get-HubPatchCascadeState
+        $currPass = if ($state -and $state.CurrentPass) { [int]$state.CurrentPass } else { 1 }
+        $maxPasses = if ($state -and $state.MaxPasses) { [int]$state.MaxPasses } else {
+            if ($cmbCascadeMaxPasses -and $cmbCascadeMaxPasses.SelectedItem) {
+                [int]($cmbCascadeMaxPasses.SelectedItem.Content)
+            } else { 5 }
+        }
+        $includeDrivers = if ($state) { [bool]$state.IncludeDrivers } else {
+            if ($chkCascadeDrivers) { [bool]$chkCascadeDrivers.IsChecked } else { $true }
+        }
+        $autoReboot = if ($chkCascadeAutoReboot) { [bool]$chkCascadeAutoReboot.IsChecked } else { $true }
+        $totalInstalled = if ($state -and $state.TotalInstalled) { [int]$state.TotalInstalled } else { 0 }
+
+        $script:CascadeRunning = $true
+        if ($btnStartCascade) { $btnStartCascade.Visibility = [System.Windows.Visibility]::Collapsed }
+        if ($btnStopCascade) { $btnStopCascade.Visibility = [System.Windows.Visibility]::Visible }
+        if ($btnWuScan) { $btnWuScan.IsEnabled = $false }
+        if ($btnWuInstall) { $btnWuInstall.IsEnabled = $false }
+
+        if ($txtCascadeStatus) { $txtCascadeStatus.Text = "CASCADE ACTIVE" }
+        if ($badgeCascadeStatus) {
+            $badgeCascadeStatus.Background = $brushConv.ConvertFromString("#182A3A")
+            $badgeCascadeStatus.BorderBrush = $brushConv.ConvertFromString("#234863")
+        }
+        if ($txtCascadeStatus) { $txtCascadeStatus.Foreground = $brushConv.ConvertFromString("#60CDFF") }
+        if ($txtCascadePassInfo) { $txtCascadePassInfo.Text = " (Pass $currPass of $maxPasses)" }
+        if ($txtCascadeInstalled) { $txtCascadeInstalled.Text = " | $totalInstalled installed" }
+        if ($txtWuStatus) { $txtWuStatus.Text = "Pass $($currPass): Scanning for Windows updates and drivers..." }
+        if ($progWuBar) { $progWuBar.IsIndeterminate = $true }
+        Write-HubLog "Starting Autonomous Patch Cascade - Pass $currPass of $maxPasses (Drivers: $includeDrivers)..." "INFO"
+        Update-WpfUI
+
+        Set-HubPatchCascadeState -CurrentPass $currPass -MaxPasses $maxPasses -IncludeDrivers:$includeDrivers -TotalInstalled $totalInstalled
+
+        $rawUpdates = @(Get-HubPendingWindowsUpdates -IncludeDrivers:$includeDrivers -StatusCallback {
+            param($msg)
+            if ($txtWuStatus) { $txtWuStatus.Text = $msg }
+            Update-WpfUI
+        })
+
+        if ($progWuBar) { $progWuBar.IsIndeterminate = $false; $progWuBar.Value = 10 }
+        Update-IntegratedWuList -rawUpdates $rawUpdates
+        Update-WpfUI
+
+        if (-not $script:CascadeRunning) {
+            if ($progWuBar) { $progWuBar.Value = 0 }
+            return
+        }
+
+        if ($rawUpdates.Count -eq 0) {
+            Clear-HubPatchCascadeState
+            $script:CascadeRunning = $false
+            if ($btnStartCascade) { $btnStartCascade.Visibility = [System.Windows.Visibility]::Visible; $btnStartCascade.IsEnabled = $true }
+            if ($btnStopCascade) { $btnStopCascade.Visibility = [System.Windows.Visibility]::Collapsed }
+            if ($btnWuScan) { $btnWuScan.IsEnabled = $true }
+            if ($txtCascadeStatus) { $txtCascadeStatus.Text = "100% PATCHED" }
+            if ($badgeCascadeStatus) {
+                $badgeCascadeStatus.Background = $brushConv.ConvertFromString("#1F2822")
+                $badgeCascadeStatus.BorderBrush = $brushConv.ConvertFromString("#2A5435")
+            }
+            if ($txtCascadeStatus) { $txtCascadeStatus.Foreground = $brushConv.ConvertFromString("#6CCB5F") }
+            if ($txtCascadeStateDetail) { $txtCascadeStateDetail.Text = "Zero updates pending. All security patches, quality updates, and hardware drivers are fully applied." }
+            if ($txtWuStatus) { $txtWuStatus.Text = "Cascade complete! System is 100% up to date. Total installed: $totalInstalled" }
+            if ($progWuBar) { $progWuBar.Value = 100 }
+            Write-HubLog "Patch Cascade finished: Zero updates remaining. System is 100% up to date! Total installed across cascade: $totalInstalled" "SUCCESS"
+            try { [System.Media.SystemSounds]::Asterisk.Play() } catch { }
+            return
+        }
+
+        Write-HubLog "Pass $($currPass): Found $($rawUpdates.Count) update(s) to install. Beginning download..." "INFO"
+        if ($txtWuStatus) { $txtWuStatus.Text = "Pass $($currPass): Downloading $($rawUpdates.Count) update package(s)..." }
+        if ($progWuBar) { $progWuBar.IsIndeterminate = $true }
+        Update-WpfUI
+
+        $session = New-Object -ComObject Microsoft.Update.Session
+        $downloader = $session.CreateUpdateDownloader()
+        $downColl = New-Object -ComObject Microsoft.Update.UpdateColl
+
+        foreach ($it in $integratedWuItems) {
+            $uObj = $it.UpdateObject
+            if ($uObj.EulaAccepted -eq $false) {
+                try { $uObj.AcceptEula() } catch { }
+            }
+            $downColl.Add($uObj) | Out-Null
+        }
+        $downloader.Updates = $downColl
+
+        try {
+            $downRes = $downloader.Download()
+        } catch {
+            Write-HubLog "Download error in pass $($currPass): $($_.Exception.Message)" "ERROR"
+            if ($txtWuStatus) { $txtWuStatus.Text = "Download error: $($_.Exception.Message)" }
+            $script:CascadeRunning = $false
+            if ($btnStartCascade) { $btnStartCascade.Visibility = [System.Windows.Visibility]::Visible; $btnStartCascade.IsEnabled = $true }
+            if ($btnStopCascade) { $btnStopCascade.Visibility = [System.Windows.Visibility]::Collapsed }
+            if ($btnWuScan) { $btnWuScan.IsEnabled = $true }
+            return
+        }
+
+        if ($progWuBar) { $progWuBar.IsIndeterminate = $false; $progWuBar.Value = 25 }
+
+        foreach ($it in $integratedWuItems) {
+            if ($it.UpdateObject.IsDownloaded) {
+                $it.StatusText = "Downloaded"
+                $it.StatusColor = "#60CDFF"
+            }
+        }
+        if ($lstIntegratedUpdates) { $lstIntegratedUpdates.Items.Refresh() }
+        Update-WpfUI
+
+        if (-not $script:CascadeRunning) { return }
+
+        $installer = $session.CreateUpdateInstaller()
+        $installer.ForceQuiet = $true
+        $total = $integratedWuItems.Count
+        $passInstalled = 0
+        $passFailed = 0
+        $rebootNeeded = $false
+
+        for ($i = 0; $i -lt $total; $i++) {
+            if (-not $script:CascadeRunning) { break }
+            $it = $integratedWuItems[$i]
+            $pct = 25 + [math]::Round((($i) / $total) * 70)
+            if ($progWuBar) { $progWuBar.Value = $pct }
+            if ($txtWuProgress) { $txtWuProgress.Text = "$pct%" }
+            if ($txtWuStatus) { $txtWuStatus.Text = "Installing ($($i+1)/$total): $($it.Title)..." }
+            $it.StatusText = "Installing..."
+            $it.StatusColor = "#EAA300"
+            if ($lstIntegratedUpdates) { $lstIntegratedUpdates.Items.Refresh() }
+            Update-WpfUI
+
+            $singleColl = New-Object -ComObject Microsoft.Update.UpdateColl
+            $singleColl.Add($it.UpdateObject) | Out-Null
+            $installer.Updates = $singleColl
+
+            try {
+                $instRes = $installer.Install()
+                $code = $instRes.ResultCode
+                if ($code -eq 2 -or $code -eq 3) {
+                    $it.StatusText = "Installed"
+                    $it.StatusColor = "#6CCB5F"
+                    $passInstalled++
+                    Write-HubLog "Installed: $($it.Title)" "SUCCESS"
+                } else {
+                    $it.StatusText = "Failed ($code)"
+                    $it.StatusColor = "#FF99A4"
+                    $passFailed++
+                    Write-HubLog "Failed ($code): $($it.Title)" "WARN"
+                }
+                if ($instRes.RebootRequired) {
+                    $rebootNeeded = $true
+                }
+            } catch {
+                $it.StatusText = "Error"
+                $it.StatusColor = "#FF99A4"
+                $passFailed++
+                Write-HubLog "Error installing $($it.Title): $($_.Exception.Message)" "ERROR"
+            }
+            if ($lstIntegratedUpdates) { $lstIntegratedUpdates.Items.Refresh() }
+            Update-WpfUI
+        }
+
+        $totalInstalled += $passInstalled
+        if ($txtCascadeInstalled) { $txtCascadeInstalled.Text = " | $totalInstalled installed" }
+        if ($progWuBar) { $progWuBar.Value = 100 }
+        if ($txtWuProgress) { $txtWuProgress.Text = "100%" }
+
+        if (-not $script:CascadeRunning) {
+            Write-HubLog "Cascade paused after pass $currPass." "WARN"
+            return
+        }
+
+        if ($rebootNeeded) {
+            $nextPass = $currPass + 1
+            if ($nextPass -le $maxPasses) {
+                Write-HubLog "Pass $currPass completed ($passInstalled installed). Reboot is REQUIRED. Scheduling Pass $nextPass of $maxPasses..." "WARN"
+                Set-HubPatchCascadeState -CurrentPass $nextPass -MaxPasses $maxPasses -IncludeDrivers:$includeDrivers -TotalInstalled $totalInstalled
+                Register-HubResumeAfterRestart
+
+                if ($autoReboot) {
+                    Start-RebootCountdown -Seconds 5 -OnComplete {
+                        Restart-Computer -Force
+                    }
+                } else {
+                    if ($btnWuRebootNow) { $btnWuRebootNow.Visibility = [System.Windows.Visibility]::Visible }
+                    if ($txtWuRebootNotice) { $txtWuRebootNotice.Text = "Reboot required for Pass $nextPass. Click 'Restart System Now'." }
+                    if ($txtWuStatus) { $txtWuStatus.Text = "Updates installed. System restart is REQUIRED before Pass $nextPass." }
+                }
+            } else {
+                Clear-HubPatchCascadeState
+                $script:CascadeRunning = $false
+                if ($btnStartCascade) { $btnStartCascade.Visibility = [System.Windows.Visibility]::Visible; $btnStartCascade.IsEnabled = $true }
+                if ($btnStopCascade) { $btnStopCascade.Visibility = [System.Windows.Visibility]::Collapsed }
+                if ($btnWuScan) { $btnWuScan.IsEnabled = $true }
+                if ($btnWuRebootNow) { $btnWuRebootNow.Visibility = [System.Windows.Visibility]::Visible }
+                Write-HubLog "Reached maximum cascade passes ($maxPasses). Final reboot is required." "WARN"
+                if ($txtWuStatus) { $txtWuStatus.Text = "Reached maximum passes ($maxPasses). Final reboot required to complete updates." }
+            }
+        } else {
+            $nextPass = $currPass + 1
+            if ($nextPass -le $maxPasses -and $passInstalled -gt 0) {
+                Write-HubLog "Pass $currPass finished ($passInstalled installed, no reboot needed). Advancing to Pass $nextPass to verify..." "INFO"
+                Set-HubPatchCascadeState -CurrentPass $nextPass -MaxPasses $maxPasses -IncludeDrivers:$includeDrivers -TotalInstalled $totalInstalled
+                Start-Sleep -Seconds 2
+                Invoke-GuiCascadePass
+            } else {
+                Clear-HubPatchCascadeState
+                $script:CascadeRunning = $false
+                if ($btnStartCascade) { $btnStartCascade.Visibility = [System.Windows.Visibility]::Visible; $btnStartCascade.IsEnabled = $true }
+                if ($btnStopCascade) { $btnStopCascade.Visibility = [System.Windows.Visibility]::Collapsed }
+                if ($btnWuScan) { $btnWuScan.IsEnabled = $true }
+                if ($txtCascadeStatus) { $txtCascadeStatus.Text = "100% PATCHED" }
+                if ($badgeCascadeStatus) {
+                    $badgeCascadeStatus.Background = $brushConv.ConvertFromString("#1F2822")
+                    $badgeCascadeStatus.BorderBrush = $brushConv.ConvertFromString("#2A5435")
+                }
+                if ($txtCascadeStatus) { $txtCascadeStatus.Foreground = $brushConv.ConvertFromString("#6CCB5F") }
+                if ($txtWuStatus) { $txtWuStatus.Text = "Cascade complete! Total updates installed: $totalInstalled." }
+                Write-HubLog "Patch Cascade complete: Total updates installed: $totalInstalled." "SUCCESS"
+                try { [System.Media.SystemSounds]::Asterisk.Play() } catch { }
+            }
+        }
+    }
+
+    if ($btnStartCascade) {
+        $btnStartCascade.Add_Click({
+            Invoke-GuiCascadePass
+        })
+    }
+
+    if ($btnStopCascade) {
+        $btnStopCascade.Add_Click({
+            $script:CascadeRunning = $false
+            Stop-RebootCountdown
+            Clear-HubPatchCascadeState
+            if ($btnStartCascade) { $btnStartCascade.Visibility = [System.Windows.Visibility]::Visible; $btnStartCascade.IsEnabled = $true }
+            if ($btnStopCascade) { $btnStopCascade.Visibility = [System.Windows.Visibility]::Collapsed }
+            if ($btnWuScan) { $btnWuScan.IsEnabled = $true }
+            if ($txtCascadeStatus) { $txtCascadeStatus.Text = "CASCADE STOPPED" }
+            if ($badgeCascadeStatus) {
+                $badgeCascadeStatus.Background = $brushConv.ConvertFromString("#2E2221")
+                $badgeCascadeStatus.BorderBrush = $brushConv.ConvertFromString("#542E2A")
+            }
+            if ($txtCascadeStatus) { $txtCascadeStatus.Foreground = $brushConv.ConvertFromString("#FF99A4") }
+            if ($txtWuStatus) { $txtWuStatus.Text = "Cascade stopped. Saved cascade state cleared." }
+            Write-HubLog "Autonomous Patch Cascade stopped and state cleared by operator." "INFO"
+        })
+    }
+
+    if ($btnAbortReboot) {
+        $btnAbortReboot.Add_Click({
+            Stop-RebootCountdown
+            $script:CascadeRunning = $false
+            if ($btnStartCascade) { $btnStartCascade.Visibility = [System.Windows.Visibility]::Visible; $btnStartCascade.IsEnabled = $true }
+            if ($btnStopCascade) { $btnStopCascade.Visibility = [System.Windows.Visibility]::Collapsed }
+            if ($btnWuScan) { $btnWuScan.IsEnabled = $true }
+            if ($txtCascadeStatus) { $txtCascadeStatus.Text = "CASCADE PAUSED" }
+            if ($badgeCascadeStatus) {
+                $badgeCascadeStatus.Background = $brushConv.ConvertFromString("#332A15")
+                $badgeCascadeStatus.BorderBrush = $brushConv.ConvertFromString("#5C4B25")
+            }
+            if ($txtCascadeStatus) { $txtCascadeStatus.Foreground = $brushConv.ConvertFromString("#EAA300") }
+            if ($txtWuStatus) { $txtWuStatus.Text = "Restart cancelled. Autonomous cascade is paused." }
+        })
+    }
+
+    if ($btnWuScan) {
+        $btnWuScan.Add_Click({
+            $btnWuScan.IsEnabled = $false
+            if ($btnWuInstall) { $btnWuInstall.IsEnabled = $false }
+            if ($progWuBar) { $progWuBar.IsIndeterminate = $true }
+            if ($txtWuStatus) { $txtWuStatus.Text = "Scanning for pending updates and drivers..." }
+            Update-WpfUI
+
+            $incDrivers = if ($chkCascadeDrivers) { [bool]$chkCascadeDrivers.IsChecked } else { $true }
+            $raw = @(Get-HubPendingWindowsUpdates -IncludeDrivers:$incDrivers -StatusCallback {
+                param($m)
+                if ($txtWuStatus) { $txtWuStatus.Text = $m }
+                Update-WpfUI
+            })
+
+            if ($progWuBar) { $progWuBar.IsIndeterminate = $false; $progWuBar.Value = 0 }
+            Update-IntegratedWuList -rawUpdates $raw
+            $btnWuScan.IsEnabled = $true
+            if ($integratedWuItems.Count -gt 0) {
+                if ($btnWuInstall) { $btnWuInstall.IsEnabled = $true }
+                if ($txtWuStatus) { $txtWuStatus.Text = "Found $($integratedWuItems.Count) update(s). Select updates and click 'Install Selected'." }
+            } else {
+                if ($txtWuStatus) { $txtWuStatus.Text = "System is up to date. No pending updates found." }
+            }
+        })
+    }
+
+    if ($btnWuSelectAll) {
+        $btnWuSelectAll.Add_Click({
+            foreach ($it in $integratedWuItems) { $it.IsSelected = $true }
+            if ($lstIntegratedUpdates) { $lstIntegratedUpdates.Items.Refresh() }
+        })
+    }
+
+    if ($btnWuDeselectAll) {
+        $btnWuDeselectAll.Add_Click({
+            foreach ($it in $integratedWuItems) { $it.IsSelected = $false }
+            if ($lstIntegratedUpdates) { $lstIntegratedUpdates.Items.Refresh() }
+        })
+    }
+
+    if ($btnWuTriggerUso) {
+        $btnWuTriggerUso.Add_Click({
+            $ok = Invoke-HubUsoScan
+            if ($ok) {
+                Write-HubLog "USO client interactive scan initiated in background." "INFO"
+                if ($txtWuStatus) { $txtWuStatus.Text = "USO Interactive Scan initiated in background." }
+            } else {
+                Write-HubLog "usoclient.exe not available on this system." "WARN"
+                if ($txtWuStatus) { $txtWuStatus.Text = "usoclient.exe not found on this system." }
+            }
+        })
+    }
+
+    if ($btnWuRebootNow) {
+        $btnWuRebootNow.Add_Click({
+            $ans = [System.Windows.MessageBox]::Show("Restart system now to complete update installation?`n`nThe Hub will register a resume task and re-launch automatically when the system boots back up.", "Confirm Restart", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+            if ($ans -eq [System.Windows.MessageBoxResult]::Yes) {
+                Register-HubResumeAfterRestart
+                Restart-Computer -Force
+            }
+        })
+    }
+
+    if ($btnWuInstall) {
+        $btnWuInstall.Add_Click({
+            $selected = @($integratedWuItems | Where-Object { $_.IsSelected -eq $true })
+            if ($selected.Count -eq 0) {
+                [System.Windows.MessageBox]::Show("Please select at least one update to install.", "No Updates Selected", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                return
+            }
+
+            $btnWuScan.IsEnabled = $false
+            $btnWuInstall.IsEnabled = $false
+            if ($progWuBar) { $progWuBar.Value = 0 }
+            if ($txtWuStatus) { $txtWuStatus.Text = "Preparing update download session..." }
+            Update-WpfUI
+
+            try {
+                Ensure-HubUpdateServices
+                $session = New-Object -ComObject Microsoft.Update.Session
+                $downloader = $session.CreateUpdateDownloader()
+                $downColl = New-Object -ComObject Microsoft.Update.UpdateColl
+
+                foreach ($it in $selected) {
+                    $uObj = $it.UpdateObject
+                    if ($uObj.EulaAccepted -eq $false) {
+                        try { $uObj.AcceptEula() } catch { }
+                    }
+                    $downColl.Add($uObj) | Out-Null
+                }
+
+                $downloader.Updates = $downColl
+                if ($txtWuStatus) { $txtWuStatus.Text = "Downloading $($downColl.Count) update package(s)..." }
+                if ($progWuBar) { $progWuBar.IsIndeterminate = $true }
+                Update-WpfUI
+
+                $downRes = $downloader.Download()
+                if ($progWuBar) { $progWuBar.IsIndeterminate = $false; $progWuBar.Value = 20 }
+
+                foreach ($it in $selected) {
+                    if ($it.UpdateObject.IsDownloaded) {
+                        $it.StatusText = "Downloaded"
+                        $it.StatusColor = "#60CDFF"
+                    }
+                }
+                if ($lstIntegratedUpdates) { $lstIntegratedUpdates.Items.Refresh() }
+                Update-WpfUI
+
+                $installer = $session.CreateUpdateInstaller()
+                $installer.ForceQuiet = $true
+                $total = $selected.Count
+                $instSucceeded = 0
+                $instFailed = 0
+                $manualRebootNeeded = $false
+
+                for ($i = 0; $i -lt $total; $i++) {
+                    $it = $selected[$i]
+                    $pct = 20 + [math]::Round((($i) / $total) * 75)
+                    if ($progWuBar) { $progWuBar.Value = $pct }
+                    if ($txtWuProgress) { $txtWuProgress.Text = "$pct%" }
+                    if ($txtWuStatus) { $txtWuStatus.Text = "Installing ($($i+1)/$total): $($it.Title)..." }
+                    $it.StatusText = "Installing..."
+                    $it.StatusColor = "#EAA300"
+                    if ($lstIntegratedUpdates) { $lstIntegratedUpdates.Items.Refresh() }
+                    Update-WpfUI
+
+                    $singleColl = New-Object -ComObject Microsoft.Update.UpdateColl
+                    $singleColl.Add($it.UpdateObject) | Out-Null
+                    $installer.Updates = $singleColl
+
+                    try {
+                        $instRes = $installer.Install()
+                        $code = $instRes.ResultCode
+                        if ($code -eq 2 -or $code -eq 3) {
+                            $it.StatusText = "Installed"
+                            $it.StatusColor = "#6CCB5F"
+                            $instSucceeded++
+                        } else {
+                            $it.StatusText = "Failed ($code)"
+                            $it.StatusColor = "#FF99A4"
+                            $instFailed++
+                        }
+                        if ($instRes.RebootRequired) {
+                            $manualRebootNeeded = $true
+                        }
+                    } catch {
+                        $it.StatusText = "Error"
+                        $it.StatusColor = "#FF99A4"
+                        $instFailed++
+                    }
+                    if ($lstIntegratedUpdates) { $lstIntegratedUpdates.Items.Refresh() }
+                    Update-WpfUI
+                }
+
+                if ($progWuBar) { $progWuBar.Value = 100 }
+                if ($txtWuProgress) { $txtWuProgress.Text = "100%" }
+                if ($txtWuStatus) { $txtWuStatus.Text = "Update complete: $instSucceeded installed, $instFailed failed." }
+                try { [System.Media.SystemSounds]::Asterisk.Play() } catch { }
+
+                if ($manualRebootNeeded) {
+                    if ($btnWuRebootNow) { $btnWuRebootNow.Visibility = [System.Windows.Visibility]::Visible }
+                    if ($txtWuRebootNotice) { $txtWuRebootNotice.Text = "Updates installed successfully. System restart is REQUIRED." }
+                    if ($chkCascadeAutoReboot -and $chkCascadeAutoReboot.IsChecked) {
+                        Start-RebootCountdown -Seconds 5 -OnComplete {
+                            Register-HubResumeAfterRestart
+                            Restart-Computer -Force
+                        }
+                    }
+                }
+            } catch {
+                if ($txtWuStatus) { $txtWuStatus.Text = "Installation error: $($_.Exception.Message)" }
+            } finally {
+                $btnWuScan.IsEnabled = $true
+            }
+        })
+    }
+
+    # --- TAB 6 ACTIONS (Lenovo Warranty, Battery Wear & Storage SMART) ---
     if ($btnCheckLenovoWarranty) {
         $btnCheckLenovoWarranty.Add_Click({
             $serial = if ($txtDellServiceTag -and -not [string]::IsNullOrWhiteSpace($txtDellServiceTag.Text)) { $txtDellServiceTag.Text.Trim() } else { $txtSerial.Text.Trim() }
@@ -7203,6 +7720,22 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     }
     Set-HubProgress -Percent 0 -Status "Ready"
 
+    # Check for active multi-pass autonomous Patch Cascade from a prior reboot
+    $cascadeState = Get-HubPatchCascadeState
+    if ($cascadeState) {
+        Write-HubLog "Active Patch Cascade detected (Pass $($cascadeState.CurrentPass) of $($cascadeState.MaxPasses), $($cascadeState.TotalInstalled) updates installed so far)." "INFO"
+        if ($mainTabControl -and $tabWinUpdate) {
+            $mainTabControl.SelectedItem = $tabWinUpdate
+        }
+        $cascadeResumeTimer = [System.Windows.Threading.DispatcherTimer]::new()
+        $cascadeResumeTimer.Interval = [TimeSpan]::FromSeconds(2)
+        $cascadeResumeTimer.Add_Tick({
+            $cascadeResumeTimer.Stop()
+            Invoke-GuiCascadePass
+        })
+        $cascadeResumeTimer.Start()
+    }
+
     # Show Window
     $window.ShowDialog() | Out-Null
 }
@@ -7341,6 +7874,20 @@ if ($ExportCsv) {
     Write-Host "`nAutopilotFast CSV Exporter" -ForegroundColor Cyan
     $res = Export-AutopilotCsv -Path $CsvPath -AutoDetectUsb -GroupTag $GroupTag -AssignedUser $AssignedUser -DeviceName $ComputerNameTemplate
     Write-Host "Exported to: $($res.Path)" -ForegroundColor Green
+    return
+}
+
+if ($PatchCascade) {
+    Write-Host "`nAutopilot Command Hub - Autonomous Patch Cascade Engine (OOBE Ready)" -ForegroundColor Cyan
+    if (-not $script:RuntimeContext.MeetsPreferred) {
+        Write-Host "Notice: Windows Update installation requires administrator privileges. Some updates may fail without elevation." -ForegroundColor Yellow
+    }
+    $res = Start-HubAutonomousPatchCascade -MaxPasses $MaxPasses -IncludeDrivers:$IncludeDrivers -StatusCallback { param($m) Write-Host "  $m" -ForegroundColor Gray }
+    if ($res.Completed) {
+        Write-Host "`nPatch Cascade completed successfully! Total updates installed: $($res.TotalInstalled)" -ForegroundColor Green
+    } elseif ($res.RebootRequired) {
+        Write-Host "`nPatch Cascade Pass $($res.CurrentPass) completed. Reboot scheduled for Pass $($res.NextPass)." -ForegroundColor Yellow
+    }
     return
 }
 
