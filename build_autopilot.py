@@ -364,6 +364,14 @@ function Set-HubAuthenticodeSignature {
     if (-not (Test-Path $FilePath)) { return $false }
     if (-not $script:RuntimeContext.IsElevated) { return $false }
 
+    # Ensure LocalMachine execution policy permits signed scripts without requiring -ExecutionPolicy Bypass
+    try {
+        $policy = Get-ExecutionPolicy -Scope LocalMachine -ErrorAction SilentlyContinue
+        if ($policy -in @('Restricted', 'Undefined')) {
+            Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
+
     try {
         # Check for existing valid code-signing certificate in LocalMachine\My
         $cert = Get-ChildItem -Path 'Cert:\LocalMachine\My' -ErrorAction SilentlyContinue | Where-Object {
@@ -375,8 +383,9 @@ function Set-HubAuthenticodeSignature {
             $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=Autopilot Provisioning Engine" -CertStoreLocation "Cert:\LocalMachine\My" -ErrorAction Stop
         }
 
-        # Export & import to Trusted Root and Trusted Publisher
-        $cerPath = Join-Path ([System.IO.Path]::GetTempPath()) 'hub_signing.cer'
+        # Export & import to Trusted Root and Trusted Publisher using unique temp file
+        $guidStr = [System.Guid]::NewGuid().ToString('N')
+        $cerPath = Join-Path ([System.IO.Path]::GetTempPath()) "hub_signing_$guidStr.cer"
         try {
             Export-Certificate -Cert $cert -FilePath $cerPath -Force -ErrorAction Stop | Out-Null
             Import-Certificate -FilePath $cerPath -CertStoreLocation 'Cert:\LocalMachine\Root' -ErrorAction Stop | Out-Null
@@ -385,17 +394,14 @@ function Set-HubAuthenticodeSignature {
             if (Test-Path $cerPath) { Remove-Item -Path $cerPath -Force -ErrorAction SilentlyContinue }
         }
 
+        # Check if already signed with valid signature
+        $existingSig = Get-AuthenticodeSignature -FilePath $FilePath -ErrorAction SilentlyContinue
+        if ($existingSig -and $existingSig.Status -eq 'Valid') {
+            return $true
+        }
+
         # Sign the script file
         $sigResult = Set-AuthenticodeSignature -FilePath $FilePath -Certificate $cert -ErrorAction Stop
-
-        # Ensure LocalMachine execution policy permits signed scripts without requiring -ExecutionPolicy Bypass
-        try {
-            $policy = Get-ExecutionPolicy -Scope LocalMachine -ErrorAction SilentlyContinue
-            if ($policy -in @('Restricted', 'Undefined')) {
-                Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force -ErrorAction SilentlyContinue
-            }
-        } catch { }
-
         return ($sigResult.Status -eq 'Valid')
     } catch {
         return $false
@@ -408,28 +414,32 @@ function Save-HubSelfCopy {
 
     # If running un-elevated on desktop, Program Files is read-only; fall back to Temp for UAC hand-off
     if (-not $script:RuntimeContext.IsElevated -and $Directory -eq $script:PersistRoot) {
-        try {
-            if (-not (Test-Path $Directory)) {
-                New-Item -ItemType Directory -Path $Directory -Force -ErrorAction Stop | Out-Null
-            }
-        } catch {
-            $Directory = Join-Path ([System.IO.Path]::GetTempPath()) 'AutopilotCommandHub'
-        }
+        $Directory = Join-Path ([System.IO.Path]::GetTempPath()) 'AutopilotCommandHub'
     }
 
     if (-not (Test-Path $Directory)) { New-Item -ItemType Directory -Path $Directory -Force | Out-Null }
     $target = Join-Path $Directory 'autopilot.ps1'
+    $resolvedTarget = if (Test-Path $target) { (Resolve-Path $target).Path } else { $target }
+
     if ($script:SelfScriptPath -and (Test-Path $script:SelfScriptPath)) {
-        if ((Resolve-Path $script:SelfScriptPath).Path -ne $target) { Copy-Item -Path $script:SelfScriptPath -Destination $target -Force }
+        $resolvedSource = (Resolve-Path $script:SelfScriptPath).Path
+        if (-not $resolvedSource.Equals($resolvedTarget, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Copy-Item -Path $script:SelfScriptPath -Destination $target -Force
+        }
     } elseif ($script:SelfSource) {
         [System.IO.File]::WriteAllText($target, $script:SelfSource, [System.Text.UTF8Encoding]::new($false))
     } else {
         throw "Cannot locate the running script's source to persist it."
     }
+
     # Carry the active .env so tenant defaults survive the relaunch
     if ($script:LoadedEnvPath -and (Test-Path $script:LoadedEnvPath)) {
         $envTarget = Join-Path $Directory '.env'
-        if ((Resolve-Path $script:LoadedEnvPath).Path -ne $envTarget) { Copy-Item -Path $script:LoadedEnvPath -Destination $envTarget -Force }
+        $resolvedEnvTarget = if (Test-Path $envTarget) { (Resolve-Path $envTarget).Path } else { $envTarget }
+        $resolvedEnvSource = (Resolve-Path $script:LoadedEnvPath).Path
+        if (-not $resolvedEnvSource.Equals($resolvedEnvTarget, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Copy-Item -Path $script:LoadedEnvPath -Destination $envTarget -Force
+        }
     }
 
     # Strategy B: Autonomous Local Authenticode Code-Signing in OOBE / Elevated mode
@@ -443,9 +453,11 @@ function Save-HubSelfCopy {
 }
 
 function Get-HubRelaunchArguments {
-    param([Parameter(Mandatory = $true)][string]$ScriptPath, [switch]$Resume, [switch]$Replacing)
-    # Strategy B: Dropped -ExecutionPolicy Bypass entirely from process command line
-    $argList = @('-NoProfile', '-STA', '-File', "`"$ScriptPath`"")
+    param([Parameter(Mandatory = $true)][string]$ScriptPath, [switch]$Resume, [switch]$Replacing, [switch]$AllowBypass)
+    # Strategy B: Dropped -ExecutionPolicy Bypass from scheduled tasks and persistent hooks
+    $argList = @('-NoProfile')
+    if ($AllowBypass) { $argList += @('-ExecutionPolicy', 'Bypass') }
+    $argList += @('-STA', '-File', "`"$ScriptPath`"")
     $envCandidate = Join-Path (Split-Path $ScriptPath -Parent) '.env'
     if (Test-Path $envCandidate) { $argList += @('-EnvFile', "`"$envCandidate`"") }
     if ($Resume) { $argList += '-ResumeFromRestart' }
@@ -458,7 +470,7 @@ function Invoke-HubElevatedRelaunch {
     $path = Save-HubSelfCopy
     # -Replacing tells the elevated child this is a hand-off, so it waits for our single-instance mutex
     # instead of bailing out with "already running" (the old Catch-22 where the elevated window never showed).
-    $argLine = Get-HubRelaunchArguments -ScriptPath $path -Replacing
+    $argLine = Get-HubRelaunchArguments -ScriptPath $path -Replacing -AllowBypass
     Start-Process -FilePath $script:RuntimeContext.HostPath -ArgumentList $argLine -Verb RunAs -ErrorAction Stop | Out-Null
     # Release our instance mutex now so the elevated child can take it as this window closes.
     try {
@@ -619,15 +631,24 @@ function Register-HubResumeAfterRestart {
         $envParam = if (Test-Path $envCandidate) { " -EnvFile `"`"$envCandidate`"`"" } else { "" }
         $cmdLine = "`"$hostExe`" -NoProfile -STA -File `"`"$path`"`"$envParam -ResumeFromRestart"
 
-        $hookBlock = "@echo off`r`nREM --- AutopilotCommandHub SetupComplete Hook ---`r`nstart `"`" $cmdLine`r`n"
+        $hookBlock = "REM --- AutopilotCommandHub SetupComplete Hook ---`r`nstart `"`" $cmdLine`r`nREM --- End AutopilotCommandHub Hook ---"
 
         if (Test-Path $setupCompletePath) {
             $existing = Get-Content -Path $setupCompletePath -Raw -ErrorAction SilentlyContinue
             if ($existing -notlike '*AutopilotCommandHub*') {
-                Add-Content -Path $setupCompletePath -Value "`r`n$hookBlock" -Encoding Ascii -Force
+                # Prepend hook so OEM exit statements (e.g. exit /b 0) cannot bypass execution
+                $hasEchoOff = ($existing -match '(?i)^\s*@echo\s+off')
+                if ($hasEchoOff) {
+                    $cleaned = $existing -replace '(?i)^\s*@echo\s+off\s*(\r?\n)?', ''
+                    $newContent = "@echo off`r`n$hookBlock`r`n$cleaned"
+                } else {
+                    $newContent = "$hookBlock`r`n$existing"
+                }
+                [System.IO.File]::WriteAllText($setupCompletePath, $newContent, [System.Text.UTF8Encoding]::new($false))
             }
         } else {
-            [System.IO.File]::WriteAllText($setupCompletePath, $hookBlock, [System.Text.Encoding]::ASCII)
+            $newContent = "@echo off`r`n$hookBlock`r`n"
+            [System.IO.File]::WriteAllText($setupCompletePath, $newContent, [System.Text.UTF8Encoding]::new($false))
         }
     } else {
         # Desktop interactive session: Scheduled Task executing from %ProgramFiles% without -ExecutionPolicy Bypass
@@ -658,7 +679,7 @@ function Unregister-HubResumeAfterRestart {
                 if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed -eq '@echo off') {
                     Remove-Item -Path $setupCompletePath -Force -ErrorAction SilentlyContinue
                 } else {
-                    [System.IO.File]::WriteAllText($setupCompletePath, ($lines -join "`r`n"), [System.Text.Encoding]::ASCII)
+                    [System.IO.File]::WriteAllText($setupCompletePath, ($lines -join "`r`n"), [System.Text.UTF8Encoding]::new($false))
                 }
                 $removed = $true
             }
