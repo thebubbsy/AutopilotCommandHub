@@ -4094,6 +4094,7 @@ function Start-AutopilotHubGui {
         <Style TargetType="{x:Type ListViewItem}">
             <Setter Property="Foreground" Value="#FFFFFF"/>
             <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
             <Setter Property="Padding" Value="4,4"/>
             <Setter Property="BorderThickness" Value="0"/>
             <Setter Property="Template">
@@ -4980,32 +4981,51 @@ function Start-AutopilotHubGui {
 
                     <!-- Updates List Grid View -->
                     <Border Grid.Row="2" Background="#1A1A1A" CornerRadius="4" BorderBrush="#383838" BorderThickness="1">
-                        <ListView Name="LstIntegratedUpdates" Background="Transparent" BorderThickness="0" Foreground="#FFFFFF" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
-                            <ListView.ItemTemplate>
-                                <DataTemplate>
-                                    <Border BorderBrush="#282828" BorderThickness="0,0,0,1" Padding="6,7">
-                                        <Grid>
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="30"/>
-                                                <ColumnDefinition Width="80"/>
-                                                <ColumnDefinition Width="*"/>
-                                                <ColumnDefinition Width="80"/>
-                                                <ColumnDefinition Width="130"/>
-                                            </Grid.ColumnDefinitions>
-                                            <CheckBox IsChecked="{Binding IsSelected}" VerticalAlignment="Center" HorizontalAlignment="Center"/>
-                                            <Border Grid.Column="1" Background="{Binding BadgeBackground}" CornerRadius="3" Padding="4,2" HorizontalAlignment="Center" VerticalAlignment="Center">
-                                                <TextBlock Text="{Binding CategoryText}" FontSize="9.5" FontWeight="Bold" Foreground="{Binding BadgeForeground}"/>
-                                            </Border>
-                                            <StackPanel Grid.Column="2" VerticalAlignment="Center" Margin="8,0,8,0">
-                                                <TextBlock Text="{Binding Title}" FontSize="11.5" FontWeight="SemiBold" Foreground="#FFFFFF" TextWrapping="Wrap"/>
-                                                <TextBlock Text="{Binding Subtitle}" FontSize="10" Foreground="#8A8A8A" Margin="0,2,0,0"/>
-                                            </StackPanel>
-                                            <TextBlock Grid.Column="3" Text="{Binding SizeText}" FontSize="11" Foreground="#B0B0B0" VerticalAlignment="Center" HorizontalAlignment="Right" Margin="0,0,8,0"/>
-                                            <TextBlock Grid.Column="4" Text="{Binding StatusText}" FontSize="11" FontWeight="SemiBold" Foreground="{Binding StatusColor}" VerticalAlignment="Center" HorizontalAlignment="Right" Margin="0,0,8,0"/>
-                                        </Grid>
-                                    </Border>
-                                </DataTemplate>
-                            </ListView.ItemTemplate>
+                        <ListView Name="LstIntegratedUpdates" Background="#1F1F1F" BorderThickness="0" Foreground="#FFFFFF">
+                            <ListView.View>
+                                <GridView>
+                                    <GridViewColumn Header="Select" Width="50">
+                                        <GridViewColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <CheckBox IsChecked="{Binding IsSelected}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                            </DataTemplate>
+                                        </GridViewColumn.CellTemplate>
+                                    </GridViewColumn>
+                                    <GridViewColumn Header="Type" Width="85">
+                                        <GridViewColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <Border Background="{Binding BadgeBackground}" CornerRadius="3" Padding="6,2" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                                    <TextBlock Text="{Binding CategoryText}" FontSize="9.5" FontWeight="Bold" Foreground="{Binding BadgeForeground}"/>
+                                                </Border>
+                                            </DataTemplate>
+                                        </GridViewColumn.CellTemplate>
+                                    </GridViewColumn>
+                                    <GridViewColumn Header="Update / Driver Description" Width="780">
+                                        <GridViewColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <StackPanel VerticalAlignment="Center" Margin="2,2,8,2">
+                                                    <TextBlock Text="{Binding Title}" FontSize="11.5" FontWeight="SemiBold" Foreground="#FFFFFF" TextWrapping="Wrap"/>
+                                                    <TextBlock Text="{Binding Subtitle}" FontSize="10" Foreground="#8A8A8A" Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                                </StackPanel>
+                                            </DataTemplate>
+                                        </GridViewColumn.CellTemplate>
+                                    </GridViewColumn>
+                                    <GridViewColumn Header="Size" Width="85">
+                                        <GridViewColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBlock Text="{Binding SizeText}" FontSize="11" Foreground="#B0B0B0" VerticalAlignment="Center" HorizontalAlignment="Right" Margin="0,0,8,0"/>
+                                            </DataTemplate>
+                                        </GridViewColumn.CellTemplate>
+                                    </GridViewColumn>
+                                    <GridViewColumn Header="Status" Width="140">
+                                        <GridViewColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBlock Text="{Binding StatusText}" FontSize="11" FontWeight="SemiBold" Foreground="{Binding StatusColor}" VerticalAlignment="Center" Margin="4,0,8,0"/>
+                                            </DataTemplate>
+                                        </GridViewColumn.CellTemplate>
+                                    </GridViewColumn>
+                                </GridView>
+                            </ListView.View>
                         </ListView>
                     </Border>
                 </Grid>
@@ -7051,6 +7071,9 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
             if ($u.Description) {
                 $descShort = if ($u.Description.Length -gt 80) { $u.Description.Substring(0, 80) + '...' } else { $u.Description }
                 $sub = if ($sub) { "$sub - $descShort" } else { $descShort }
+            }
+            if (-not $sub) {
+                $sub = if ($u.IsDriver) { "Hardware Device Driver" } else { "System Component Update" }
             }
 
             $item = [PSCustomObject]@{
