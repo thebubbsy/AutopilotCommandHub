@@ -31,7 +31,8 @@ def test_xaml_remediation_tab():
     # Verify buttons exist in XAML
     expected_buttons = [
         'BtnHybDcLadder', 'BtnHybScp', 'BtnHybCoMgmtAllIntune', 'BtnHybCoMgmtAllCcm', 'BtnHybCoMgmtPilot',
-        'BtnHybKerbDiag', 'BtnHybKerbPurge', 'BtnHybPrtDiag', 'BtnHybResetBroker', 'BtnHybCertPulse', 'BtnHybScepHealth',
+        'BtnHybKerbDiag', 'BtnHybKerbPurge', 'BtnHybSpn', 'BtnHybPrtDiag', 'BtnHybAadToken', 'BtnHybResetBroker',
+        'BtnHybCertPulse', 'BtnHybScepHealth',
         'BtnFixHealthReadout', 'BtnFixWmi', 'BtnFixWu', 'BtnFixCatroot', 'BtnFixBits', 'BtnFixDcom',
         'BtnFixSpooler', 'BtnFixNetStack', 'BtnFixWinRm', 'BtnFixProfiles', 'BtnFixTpm', 'BtnFixAppX'
     ]
@@ -50,6 +51,8 @@ def test_powershell_functions_execution():
     $k = Get-KerberosDiagnostics
     $s = Get-ScepCertificateHealth
     $p = Get-EntraPrtDiagnostics
+    $spn = Test-ComputerSpnRegistration
+    $tok = Test-EntraTokenAcquisition
     $l = Test-DomainControllerLadder -TargetDc '127.0.0.1' -TimeoutMs 200
 
     [PSCustomObject]@{{
@@ -58,6 +61,8 @@ def test_powershell_functions_execution():
         KerberosMessage   = $k.Message
         ScepCount         = $s.Count
         PrtChecked        = ($null -ne $p.HasPrt)
+        SpnChecked        = ($null -ne $spn.Status)
+        TokenAcqChecked   = ($null -ne $tok.Verdict)
         LadderApplicable  = $l.Applicable
         LadderPortCount   = $l.Ports.Count
     }} | ConvertTo-Json
@@ -74,9 +79,13 @@ def test_powershell_functions_execution():
     print(f"  WMI Subsystem Healthy: {data['HealthOverviewWmi']}")
     print(f"  BITS Service Status:   {data['HealthOverviewBits']}")
     print(f"  Kerberos Result:       {data['KerberosMessage']}")
+    print(f"  SPN Status Checked:    {data['SpnChecked']}")
+    print(f"  Token Acq Checked:     {data['TokenAcqChecked']}")
     print(f"  DC Ladder Ports:       {data['LadderPortCount']} ports tested")
     assert data['LadderPortCount'] == 9, f"Expected 9 DC ladder ports, got {data['LadderPortCount']}"
     assert data['PrtChecked'] is True, "Expected PRT check to produce boolean"
+    assert data['SpnChecked'] is True, "Expected SPN check to produce status"
+    assert data['TokenAcqChecked'] is True, "Expected token acquisition to produce verdict"
     print("  [PASS] All core PowerShell diagnostic and remediation engines executed cleanly.")
 
 def test_ps51_ast():
@@ -98,6 +107,22 @@ def test_ps51_ast():
     assert res.returncode == 0 and 'PS51_PARSE_OK' in res.stdout, f"PS5.1 AST Parse failed: {res.stderr}\n{res.stdout}"
     print("  [PASS] PowerShell 5.1 AST syntax parse: 100% clean (zero errors).")
 
+def test_encoding_and_ascii():
+    print("\n--- Test 4: UTF-8 Without BOM & Pure ASCII Verification ---")
+    for fname in ['autopilot.ps1', 'autopilot']:
+        fpath = os.path.join(repo_dir, fname)
+        with open(fpath, 'rb') as f:
+            raw = f.read()
+
+        # Check BOM: UTF-8 BOM is 0xEF, 0xBB, 0xBF. First 4 bytes must be '<#\n.' -> [60, 35, 10, 46]
+        prefix = list(raw[:4])
+        assert prefix == [60, 35, 10, 46], f"{fname} has invalid magic bytes: {prefix}, expected [60, 35, 10, 46] (no BOM)"
+
+        # Check ASCII
+        non_ascii = [(idx, b) for idx, b in enumerate(raw) if b > 127]
+        assert len(non_ascii) == 0, f"{fname} contains {len(non_ascii)} non-ASCII bytes! First at {non_ascii[:5]}"
+        print(f"  [PASS] {fname}: {len(raw)} bytes, UTF-8 without BOM, 100% pure ASCII.")
+
 if __name__ == '__main__':
     print("==================================================================")
     print(" HYBRID & PRECISION ENTERPRISE REMEDIATION VERIFICATION SUITE")
@@ -105,6 +130,7 @@ if __name__ == '__main__':
     test_xaml_remediation_tab()
     test_powershell_functions_execution()
     test_ps51_ast()
+    test_encoding_and_ascii()
     print("\n==================================================================")
     print(" ALL ENTERPRISE SUITES PASSED CLEANLY (100% EMPIRICAL VERIFICATION)")
     print("==================================================================")

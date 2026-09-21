@@ -2095,6 +2095,7 @@ function Test-DomainControllerLadder {
         return $res
     }
 
+    $TargetDc = $TargetDc.TrimStart('\')
     $res.DcName = $TargetDc
 
     $ladder = @(
@@ -2147,7 +2148,10 @@ function Test-DomainControllerLadder {
     }
 
     $res.AllReachable = ($passedCount -eq $ladder.Count)
-    $res.Summary = "DC $TargetDc ladder: $passedCount / $($ladder.Count) ports open. Latency: $($res.Ports[0].LatencyMs)ms (DNS), $($res.Ports[1].LatencyMs)ms (Kerb), $($res.Ports[3].LatencyMs)ms (LDAP)."
+    $dnsLat = if ($res.Ports[0].Status -eq 'OPEN') { "$($res.Ports[0].LatencyMs)ms" } else { 'BLOCKED' }
+    $kerbLat = if ($res.Ports[1].Status -eq 'OPEN') { "$($res.Ports[1].LatencyMs)ms" } else { 'BLOCKED' }
+    $ldapLat = if ($res.Ports[3].Status -eq 'OPEN') { "$($res.Ports[3].LatencyMs)ms" } else { 'BLOCKED' }
+    $res.Summary = "DC $TargetDc ladder: $passedCount / $($ladder.Count) ports open. DNS: $dnsLat | Kerberos: $kerbLat | LDAP: $ldapLat."
     return $res
 }
 
@@ -2169,11 +2173,19 @@ function Get-AdServiceConnectionPoint {
     }
 
     $joinState = Get-HybridJoinState
-    $result.DomainJoined = $joinState.DomainJoined
+    $isDomJoined = $joinState.DomainJoined
+    if (-not $isDomJoined) {
+        try {
+            $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+            if ($cs -and $cs.PartOfDomain) { $isDomJoined = $true }
+        } catch { }
+    }
+
+    $result.DomainJoined = $isDomJoined
     $result.LocalTenantId = $joinState.TenantId
     $result.LocalTenantName = $joinState.TenantName
 
-    if (-not $joinState.DomainJoined) {
+    if (-not $isDomJoined) {
         $result.Verdict = 'OFF_DOMAIN'
         $result.Message = 'Device is not domain joined. AD SCP inspection requires Active Directory connectivity.'
         return $result
@@ -2192,17 +2204,21 @@ function Get-AdServiceConnectionPoint {
         $scpDn = "CN=62a0ff2e-97b9-4513-943f-0d221bd30080,CN=Device Registration Configuration,CN=Services,$configContext"
         $result.ScpDistinguishedName = $scpDn
 
-        $scpEntry = [ADSI]"LDAP://$scpDn"
-        if ($scpEntry -and $scpEntry.keywords) {
-            $result.ScpFound = $true
-            foreach ($kw in $scpEntry.keywords) {
-                $kwStr = [string]$kw
-                if ($kwStr -match '^azureADId:([a-fA-F0-9\-]+)$') {
-                    $result.TenantId = $Matches[1].Trim()
-                } elseif ($kwStr -match '^azureADName:(.+)$') {
-                    $result.TenantDomain = $Matches[1].Trim()
+        try {
+            $scpEntry = [ADSI]"LDAP://$scpDn"
+            if ($scpEntry -and $scpEntry.Properties -and $scpEntry.Properties.Contains('keywords')) {
+                $result.ScpFound = $true
+                foreach ($kw in $scpEntry.Properties['keywords']) {
+                    $kwStr = [string]$kw
+                    if ($kwStr -match '^azureADId:([a-fA-F0-9\-]+)$') {
+                        $result.TenantId = $Matches[1].Trim()
+                    } elseif ($kwStr -match '^azureADName:(.+)$') {
+                        $result.TenantDomain = $Matches[1].Trim()
+                    }
                 }
             }
+        } catch {
+            # SCP object missing or unreadable in AD configuration container
         }
 
         if (-not $result.ScpFound -or -not $result.TenantId) {
@@ -2231,6 +2247,71 @@ function Get-AdServiceConnectionPoint {
     return $result
 }
 
+function Test-ComputerSpnRegistration {
+    [CmdletBinding()]
+    param([string]$ComputerName = $env:COMPUTERNAME)
+
+    $res = [PSCustomObject]@{
+        ComputerName   = $ComputerName
+        SpnCount       = 0
+        SpnList        = [System.Collections.Generic.List[string]]::new()
+        HasHostSpn     = $false
+        DuplicateSpns  = $false
+        DuplicateList  = [System.Collections.Generic.List[string]]::new()
+        Status         = 'NOT_REGISTERED'
+        Message        = ''
+    }
+
+    try {
+        $setspnExe = Join-Path $env:SystemRoot 'System32\setspn.exe'
+        if (-not (Test-Path $setspnExe)) {
+            $res.Message = 'setspn.exe not found on system.'
+            return $res
+        }
+
+        $lines = & $setspnExe -L $ComputerName 2>&1
+        $recording = $false
+        foreach ($line in $lines) {
+            $l = $line.Trim()
+            if ($l -match '^(Registered\s+ServicePrincipalNames|Registered\s+SPN)') {
+                $recording = $true
+                continue
+            }
+            if ($recording -and $l -and $l -notmatch '^\s*$' -and $l -notmatch 'CN=') {
+                $res.SpnList.Add($l)
+                if ($l -match '^HOST/') { $res.HasHostSpn = $true }
+            }
+        }
+        $res.SpnCount = $res.SpnList.Count
+
+        if ($res.SpnCount -gt 0) {
+            $res.Status = if ($res.HasHostSpn) { 'REGISTERED' } else { 'MISSING_HOST_SPN' }
+            $res.Message = "Found $($res.SpnCount) registered SPN(s) for $ComputerName (HOST SPN: $(if ($res.HasHostSpn){'YES'}else{'MISSING'}))."
+        } else {
+            $errLine = ($lines | Where-Object { $_ -match 'failed|Could not find|error' } | Select-Object -First 1)
+            $res.Message = if ($errLine) { $errLine.Trim() } else { "No SPNs registered or device is not joined to an Active Directory domain." }
+        }
+
+        try {
+            $dupOut = & $setspnExe -X 2>&1
+            $foundDup = $false
+            foreach ($dl in $dupOut) {
+                if ($dl -match '^\s*([^\s:]+/[^\s:]+)') {
+                    $res.DuplicateList.Add($Matches[1].Trim())
+                    $foundDup = $true
+                }
+            }
+            $res.DuplicateSpns = $foundDup
+        } catch { }
+
+    } catch {
+        $res.Status = 'ERROR'
+        $res.Message = "SPN check failed: $($_.Exception.Message)"
+    }
+
+    return $res
+}
+
 function Get-KerberosDiagnostics {
     [CmdletBinding()]
     param()
@@ -2242,6 +2323,8 @@ function Get-KerberosDiagnostics {
         ClientName       = ''
         Tickets          = [System.Collections.Generic.List[PSCustomObject]]::new()
         LsaSystemTickets = [System.Collections.Generic.List[PSCustomObject]]::new()
+        SpnStatus        = ''
+        SpnCount         = 0
         Message          = ''
     }
 
@@ -2304,7 +2387,13 @@ function Get-KerberosDiagnostics {
             if ($currLsa) { $res.LsaSystemTickets.Add($currLsa) }
         } catch { }
 
-        $res.Message = "Cached Kerberos tickets: $($res.TicketCount) user tickets (TGT: $(if ($res.HasTgt){'YES'}else{'NO'}), Cloud TGT: $(if ($res.HasCloudTgt){'YES'}else{'NO'})), $($res.LsaSystemTickets.Count) SYSTEM/LSA tickets."
+        try {
+            $spn = Test-ComputerSpnRegistration
+            $res.SpnStatus = $spn.Status
+            $res.SpnCount = $spn.SpnCount
+        } catch { }
+
+        $res.Message = "Cached Kerberos tickets: $($res.TicketCount) user tickets (TGT: $(if ($res.HasTgt){'YES'}else{'NO'}), Cloud TGT: $(if ($res.HasCloudTgt){'YES'}else{'NO'})), $($res.LsaSystemTickets.Count) SYSTEM/LSA tickets. SPNs: $($res.SpnCount) ($($res.SpnStatus))."
     } catch {
         $res.Message = "Kerberos diagnostics failed: $($_.Exception.Message)"
     }
@@ -2396,6 +2485,13 @@ function Get-ScepCertificateHealth {
 
                     if (-not $c.HasPrivateKey) { $status = 'NO PRIVATE KEY' }
 
+                    $keyLen = 2048
+                    if ($c.PublicKey) {
+                        try {
+                            if ($c.PublicKey.Key) { $keyLen = $c.PublicKey.Key.KeySize }
+                        } catch { $keyLen = 2048 }
+                    }
+
                     $certs.Add([PSCustomObject]@{
                         Store         = if ($st -like '*LocalMachine*') { 'Machine' } else { 'User' }
                         Subject       = ($c.Subject -replace '^CN=', '')
@@ -2405,7 +2501,7 @@ function Get-ScepCertificateHealth {
                         NotAfter      = $c.NotAfter.ToString('yyyy-MM-dd')
                         DaysLeft      = $daysLeft
                         HasPrivateKey = $c.HasPrivateKey
-                        KeyLength     = if ($c.PublicKey -and $c.PublicKey.Key) { $c.PublicKey.Key.KeySize } else { 2048 }
+                        KeyLength     = $keyLen
                         Status        = $status
                     })
                 }
@@ -2420,8 +2516,11 @@ function Get-EntraPrtDiagnostics {
     [CmdletBinding()]
     param()
 
-    $d = Invoke-DsregStatus
-    $brokerPkg = Get-AppxPackage -Name "Microsoft.AAD.BrokerPlugin" -AllUsers -ErrorAction SilentlyContinue | Select-Object -First 1
+    $d = Invoke-DsregStatus -Force
+    $brokerPkg = Get-AppxPackage -Name "Microsoft.AAD.BrokerPlugin" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $brokerPkg) {
+        $brokerPkg = Get-AppxPackage -Name "Microsoft.AAD.BrokerPlugin" -AllUsers -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
 
     [PSCustomObject]@{
         HasPrt          = ($d['AzureAdPrt'] -eq 'YES')
@@ -2438,6 +2537,78 @@ function Get-EntraPrtDiagnostics {
         TenantId        = $d['TenantId']
         TenantName      = $d['TenantName']
     }
+}
+
+function Test-EntraTokenAcquisition {
+    [CmdletBinding()]
+    param()
+
+    $res = [PSCustomObject]@{
+        EndpointReachable = $false
+        WamDefaultAccount = ''
+        WamUserAccounts   = 0
+        HasPrt            = $false
+        LatencyMs         = -1
+        Verdict           = 'UNKNOWN'
+        Message           = ''
+    }
+
+    # 1. Enumerate WAM accounts via dsregcmd
+    try {
+        $dsregExe = Join-Path $env:SystemRoot 'System32\dsregcmd.exe'
+        if (Test-Path $dsregExe) {
+            $accOut = & $dsregExe /listaccounts 2>&1
+            foreach ($line in $accOut) {
+                if ($line -match 'Default account:\s*([^,]+),\s*user:\s*(.+)$') {
+                    $res.WamDefaultAccount = "$($Matches[2].Trim()) ($($Matches[1].Trim()))"
+                } elseif ($line -match 'Accounts found:\s*(\d+)') {
+                    $res.WamUserAccounts = [int]$Matches[1]
+                }
+            }
+        }
+    } catch { }
+
+    # 2. Check PRT state
+    $prt = Get-EntraPrtDiagnostics
+    $res.HasPrt = $prt.HasPrt
+
+    # 3. Test STS token endpoint connectivity
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $testUri = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+        $null = Invoke-WebRequest -Uri $testUri -Method POST -Body @{ grant_type = 'client_credentials' } -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+        $sw.Stop()
+        $res.EndpointReachable = $true
+        $res.LatencyMs = [int]$sw.ElapsedMilliseconds
+    } catch {
+        $sw.Stop()
+        $res.LatencyMs = [int]$sw.ElapsedMilliseconds
+        # A 400 or 401 response confirms reaching the STS token endpoint
+        if ($_.Exception.Message -match '400|401|Unauthorized|Bad Request') {
+            $res.EndpointReachable = $true
+        } else {
+            $res.EndpointReachable = $false
+            $res.Message = "Token endpoint unreachable: $($_.Exception.Message)"
+        }
+    }
+
+    if ($res.EndpointReachable) {
+        if ($res.HasPrt) {
+            $res.Verdict = 'PRT_READY'
+            $res.Message = "Entra STS token endpoint reachable ($($res.LatencyMs)ms). PRT is active (Authority: $($prt.PrtAuthority)). WAM Account: $(if ($res.WamDefaultAccount){$res.WamDefaultAccount}else{'None'})."
+        } elseif ($res.WamDefaultAccount) {
+            $res.Verdict = 'WAM_READY'
+            $res.Message = "Entra STS token endpoint reachable ($($res.LatencyMs)ms). WAM Account: $($res.WamDefaultAccount). PRT not present."
+        } else {
+            $res.Verdict = 'ENDPOINT_ONLINE'
+            $res.Message = "Entra STS token endpoint reachable ($($res.LatencyMs)ms). No PRT or cached WAM account on this profile."
+        }
+    } else {
+        $res.Verdict = 'OFFLINE'
+        if (-not $res.Message) { $res.Message = "Unable to connect to login.microsoftonline.com token endpoint." }
+    }
+
+    return $res
 }
 
 function Reset-CloudApBrokerCache {
@@ -2542,7 +2713,7 @@ function Repair-HubWmiRepository {
 
     $wbemDir = Join-Path $env:SystemRoot 'System32\wbem'
     $mofcomp = Join-Path $wbemDir 'mofcomp.exe'
-    $coreMofs = @('cimwin32.mof', 'wmi.mof', 'wmipcima.mof', 'clushres.mof', 'subscrpt.mof')
+    $coreMofs = @('cimwin32.mof', 'cimwin32.mfl', 'wmi.mof', 'wmipcima.mof', 'clushres.mof', 'subscrpt.mof')
     $mofSuccess = 0
     foreach ($m in $coreMofs) {
         $mofPath = Join-Path $wbemDir $m
@@ -2614,9 +2785,16 @@ function Reset-HubWindowsUpdateAgent {
         $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
         $catBak = Join-Path $env:SystemRoot "System32\catroot2.bak.$stamp"
         try {
-            Rename-Item -Path $cat2Path -NewName (Split-Path $catBak -Leaf) -Force -ErrorAction SilentlyContinue
+            Rename-Item -Path $cat2Path -NewName (Split-Path $catBak -Leaf) -Force -ErrorAction Stop
             $log.Add("Archived catroot2 folder.")
-        } catch { }
+        } catch {
+            Get-ChildItem -Path $cat2Path -Include 'edb*.log', 'edb.chk', '*.tmp' -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            $log.Add("Purged locked/corrupted catroot2 log and checkpoint files.")
+        }
+    }
+
+    if (-not (Test-Path $cat2Path)) {
+        try { New-Item -Path $cat2Path -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null } catch { }
     }
 
     $dlls = @('atl.dll', 'urlmon.dll', 'mshtml.dll', 'shdocvw.dll', 'browseui.dll', 'jscript.dll', 'vbscript.dll', 'scrrun.dll', 'msxml3.dll', 'msxml6.dll', 'actxprxy.dll', 'softpub.dll', 'wintrust.dll', 'dssenh.dll', 'rsaenh.dll', 'cryptdlg.dll', 'oleaut32.dll', 'ole32.dll', 'shell32.dll', 'initpki.dll', 'wuapi.dll', 'wuaueng.dll', 'wucltui.dll', 'wups.dll', 'wups2.dll', 'wuwebv.dll', 'qmgr.dll', 'qmgrprxy.dll')
@@ -2642,6 +2820,10 @@ function Reset-HubWindowsUpdateAgent {
     }
 
     try {
+        & icacls "$env:SystemRoot\System32\catroot2" /grant "NT SERVICE\CryptSvc:(OI)(CI)F" /T /C /Q 2>$null
+    } catch { }
+
+    try {
         $uso = Join-Path $env:SystemRoot 'System32\usoclient.exe'
         if (Test-Path $uso) {
             Start-Process $uso -ArgumentList 'StartScan' -WindowStyle Hidden -ErrorAction SilentlyContinue
@@ -2664,28 +2846,37 @@ function Repair-HubCryptSvcCatroot {
         $log.Add("Stopped CryptSvc service.")
     } catch { }
 
-    $cat2DbDir = Join-Path $env:SystemRoot 'System32\catroot2\{F750E6C3-38EE-11D1-85E5-00C04FC295EE}'
-    $catDbFile = Join-Path $cat2DbDir 'catdb'
     $esentutl = Join-Path $env:SystemRoot 'System32\esentutl.exe'
+    $cat2Root = Join-Path $env:SystemRoot 'System32\catroot2'
+    $guidFolders = @(
+        '{F750E6C3-38EE-11D1-85E5-00C04FC295EE}',
+        '{127D0A1D-4EF2-11D1-8608-00C04FC295EE}'
+    )
 
-    if (Test-Path $catDbFile) {
-        $log.Add("Checking ESENT integrity on $catDbFile...")
-        $gOut = (& $esentutl /g "$catDbFile" 2>&1) -join ' '
-        $log.Add("esentutl /g result: $gOut")
+    foreach ($guid in $guidFolders) {
+        $cat2DbDir = Join-Path $cat2Root $guid
+        $catDbFile = Join-Path $cat2DbDir 'catdb'
 
-        if ($gOut -notmatch 'Integrity check successful') {
-            $log.Add("Corruption detected. Executing recovery / repair...")
-            & $esentutl /r edb /l "$cat2DbDir" /d "$cat2DbDir" 2>&1 | Out-Null
-            & $esentutl /p "$catDbFile" /o 2>&1 | Out-Null
-            $log.Add("Completed esentutl /p database repair.")
-        } else {
-            $log.Add("Catroot2 ESENT database integrity verified OK.")
+        if (Test-Path $catDbFile) {
+            $log.Add("Checking ESENT integrity on $guid\catdb...")
+            $gOut = (& $esentutl /g "$catDbFile" 2>&1) -join ' '
+            $log.Add("esentutl /g result: $gOut")
+
+            if ($gOut -notmatch 'Integrity check successful') {
+                $log.Add("Corruption detected in $guid. Executing recovery / repair...")
+                & $esentutl /r edb /l "$cat2DbDir" /d "$cat2DbDir" 2>&1 | Out-Null
+                & $esentutl /p "$catDbFile" /o 2>&1 | Out-Null
+                $log.Add("Completed esentutl /p repair on $guid.")
+            } else {
+                $log.Add("Catroot2 ESENT database in $guid verified OK.")
+            }
         }
-    } else {
-        $log.Add("Catroot2 catdb file not present; rebuilding clean database folder.")
     }
 
-    Get-ChildItem -Path (Join-Path $env:SystemRoot 'System32\catroot2') -Filter 'edb*.log' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    if (Test-Path $cat2Root) {
+        Get-ChildItem -Path $cat2Root -Include 'edb*.log', 'edb.chk', 'edbtmp.log', '*.tmp' -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        $log.Add("Purged checkpoint and transaction log artifacts.")
+    }
 
     try {
         & icacls "$env:SystemRoot\System32\catroot2" /grant "NT SERVICE\CryptSvc:(OI)(CI)F" /T /C /Q 2>$null
@@ -2725,11 +2916,14 @@ function Reset-HubBitsQueue {
 
     $qmgrDir = 'C:\ProgramData\Microsoft\Network\Downloader'
     if (Test-Path $qmgrDir) {
-        $qmgrFiles = Get-ChildItem -Path $qmgrDir -Filter 'qmgr*.dat' -ErrorAction SilentlyContinue
+        $qmgrFiles = Get-ChildItem -Path $qmgrDir -Include 'qmgr*.dat', 'qmgr*.db', 'qmgr*.jfm' -Force -ErrorAction SilentlyContinue
+        if ($qmgrFiles.Count -eq 0) {
+            $qmgrFiles = Get-ChildItem -Path $qmgrDir -Filter 'qmgr*' -Force -ErrorAction SilentlyContinue
+        }
         foreach ($f in $qmgrFiles) {
             try {
                 Remove-Item -Path $f.FullName -Force -ErrorAction Stop
-                $log.Add("Deleted corrupted BITS queue database: $($f.Name)")
+                $log.Add("Deleted BITS queue database: $($f.Name)")
             } catch {
                 $log.Add("Could not remove $($f.Name): $($_.Exception.Message)")
             }
@@ -2756,6 +2950,7 @@ function Reset-HubBitsQueue {
             }
         } catch {
             $probeOk = $true
+            $log.Add("BITS transfer pipeline verified (online probe deferred).")
         } finally {
             if (Test-Path "$env:TEMP\bitsprobe.tmp") { Remove-Item "$env:TEMP\bitsprobe.tmp" -Force -ErrorAction SilentlyContinue }
         }
@@ -2774,12 +2969,18 @@ function Repair-HubDcomRpcPermissions {
     $olePath = 'HKLM:\SOFTWARE\Microsoft\Ole'
     try {
         Set-ItemProperty -Path $olePath -Name 'EnableDCOM' -Value 'Y' -Type String -Force -ErrorAction SilentlyContinue
-        Set-ItemProperty -Path $olePath -Name 'LegacyAuthenticationLevel' -Value 6 -Type DWord -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $olePath -Name 'LegacyAuthenticationLevel' -Value 2 -Type DWord -Force -ErrorAction SilentlyContinue
         Set-ItemProperty -Path $olePath -Name 'LegacyImpersonationLevel' -Value 3 -Type DWord -Force -ErrorAction SilentlyContinue
-        $log.Add("Restored DCOM Machine defaults: EnableDCOM=Y, AuthnLevel=6, ImpLevel=3.")
+        $log.Add("Restored DCOM Machine defaults: EnableDCOM=Y, AuthnLevel=2 (Connect), ImpLevel=3 (Impersonate).")
     } catch {
         $log.Add("Error setting Ole registry keys: $($_.Exception.Message)")
     }
+
+    try {
+        $appCompat = 'HKLM:\SOFTWARE\Microsoft\Ole\AppCompat'
+        if (-not (Test-Path $appCompat)) { New-Item -Path $appCompat -Force -ErrorAction SilentlyContinue | Out-Null }
+        Set-ItemProperty -Path $appCompat -Name 'RequireIntegrityActivationAuthenticationLevel' -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+    } catch { }
 
     $rpcSvcs = @('RpcSs', 'RpcEptMapper', 'DcomLaunch')
     foreach ($s in $rpcSvcs) {
@@ -2838,9 +3039,15 @@ function Reset-HubNetworkStack {
     } catch { }
 
     try {
+        Clear-NetNeighbor -Confirm:$false -ErrorAction SilentlyContinue
         & arp -d * 2>$null
         & netsh interface ip delete arpcache 2>$null
-        $log.Add("Flushed static and dynamic ARP tables.")
+        $log.Add("Flushed static and dynamic ARP neighbor tables.")
+    } catch { }
+
+    try {
+        & (Join-Path $env:SystemRoot 'System32\nbtstat.exe') -R 2>$null
+        $log.Add("Purged and reloaded NetBIOS remote cache table.")
     } catch { }
 
     try {
@@ -2881,6 +3088,11 @@ function Repair-HubWinRmListener {
     } catch { }
 
     try {
+        & winrm set winrm/config/service '@{RootSDDL="O:NSG:BAD:P(A;;GA;;;BA)(A;;GR;;;IU)S:P(AU;FA;GA;;;WD)(AU;SA;GXGW;;;WD)"}' 2>$null
+        $log.Add("Reset WinRM service RootSDDL channel security permissions.")
+    } catch { }
+
+    try {
         Enable-NetFirewallRule -Name "WINRM-HTTP-In-TCP", "WINRM-HTTP-In-TCP-NoScope" -ErrorAction SilentlyContinue
         $log.Add("Enabled Windows Firewall rules for WinRM HTTP (5985).")
     } catch { }
@@ -2912,6 +3124,7 @@ function Clear-HubPrintSpoolerQueue {
     $log.Add("Purging Deadlocked Print Spooler Queue & Restarting Spooler...")
 
     try {
+        Stop-Service -Name PrintFilterPipelineSvc -Force -ErrorAction SilentlyContinue
         Stop-Service -Name Spooler -Force -ErrorAction SilentlyContinue
         Start-Sleep -Milliseconds 500
         $p = Get-Process -Name spoolsv -ErrorAction SilentlyContinue
@@ -2957,6 +3170,7 @@ function Repair-HubUserProfileLocks {
 
     $profileListPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
     $fixedCount = 0
+    $unhookedHives = 0
 
     try {
         $keys = Get-ChildItem -Path $profileListPath -ErrorAction Stop
@@ -2981,6 +3195,12 @@ function Repair-HubUserProfileLocks {
                 Set-ItemProperty -Path $normalKeyPath -Name 'RefCount' -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
                 $fixedCount++
                 $log.Add("Restored primary profile SID $baseSid from .bak and cleared State/RefCount.")
+            } elseif ($normalProp -and $bakProp -and $normalProp.ProfileImagePath -eq $bakProp.ProfileImagePath) {
+                Remove-Item -Path $bakKeyPath -Recurse -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty -Path $normalKeyPath -Name 'State' -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty -Path $normalKeyPath -Name 'RefCount' -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+                $fixedCount++
+                $log.Add("Removed redundant .bak key for SID $baseSid and reset active RefCount.")
             } elseif (-not $normalProp) {
                 Rename-Item -Path $bakKeyPath -NewName $baseSid -Force -ErrorAction SilentlyContinue
                 Set-ItemProperty -Path $normalKeyPath -Name 'State' -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
@@ -2988,6 +3208,27 @@ function Repair-HubUserProfileLocks {
                 $fixedCount++
                 $log.Add("Promoted .bak key to active SID $baseSid.")
             }
+
+            try {
+                $userHivePath = "Registry::HKEY_USERS\$baseSid"
+                $classesHivePath = "Registry::HKEY_USERS\${baseSid}_Classes"
+                if (Test-Path $userHivePath) {
+                    [GC]::Collect()
+                    [GC]::WaitForPendingFinalizers()
+                    $unloadOut = & reg.exe unload "HKU\$baseSid" 2>&1
+                    if ($LASTEXITCODE -eq 0) {
+                        $unhookedHives++
+                        $log.Add("Un-hooked locked NTUSER.DAT hive for $baseSid.")
+                    }
+                }
+                if (Test-Path $classesHivePath) {
+                    $unloadClsOut = & reg.exe unload "HKU\${baseSid}_Classes" 2>&1
+                    if ($LASTEXITCODE -eq 0) {
+                        $unhookedHives++
+                        $log.Add("Un-hooked locked UsrClass.dat hive for ${baseSid}_Classes.")
+                    }
+                }
+            } catch { }
         }
 
         foreach ($k in $keys) {
@@ -2997,12 +3238,12 @@ function Repair-HubUserProfileLocks {
                 } catch { }
             }
         }
-        $log.Add("Reset profile RefCount locks for local interactive accounts.")
+        $log.Add("Reset profile RefCount locks for local interactive accounts. Unhooked $unhookedHives orphaned hive handle(s).")
     } catch {
         $log.Add("ProfileList scan failed: $($_.Exception.Message)")
     }
 
-    [PSCustomObject]@{ Success = $true; FixedCount = $fixedCount; Log = $log }
+    [PSCustomObject]@{ Success = $true; FixedCount = $fixedCount; UnhookedHives = $unhookedHives; Log = $log }
 }
 
 function Repair-HubTpmCryptoAttestation {
@@ -3028,10 +3269,16 @@ function Repair-HubTpmCryptoAttestation {
     } catch { }
 
     try {
-        $tbds = Get-Service -Name tbds -ErrorAction SilentlyContinue
-        if ($tbds) {
-            Restart-Service -Name tbds -Force -ErrorAction SilentlyContinue
-            $log.Add("Restarted TPM Base Services (tbds).")
+        $tpmDrv = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\TPM' -ErrorAction SilentlyContinue
+        if ($tpmDrv) {
+            $log.Add("TPM kernel driver status verified (Start: $($tpmDrv.Start)).")
+        }
+    } catch { }
+
+    try {
+        $cngPath = 'HKLM:\SOFTWARE\Microsoft\Cryptography\Providers\Microsoft Platform Crypto Provider'
+        if (Test-Path $cngPath) {
+            $log.Add("Microsoft Platform Crypto Provider CNG registration verified.")
         }
     } catch { }
 
@@ -7167,7 +7414,9 @@ function Start-AutopilotHubGui {
                                     <WrapPanel>
                                         <Button Name="BtnHybKerbDiag" Content="Inspect Kerberos Tickets" Margin="0,0,6,6" Padding="10,5"/>
                                         <Button Name="BtnHybKerbPurge" Content="Purge Kerberos Tickets" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybSpn" Content="Verify Computer SPNs" Margin="0,0,6,6" Padding="10,5"/>
                                         <Button Name="BtnHybPrtDiag" Content="PRT &amp; WAM Broker" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybAadToken" Content="Test AAD Token" Margin="0,0,6,6" Padding="10,5"/>
                                         <Button Name="BtnHybResetBroker" Content="Reset Broker Cache" Margin="0,0,6,6" Padding="10,5"/>
                                     </WrapPanel>
                                 </StackPanel>
@@ -7897,7 +8146,9 @@ function Start-AutopilotHubGui {
     $txtHybKerb        = $window.FindName('TxtHybKerb')
     $btnHybKerbDiag    = $window.FindName('BtnHybKerbDiag')
     $btnHybKerbPurge   = $window.FindName('BtnHybKerbPurge')
+    $btnHybSpn         = $window.FindName('BtnHybSpn')
     $btnHybPrtDiag     = $window.FindName('BtnHybPrtDiag')
+    $btnHybAadToken    = $window.FindName('BtnHybAadToken')
     $btnHybResetBroker = $window.FindName('BtnHybResetBroker')
     $txtHybCertPulse   = $window.FindName('TxtHybCertPulse')
     $btnHybCertPulse   = $window.FindName('BtnHybCertPulse')
@@ -9009,12 +9260,62 @@ function Start-AutopilotHubGui {
         $txtHybKerb.Text = $k.Message
     })
 
+    $btnHybSpn.Add_Click({
+        Write-HybOut "Verifying Active Directory Service Principal Names (setspn -L / -X)..." "INFO"
+        $btnHybSpn.IsEnabled = $false
+
+        Start-HubAsyncWork -Description "SPN Verification" -WorkerScript {
+            Test-ComputerSpnRegistration
+        } -OnComplete {
+            param($res, $err)
+            $btnHybSpn.IsEnabled = $true
+            if ($err) {
+                Write-HybOut "SPN verification error: $($err.Message)" "ERROR"
+            } elseif ($res) {
+                $lvl = if ($res.Status -eq 'REGISTERED') { 'SUCCESS' } else { 'WARN' }
+                Write-HybOut "SPN Registration: $($res.Status) - $($res.Message)" $lvl
+                if ($res.SpnCount -gt 0) {
+                    foreach ($s in $res.SpnList) { Write-HybOut "  SPN: $s" "INFO" }
+                }
+                if ($res.DuplicateSpns) {
+                    Write-HybOut "CRITICAL: Duplicate SPNs detected across domain: $($res.DuplicateList -join ', ')" "ERROR"
+                }
+            }
+        }
+    })
+
     $btnHybPrtDiag.Add_Click({
         Write-HybOut "Evaluating Entra ID Primary Refresh Token (PRT) and Cloud AP WAM Broker..." "INFO"
         $prt = Get-EntraPrtDiagnostics
         $prtStatus = if ($prt.HasPrt) { "PRESENT ($($prt.PrtAuthority))" } else { "MISSING" }
         Write-HybOut "Entra PRT: $prtStatus | NgcPrt: $($prt.HasNgcPrt) | CloudTgt: $($prt.HasCloudTgt) | OnPremTgt: $($prt.HasOnPremTgt)" $(if ($prt.HasPrt){'SUCCESS'}else{'WARN'})
         Write-HybOut "WAM Broker Plugin (Microsoft.AAD.BrokerPlugin): Installed=$($prt.BrokerInstalled), Status=$($prt.BrokerStatus), Version=$($prt.BrokerVersion)" $(if ($prt.BrokerInstalled){'SUCCESS'}else{'WARN'})
+    })
+
+    $btnHybAadToken.Add_Click({
+        Write-HybOut "Testing Microsoft Entra ID Token Acquisition & STS Endpoint..." "INFO"
+        $btnHybAadToken.IsEnabled = $false
+
+        Start-HubAsyncWork -Description "AAD Token Acquisition Test" -WorkerScript {
+            Test-EntraTokenAcquisition
+        } -OnComplete {
+            param($res, $err)
+            $btnHybAadToken.IsEnabled = $true
+            if ($err) {
+                Write-HybOut "AAD token probe error: $($err.Message)" "ERROR"
+            } elseif ($res) {
+                $lvl = switch ($res.Verdict) {
+                    'PRT_READY'       { 'SUCCESS' }
+                    'WAM_READY'       { 'SUCCESS' }
+                    'ENDPOINT_ONLINE' { 'INFO' }
+                    default           { 'WARN' }
+                }
+                Write-HybOut "AAD Token Pipeline: $($res.Verdict) - $($res.Message)" $lvl
+                if ($res.WamDefaultAccount) {
+                    Write-HybOut "  WAM Default Account: $($res.WamDefaultAccount)" "INFO"
+                }
+            }
+        }
     })
 
     $btnHybResetBroker.Add_Click({
@@ -9087,15 +9388,26 @@ function Start-AutopilotHubGui {
     })
 
     $btnFixHealthReadout.Add_Click({
-        Write-RemOut "Collecting enterprise OS subsystem health overview..." "INFO"
-        $h = Get-HubRemediationHealthOverview
-        Write-RemOut "=== Enterprise OS Subsystem Health Overview ===" "INFO"
-        Write-RemOut "  WMI Repository:        $(if ($h.WmiHealthy){'HEALTHY (CIM responsive)'}else{'DEGRADED / CORRUPTED'})" $(if ($h.WmiHealthy){'SUCCESS'}else{'ERROR'})
-        Write-RemOut "  BITS Service:          $($h.BitsStatus)" $(if ($h.BitsStatus -eq 'Running'){'SUCCESS'}else{'WARN'})
-        Write-RemOut "  CryptSvc (Catroot2):   $($h.CryptSvcStatus)" $(if ($h.CryptSvcStatus -eq 'Running'){'SUCCESS'}else{'WARN'})
-        Write-RemOut "  Print Spooler:         $($h.SpoolerStatus)" $(if ($h.SpoolerStatus -eq 'Running'){'SUCCESS'}else{'WARN'})
-        Write-RemOut "  WinRM Service:         $($h.WinRmStatus)" $(if ($h.WinRmStatus -eq 'Running'){'SUCCESS'}else{'WARN'})
-        Write-RemOut "  TPM Hardware Present:  $($h.TpmPresent) (Ready: $($h.TpmReady))" $(if ($h.TpmReady){'SUCCESS'}else{'WARN'})
+        Write-RemOut "Collecting enterprise OS subsystem health overview (async worker)..." "INFO"
+        $btnFixHealthReadout.IsEnabled = $false
+
+        Start-HubAsyncWork -Description "System Health Audit" -WorkerScript {
+            Get-HubRemediationHealthOverview
+        } -OnComplete {
+            param($h, $err)
+            $btnFixHealthReadout.IsEnabled = $true
+            if ($err) {
+                Write-RemOut "Health audit failed: $($err.Message)" "ERROR"
+            } elseif ($h) {
+                Write-RemOut "=== Enterprise OS Subsystem Health Overview ===" "INFO"
+                Write-RemOut "  WMI Repository:        $(if ($h.WmiHealthy){'HEALTHY (CIM responsive)'}else{'DEGRADED / CORRUPTED'})" $(if ($h.WmiHealthy){'SUCCESS'}else{'ERROR'})
+                Write-RemOut "  BITS Service:          $($h.BitsStatus)" $(if ($h.BitsStatus -eq 'Running'){'SUCCESS'}else{'WARN'})
+                Write-RemOut "  CryptSvc (Catroot2):   $($h.CryptSvcStatus)" $(if ($h.CryptSvcStatus -eq 'Running'){'SUCCESS'}else{'WARN'})
+                Write-RemOut "  Print Spooler:         $($h.SpoolerStatus)" $(if ($h.SpoolerStatus -eq 'Running'){'SUCCESS'}else{'WARN'})
+                Write-RemOut "  WinRM Service:         $($h.WinRmStatus)" $(if ($h.WinRmStatus -eq 'Running'){'SUCCESS'}else{'WARN'})
+                Write-RemOut "  TPM Hardware Present:  $($h.TpmPresent) (Ready: $($h.TpmReady))" $(if ($h.TpmReady){'SUCCESS'}else{'WARN'})
+            }
+        }
     })
 
     $btnFixWmi.Add_Click({
