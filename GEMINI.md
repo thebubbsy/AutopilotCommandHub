@@ -146,6 +146,12 @@ When developing or maintaining Autopilot Command Hub, AutopilotFast, IntuneShare
   - Target failure modes for on-prem domain + Entra hybrid joins via `dsregcmd /status` (PRT token status, tenant IDs, join flags).
   - Decode the ConfigMgr/Intune co-management authority bitmask to determine per-workload ownership (Compliance, Config, Apps, Updates, Office).
   - Gate all remediation actions (`Restart-IntuneExtension`, `Invoke-MdmSync`, `Invoke-BitLockerEscrow`, `Invoke-GpUpdateForce`) behind elevation checks.
+- **Non-Blocking Startup Discipline**:
+  - The window must render before slow probes finish. Never call `Test-StagedNetwork`, `Get-WindowsLicensingInfo`, `Get-Tpm`, `Get-PhysicalDisk`/`Get-StorageReliabilityInfo`, or `Get-BatteryHealthInfo` synchronously on the startup path - dispatch them through `Start-HubAsyncWork` and apply results in the `-OnComplete` callback (it runs on the UI thread via the 30 ms `HubQueueTimer`). The 7-stage ladder is additionally pre-started in a standalone runspace in Section C so it overlaps the console intro.
+  - Prefer cheap local reads over WMI/CIM on the hot path: `[System.IO.DriveInfo]::GetDrives()` over `Win32_Volume`; the `SecureBoot\State` registry value (readable unelevated) over `Confirm-SecureBootUEFI`. Cache `SoftwareLicensingService.OA3xOriginalProductKey` (`$script:CachedOa3Key`).
+  - `Get-Tpm` returns nothing without elevation; render that as `NEEDS ELEVATION`, not `NOT READY`/`NOT DETECTED`.
+- **Easter Eggs (keep them harmless)**:
+  - Any egg (`Show-HubIntro` shootout, `Get-HubQuip` log flavour, Konami -> Outlaw title, 5x title-click -> ASCII horse) must be purely cosmetic, side-effect free, and skippable. `Show-HubIntro` must no-op when `Test-HubConsoleAvailable` is false (no ConsoleHost, redirected output, tiny window), on `-NoIntro`, on `AUTOPILOT_NO_INTRO`, and for the STA relaunch child (`AUTOPILOT_HUB_STA_CHILD=1`). Never let an egg touch provisioning state.
 - **Autonomous Multi-Repo Bootstrap Distribution**:
   - Keep `onyachamp.com` in continuous lockstep with `AutopilotCommandHub` via dual automated pipelines:
     1. Push trigger in `AutopilotCommandHub` (`deploy-website.yml`) using repository secret `SITE_DEPLOY_TOKEN`.

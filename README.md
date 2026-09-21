@@ -89,6 +89,8 @@ Device Code Flow | App Secret
 * **Native Single-Threaded Apartment (STA) Engine**: Built on a non-blocking `DispatcherFrame` message loop that streams live color-coded logs without freezing the interface.
 * **WinUI 3 Fluent Dark Architecture**: Crafted strictly with authentic Windows 11 dark theme design tokens (`#202020` canvas, `#2B2B2B` elevation surfaces, and `#0067C0` accent blue).
 * **Cross-Subsystem Core Integration**: Combines core engines from [`AutopilotFast`](https://github.com/thebubbsy/AutopilotFast), [`IntuneShared`](https://github.com/thebubbsy/IntuneShared), and [`WingetIntune`](https://github.com/thebubbsy/WingetIntune).
+* **Fast, Non-Blocking Startup**: The window renders in ~3 s (pwsh 7) / ~2.4 s (Windows PowerShell 5.1), down from ~10 s. Slow, UI-free work - the 7-stage network ladder, licensing WMI, TPM probe, battery/storage counters - runs in a background runspace pool and streams into the UI as it completes, so the console never blocks on a probe. Secure Boot is read from its registry mirror (works without elevation) and the OA3 product key is cached per session.
+* **A little showmanship**: On launch the console plays a brief ASCII cowboy shootout *while* those background probes run, so the flourish overlaps real work instead of adding to it. It is skipped automatically when there is no console, output is redirected, `-NoIntro` is passed, or `AUTOPILOT_NO_INTRO` is set. Replay it any time with `.utopilot.ps1 -Shootout`. (There are one or two other things to find, too.)
 
 ---
 
