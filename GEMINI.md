@@ -139,7 +139,7 @@ When developing or maintaining Autopilot Command Hub, AutopilotFast, IntuneShare
   - Genuine OA3 blobs carry the magic header `4F 41 33 00` (`OA3\0`, Base64 prefix `T0EzAA`) and measure between 2,048 and 16,384 bytes. The payload is NOT ASN.1 DER (`0x30`). Block CSV export and Graph upload if the payload does not validate against this binary structure.
 - **Runtime Privilege Detection & Elevation Guide**:
   - Automatically detect runtime context via `Get-HubRuntimeContext`: distinguish between `SYSTEM` (OOBE Shift+F10 / defaultuser0), elevated `Administrator` on desktop, and `StandardUser`.
-  - If privileges are limited, present guided elevation (`Show-PrivilegeGuide`) with a one-click "Relaunch as Administrator" button that self-copies the active script and `.env` to `%ProgramData%\AutopilotCommandHub` and elevates via UAC.
+  - If privileges are limited, present guided elevation (`Show-PrivilegeGuide`) with a one-click "Relaunch as Administrator" button that self-copies the active script and `.env` to `%ProgramFiles%\AutopilotCommandHub` and elevates via UAC.
 - **WPF STA Runspace Safety**:
   - WPF applications in PowerShell cannot run on a raw `[System.Threading.Thread]` without a Runspace; any MTA host will crash on invoke. Re-run within a dedicated STA Runspace or launch via `powershell -STA`.
 - **Hybrid Join & Co-Management Local Diagnostics**:
