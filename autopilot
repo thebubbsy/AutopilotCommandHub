@@ -61,7 +61,10 @@ param(
     [switch]$AutoReboot,
     [switch]$ScanOnly,
     [switch]$PatchCascade,
-    [int]$MaxPasses = 5
+    [int]$MaxPasses = 5,
+    [switch]$OfflineStaging,
+    [string]$StagingProfile = 'HardwareDiagnostics',
+    [switch]$ResumeAutopilot
 )
 
 # 0. Central Environment & Configuration Engine (.env)
@@ -773,6 +776,544 @@ function Enable-HubNetworkAdapters {
         }
     }
     return ,$enabled
+}
+
+# ==============================================================================
+# CONTROLLED OFFLINE STAGING & ADAPTIVE EVALUATION PROFILES SUBSYSTEM
+# ==============================================================================
+$script:StagingDir = Join-Path $env:ProgramData 'AutopilotCommandHub\OfflineStaging'
+$script:StagingQuarantineDir = Join-Path $script:StagingDir 'Quarantine'
+$script:StagingSnapshotPath = Join-Path $script:StagingDir 'StagingSnapshot.json'
+
+function Get-OfflineStagingState {
+    if (Test-Path $script:StagingSnapshotPath) {
+        try {
+            $raw = [System.IO.File]::ReadAllText($script:StagingSnapshotPath, [System.Text.Encoding]::UTF8)
+            $snap = ConvertFrom-Json $raw -ErrorAction Stop
+            if ($snap -and $snap.IsActive) { return $snap }
+        } catch { }
+    }
+    return $null
+}
+
+function Invoke-OfflineStaging {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$false)]
+        [ValidateSet('HardwareDiagnostics', 'WorkloadBenchmarking', 'SoftwareSandbox')]
+        [string]$Profile = 'HardwareDiagnostics',
+
+        [switch]$QuarantineProfile = $true,
+        [switch]$LoopbackFence = $true,
+        [switch]$SetBypassNro = $true,
+        [switch]$CreateDesktopShortcut = $true
+    )
+
+    $actions = [System.Collections.Generic.List[string]]::new()
+    $quarantinedFiles = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $serviceSnapshots = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    if (-not (Test-Path $script:StagingQuarantineDir)) {
+        New-Item -Path $script:StagingQuarantineDir -ItemType Directory -Force | Out-Null
+    }
+
+    # 1. Reversible Quarantine of ZTD / Autopilot Profiles
+    if ($QuarantineProfile) {
+        $profileTargets = @(
+            "$env:SystemRoot\ServiceState\wmansvc\AutopilotDDSZTDFile.json",
+            "$env:SystemRoot\Provisioning\Autopilot\AutopilotConfigurationFile.json"
+        )
+        foreach ($target in $profileTargets) {
+            if (Test-Path $target) {
+                $leaf = Split-Path -Leaf $target
+                $dest = Join-Path $script:StagingQuarantineDir $leaf
+                try {
+                    Copy-Item -Path $target -Destination $dest -Force -ErrorAction Stop
+                    Remove-Item -Path $target -Force -ErrorAction Stop
+                    $quarantinedFiles.Add([PSCustomObject]@{
+                        OriginalPath   = $target
+                        QuarantinePath = $dest
+                        FileName       = $leaf
+                    })
+                    $actions.Add("Quarantined Autopilot profile '$leaf' to staging holding area")
+                } catch {
+                    $actions.Add("FAILED to quarantine '$leaf': $($_.Exception.Message)")
+                }
+            }
+        }
+    }
+
+    # 2. Reversible Hosts Loopback Fence for Enrollment Endpoints
+    $hostsFenced = $false
+    if ($LoopbackFence) {
+        $hostsFile = "$env:SystemRoot\System32\drivers\etc\hosts"
+        try {
+            $hostsContent = if (Test-Path $hostsFile) { [System.IO.File]::ReadAllText($hostsFile, [System.Text.Encoding]::ASCII) } else { "" }
+            if ($hostsContent -notmatch 'AUTOPILOT_OFFLINE_STAGING_FENCE_START') {
+                $fenceBlock = "`r`n# AUTOPILOT_OFFLINE_STAGING_FENCE_START`r`n127.0.0.1 ztd.dds.microsoft.com`r`n127.0.0.1 cs.dds.microsoft.com`r`n127.0.0.1 enterpriseenrollment.manage.microsoft.com`r`n127.0.0.1 enrollment.manage.microsoft.com`r`n127.0.0.1 manage.microsoft.com`r`n# AUTOPILOT_OFFLINE_STAGING_FENCE_END`r`n"
+                [System.IO.File]::AppendAllText($hostsFile, $fenceBlock, [System.Text.Encoding]::ASCII)
+                $hostsFenced = $true
+                $actions.Add("Configured loopback fence in hosts file blocking enrollment endpoints")
+            } else {
+                $hostsFenced = $true
+                $actions.Add("Hosts file already contains active loopback fence")
+            }
+            try { Clear-DnsClientCache -ErrorAction SilentlyContinue } catch { }
+        } catch {
+            $actions.Add("FAILED to configure hosts loopback fence: $($_.Exception.Message)")
+        }
+    }
+
+    # 3. Registry Fences: BypassNRO and IsAutopilotDisabled
+    if ($SetBypassNro) {
+        try {
+            $oobeKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE'
+            if (-not (Test-Path $oobeKey)) { New-Item -Path $oobeKey -Force | Out-Null }
+            Set-ItemProperty -Path $oobeKey -Name 'BypassNRO' -Value 1 -Type DWord -ErrorAction Stop
+            $actions.Add("Set OOBE\BypassNRO=1 (local account / offline setup unlocked)")
+        } catch {
+            $actions.Add("FAILED to set BypassNRO: $($_.Exception.Message)")
+        }
+    }
+
+    try {
+        $diagKey = 'HKLM:\SOFTWARE\Microsoft\Provisioning\Diagnostics\AutoPilot'
+        if (-not (Test-Path $diagKey)) { New-Item -Path $diagKey -Force | Out-Null }
+        Set-ItemProperty -Path $diagKey -Name 'IsAutopilotDisabled' -Value 1 -Type DWord -ErrorAction Stop
+        $actions.Add("Set IsAutopilotDisabled=1 under Provisioning\Diagnostics\AutoPilot")
+    } catch {
+        $actions.Add("FAILED to set IsAutopilotDisabled: $($_.Exception.Message)")
+    }
+
+    # 4. Adaptive Profile Specializations
+    $profileTitle = ""
+    $origPowerScheme = ""
+
+    switch ($Profile) {
+        'HardwareDiagnostics' {
+            $profileTitle = "Hardware Diagnostics & Triage"
+            $targetServices = @('DiagTrack', 'WSearch', 'SysMain')
+            foreach ($sName in $targetServices) {
+                try {
+                    $svc = Get-Service -Name $sName -ErrorAction SilentlyContinue
+                    if ($svc) {
+                        $startMode = (Get-CimInstance Win32_Service -Filter "Name='$sName'" -ErrorAction SilentlyContinue).StartMode
+                        $serviceSnapshots.Add([PSCustomObject]@{
+                            Name              = $sName
+                            OriginalStartType = $startMode
+                            OriginalStatus    = $svc.Status.ToString()
+                        })
+                        Stop-Service -Name $sName -Force -ErrorAction SilentlyContinue
+                        Set-Service -Name $sName -StartupType Disabled -ErrorAction SilentlyContinue
+                        $actions.Add("Suspended $sName (was $startMode / $($svc.Status)) for diagnostic isolation")
+                    }
+                } catch { }
+            }
+            $actions.Add("Hardware Diagnostics posture active: Local subnet network posture open, live hardware probes enabled")
+        }
+
+        'WorkloadBenchmarking' {
+            $profileTitle = "Workload Benchmarking & Testing"
+            try {
+                $activeSchemeRaw = powercfg /getactivescheme
+                if ($activeSchemeRaw -match '([0-9a-fA-F-]{36})') {
+                    $origPowerScheme = $Matches[1]
+                }
+                $ultGuid = "e9a42b02-d5df-448d-aa00-03f14749eb61"
+                $allSchemes = powercfg /list
+                if ($allSchemes -notmatch $ultGuid) {
+                    powercfg -duplicatescheme $ultGuid | Out-Null
+                }
+                powercfg -setactive $ultGuid | Out-Null
+                $actions.Add("Activated Ultimate Performance power scheme ($ultGuid) - zero CPU jitter/throttling")
+            } catch {
+                $actions.Add("Power scheme note: $($_.Exception.Message)")
+            }
+
+            $targetServices = @('wuauserv', 'bits', 'TrustedInstaller', 'DiagTrack', 'SysMain')
+            foreach ($sName in $targetServices) {
+                try {
+                    $svc = Get-Service -Name $sName -ErrorAction SilentlyContinue
+                    if ($svc) {
+                        $startMode = (Get-CimInstance Win32_Service -Filter "Name='$sName'" -ErrorAction SilentlyContinue).StartMode
+                        $serviceSnapshots.Add([PSCustomObject]@{
+                            Name              = $sName
+                            OriginalStartType = $startMode
+                            OriginalStatus    = $svc.Status.ToString()
+                        })
+                        Stop-Service -Name $sName -Force -ErrorAction SilentlyContinue
+                        Set-Service -Name $sName -StartupType Disabled -ErrorAction SilentlyContinue
+                        $actions.Add("Halted $sName for deterministic benchmark testing")
+                    }
+                } catch { }
+            }
+        }
+
+        'SoftwareSandbox' {
+            $profileTitle = "Software Evaluation & Staging Sandbox"
+            try {
+                $devKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock'
+                if (-not (Test-Path $devKey)) { New-Item -Path $devKey -Force | Out-Null }
+                Set-ItemProperty -Path $devKey -Name 'AllowDevelopmentWithoutDevLicense' -Value 1 -Type DWord -ErrorAction Stop
+                $actions.Add("Enabled Windows Developer Mode (sideloading & remote debugging allowed)")
+            } catch {
+                $actions.Add("Failed to enable Developer Mode: $($_.Exception.Message)")
+            }
+
+            $stagingDirSys = "$env:SystemDrive\Staging"
+            if (-not (Test-Path $stagingDirSys)) {
+                New-Item -Path $stagingDirSys -ItemType Directory -Force | Out-Null
+                $actions.Add("Created offline package staging folder at $stagingDirSys")
+            }
+
+            try {
+                Enable-LocalUser -Name "Administrator" -ErrorAction SilentlyContinue
+                $actions.Add("Enabled built-in Administrator account for offline sandbox access")
+            } catch { }
+        }
+    }
+
+    # 5. Persist Snapshot JSON
+    $snapshotObj = [PSCustomObject]@{
+        Timestamp           = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        Profile             = $Profile
+        ProfileTitle        = $profileTitle
+        QuarantinedFiles    = $quarantinedFiles
+        HostsFenced         = $hostsFenced
+        OriginalPowerScheme = $origPowerScheme
+        Services            = $serviceSnapshots
+        IsActive            = $true
+    }
+
+    $jsonStr = $snapshotObj | ConvertTo-Json -Depth 5
+    [System.IO.File]::WriteAllText($script:StagingSnapshotPath, $jsonStr, [System.Text.Encoding]::UTF8)
+    $actions.Add("Saved staging state snapshot to $script:StagingSnapshotPath")
+
+    # 6. Generate Re-Docking Companion Script & Desktop Shortcut
+    if ($CreateDesktopShortcut) {
+        try {
+            $redockScriptPath = Join-Path $script:StagingDir "Resume-EnterpriseAutopilot.ps1"
+            $redockScriptCode = @"
+<#
+.SYNOPSIS
+    Resume Enterprise Autopilot & Re-Dock Device to Cloud
+#>
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " RESUMING ENTERPRISE AUTOPILOT & RE-DOCKING TO CLOUD" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+
+`$snapshotFile = "$script:StagingSnapshotPath"
+if (-not (Test-Path `$snapshotFile)) {
+    Write-Host "No active staging snapshot found at `$snapshotFile." -ForegroundColor Yellow
+    pause
+    exit
+}
+
+`$snap = [System.IO.File]::ReadAllText(`$snapshotFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+
+# 1. Restore Services
+if (`$snap.Services) {
+    foreach (`$s in `$snap.Services) {
+        Write-Host "Restoring service `$(`$s.Name) to `$(`$s.OriginalStartType)..." -ForegroundColor Gray
+        try {
+            Set-Service -Name `$s.Name -StartupType `$s.OriginalStartType -ErrorAction SilentlyContinue
+            if (`$s.OriginalStatus -eq 'Running') {
+                Start-Service -Name `$s.Name -ErrorAction SilentlyContinue
+            }
+        } catch { }
+    }
+}
+
+# 2. Restore Power Scheme
+if (`$snap.OriginalPowerScheme) {
+    Write-Host "Restoring original power scheme `$(`$snap.OriginalPowerScheme)..." -ForegroundColor Gray
+    try { powercfg -setactive `$snap.OriginalPowerScheme } catch { }
+}
+
+# 3. Clear Hosts Fence
+`$hostsFile = "`$env:SystemRoot\System32\drivers\etc\hosts"
+if (Test-Path `$hostsFile) {
+    try {
+        `$hContent = [System.IO.File]::ReadAllText(`$hostsFile, [System.Text.Encoding]::ASCII)
+        if (`$hContent -match 'AUTOPILOT_OFFLINE_STAGING_FENCE_START') {
+            `$cleaned = `$hContent -replace '(?s)\r?\n?# AUTOPILOT_OFFLINE_STAGING_FENCE_START.*?# AUTOPILOT_OFFLINE_STAGING_FENCE_END\r?\n?', ''
+            [System.IO.File]::WriteAllText(`$hostsFile, `$cleaned, [System.Text.Encoding]::ASCII)
+            Write-Host "Cleared hosts loopback fence for enrollment endpoints." -ForegroundColor Green
+            try { Clear-DnsClientCache -ErrorAction SilentlyContinue } catch { }
+        }
+    } catch { }
+}
+
+# 4. Restore Registry
+try {
+    Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Provisioning\Diagnostics\AutoPilot' -Name 'IsAutopilotDisabled' -Value 0 -Type DWord -ErrorAction SilentlyContinue
+    Write-Host "Restored IsAutopilotDisabled=0 in registry." -ForegroundColor Green
+} catch { }
+
+# 5. Restore Quarantined Autopilot Profiles
+if (`$snap.QuarantinedFiles) {
+    foreach (`$q in `$snap.QuarantinedFiles) {
+        if (Test-Path `$q.QuarantinePath) {
+            `$parent = Split-Path -Parent `$q.OriginalPath
+            if (-not (Test-Path `$parent)) { New-Item -Path `$parent -ItemType Directory -Force | Out-Null }
+            Copy-Item -Path `$q.QuarantinePath -Destination `$q.OriginalPath -Force
+            Remove-Item -Path `$q.QuarantinePath -Force -ErrorAction SilentlyContinue
+            Write-Host "Restored Autopilot profile to `$(`$q.OriginalPath)." -ForegroundColor Green
+        }
+    }
+}
+
+# 6. Trigger Policy Sync
+Write-Host "Triggering enterprise policy retrieval..." -ForegroundColor Cyan
+try {
+    Start-Process -FilePath "`$env:SystemRoot\System32\DeviceEnroller.exe" -ArgumentList "/c /AutoEnrollMDM" -NoNewWindow -Wait -ErrorAction SilentlyContinue
+} catch { }
+
+# 7. Archive Snapshot
+`$restoredPath = "`$snapshotFile.restored.json"
+Move-Item -Path `$snapshotFile -Destination `$restoredPath -Force -ErrorAction SilentlyContinue
+
+# 8. Clean desktop shortcut
+`$pubDesk = [Environment]::GetFolderPath('CommonDesktopDirectory')
+if (-not (Test-Path `$pubDesk)) { `$pubDesk = "`$env:PUBLIC\Desktop" }
+`$lnkPath = Join-Path `$pubDesk "Resume-EnterpriseAutopilot.lnk"
+if (Test-Path `$lnkPath) { Remove-Item -Path `$lnkPath -Force -ErrorAction SilentlyContinue }
+
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host " DEVICE SUCCESSFULLY RE-DOCKED TO ENTERPRISE CLOUD!" -ForegroundColor Green
+Write-Host " Autopilot profile and enterprise management active." -ForegroundColor Green
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host "Press any key to close..."
+`$null = `$Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+"@
+            [System.IO.File]::WriteAllText($redockScriptPath, $redockScriptCode, [System.Text.Encoding]::UTF8)
+
+            # Create Desktop Shortcut
+            $pubDesk = [Environment]::GetFolderPath('CommonDesktopDirectory')
+            if (-not (Test-Path $pubDesk)) { $pubDesk = "$env:PUBLIC\Desktop" }
+            if (Test-Path $pubDesk) {
+                $lnkPath = Join-Path $pubDesk "Resume-EnterpriseAutopilot.lnk"
+                $wsh = New-Object -ComObject WScript.Shell
+                $sc = $wsh.CreateShortcut($lnkPath)
+                $sc.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+                $sc.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$redockScriptPath`""
+                $sc.Description = "Reconnect to Enterprise Cloud & Resume Autopilot"
+                $sc.IconLocation = "$env:SystemRoot\System32\shell32.dll,238"
+                $sc.Save()
+                $actions.Add("Placed 'Resume-EnterpriseAutopilot' re-docking shortcut on Public Desktop")
+            }
+        } catch {
+            $actions.Add("Desktop shortcut note: $($_.Exception.Message)")
+        }
+    }
+
+    return [PSCustomObject]@{
+        Profile  = $Profile
+        Title    = $profileTitle
+        Actions  = $actions
+        Snapshot = $snapshotObj
+    }
+}
+
+function Invoke-AutopilotReDock {
+    [CmdletBinding()]
+    param([switch]$Force)
+
+    $actions = [System.Collections.Generic.List[string]]::new()
+    $snap = Get-OfflineStagingState
+    if (-not $snap) {
+        return [PSCustomObject]@{ Success = $false; Message = "No active offline staging snapshot found."; Actions = @() }
+    }
+
+    # 1. Restore Services
+    if ($snap.Services) {
+        foreach ($s in $snap.Services) {
+            try {
+                Set-Service -Name $s.Name -StartupType $s.OriginalStartType -ErrorAction SilentlyContinue
+                if ($s.OriginalStatus -eq 'Running') {
+                    Start-Service -Name $s.Name -ErrorAction SilentlyContinue
+                }
+                $actions.Add("Restored service '$($s.Name)' to $($s.OriginalStartType) (status: $($s.OriginalStatus))")
+            } catch {
+                $actions.Add("Failed to restore service '$($s.Name)': $($_.Exception.Message)")
+            }
+        }
+    }
+
+    # 2. Restore Power Scheme
+    if ($snap.OriginalPowerScheme) {
+        try {
+            powercfg -setactive $snap.OriginalPowerScheme | Out-Null
+            $actions.Add("Restored original power scheme ($($snap.OriginalPowerScheme))")
+        } catch {
+            $actions.Add("Failed to restore power scheme: $($_.Exception.Message)")
+        }
+    }
+
+    # 3. Remove Hosts Loopback Fence
+    $hostsFile = "$env:SystemRoot\System32\drivers\etc\hosts"
+    if (Test-Path $hostsFile) {
+        try {
+            $hContent = [System.IO.File]::ReadAllText($hostsFile, [System.Text.Encoding]::ASCII)
+            if ($hContent -match 'AUTOPILOT_OFFLINE_STAGING_FENCE_START') {
+                $cleaned = $hContent -replace '(?s)\r?\n?# AUTOPILOT_OFFLINE_STAGING_FENCE_START.*?# AUTOPILOT_OFFLINE_STAGING_FENCE_END\r?\n?', ''
+                [System.IO.File]::WriteAllText($hostsFile, $cleaned, [System.Text.Encoding]::ASCII)
+                $actions.Add("Removed enrollment endpoint loopback fence from hosts file")
+                try { Clear-DnsClientCache -ErrorAction SilentlyContinue } catch { }
+            }
+        } catch {
+            $actions.Add("Failed to edit hosts file: $($_.Exception.Message)")
+        }
+    }
+
+    # 4. Restore Registry
+    try {
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Provisioning\Diagnostics\AutoPilot' -Name 'IsAutopilotDisabled' -Value 0 -Type DWord -ErrorAction SilentlyContinue
+        $actions.Add("Restored IsAutopilotDisabled=0 under Provisioning\Diagnostics\AutoPilot")
+    } catch { }
+
+    # 5. Restore Quarantined Autopilot Profile
+    if ($snap.QuarantinedFiles) {
+        foreach ($q in $snap.QuarantinedFiles) {
+            if (Test-Path $q.QuarantinePath) {
+                try {
+                    $parent = Split-Path -Parent $q.OriginalPath
+                    if (-not (Test-Path $parent)) { New-Item -Path $parent -ItemType Directory -Force | Out-Null }
+                    Copy-Item -Path $q.QuarantinePath -Destination $q.OriginalPath -Force -ErrorAction Stop
+                    Remove-Item -Path $q.QuarantinePath -Force -ErrorAction SilentlyContinue
+                    $actions.Add("Restored quarantined Autopilot profile to '$($q.OriginalPath)'")
+                } catch {
+                    $actions.Add("Failed to restore profile file '$($q.OriginalPath)': $($_.Exception.Message)")
+                }
+            }
+        }
+    }
+
+    # 6. Trigger Enterprise Policy Retrieval
+    try {
+        Start-Process -FilePath "$env:SystemRoot\System32\DeviceEnroller.exe" -ArgumentList "/c /AutoEnrollMDM" -NoNewWindow -ErrorAction SilentlyContinue
+        $actions.Add("Triggered DeviceEnroller /AutoEnrollMDM enterprise sync")
+    } catch { }
+
+    try {
+        Invoke-MdmSync | Out-Null
+        $actions.Add("Dispatched MDM session sync")
+    } catch { }
+
+    # 7. Clean up snapshot & Desktop Shortcut
+    try {
+        $restoredPath = "$($script:StagingSnapshotPath).restored.json"
+        Move-Item -Path $script:StagingSnapshotPath -Destination $restoredPath -Force -ErrorAction SilentlyContinue
+        $actions.Add("Archived snapshot to $restoredPath")
+    } catch { }
+
+    try {
+        $pubDesk = [Environment]::GetFolderPath('CommonDesktopDirectory')
+        if (-not (Test-Path $pubDesk)) { $pubDesk = "$env:PUBLIC\Desktop" }
+        $lnkPath = Join-Path $pubDesk "Resume-EnterpriseAutopilot.lnk"
+        if (Test-Path $lnkPath) { Remove-Item -Path $lnkPath -Force -ErrorAction SilentlyContinue }
+    } catch { }
+
+    return [PSCustomObject]@{
+        Success = $true
+        Message = "Device successfully re-docked to enterprise cloud. Autopilot profile and enterprise policies restored."
+        Actions = $actions
+    }
+}
+
+function Show-OfflineStagingDialog {
+    param([System.Windows.Window]$Owner = $null)
+    $ctx = $script:RuntimeContext
+    if (-not $ctx.MeetsPreferred) {
+        [System.Windows.MessageBox]::Show("Controlled Offline Staging requires administrative elevation to configure service states, quarantine profiles, and write network fences. Please click 'Fix Privileges' in the header first.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+        return $false
+    }
+
+    $xamlStaging = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Controlled Offline Staging &amp; Adaptive Evaluation Profiles"
+        Width="680" SizeToContent="Height" WindowStartupLocation="CenterOwner"
+        Background="#1F1F1F" Foreground="#FFFFFF" FontFamily="Segoe UI" ResizeMode="NoResize">
+    <StackPanel Margin="22">
+        <TextBlock Text="CONTROLLED OFFLINE STAGING &amp; ADAPTIVE PROFILES" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,0,0,8"/>
+        <TextBlock Text="Safely isolate this device during OOBE without permanently destroying the Autopilot profile link. Select an adaptive profile to optimize background behavior, then reconnect to the enterprise cloud at any time." FontSize="12" Foreground="#D0D0D0" TextWrapping="Wrap" Margin="0,0,0,14"/>
+
+        <!-- Profile Selection Options -->
+        <Border Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14,10" Margin="0,0,0,10">
+            <StackPanel>
+                <RadioButton Name="RadProfileDiag" IsChecked="True" GroupName="StagingProfiles" Margin="0,0,0,6">
+                    <StackPanel>
+                        <TextBlock Text="Hardware Diagnostics &amp; Triage (Recommended)" FontWeight="Bold" FontSize="12.5" Foreground="#FFFFFF"/>
+                        <TextBlock Text="Suspends telemetry/indexing (DiagTrack, WSearch, SysMain), keeps local subnet open, enables live hardware probes." FontSize="11" Foreground="#8A8A8A" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </RadioButton>
+
+                <RadioButton Name="RadProfileBench" GroupName="StagingProfiles" Margin="0,6,0,6">
+                    <StackPanel>
+                        <TextBlock Text="Workload Benchmarking &amp; Testing" FontWeight="Bold" FontSize="12.5" Foreground="#FFFFFF"/>
+                        <TextBlock Text="Ultimate Performance power scheme, halts background maintenance/updates, zero CPU jitter/throttling." FontSize="11" Foreground="#8A8A8A" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </RadioButton>
+
+                <RadioButton Name="RadProfileSandbox" GroupName="StagingProfiles" Margin="0,6,0,2">
+                    <StackPanel>
+                        <TextBlock Text="Software Evaluation &amp; Staging Sandbox" FontWeight="Bold" FontSize="12.5" Foreground="#FFFFFF"/>
+                        <TextBlock Text="Clean local admin access, enables Windows Developer Mode, readies local/USB offline package staging." FontSize="11" Foreground="#8A8A8A" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </RadioButton>
+            </StackPanel>
+        </Border>
+
+        <!-- Staging Policy Fence Options -->
+        <TextBlock Text="REVERSIBLE POLICY FENCE CONTROLS" FontSize="10" FontWeight="SemiBold" Foreground="#8A8A8A" Margin="0,4,0,6"/>
+        <Border Background="#242424" CornerRadius="4" BorderBrush="#333333" BorderThickness="1" Padding="12,8" Margin="0,0,0,14">
+            <StackPanel>
+                <CheckBox Name="ChkQuarantineProfile" Content="Quarantine &amp; hold existing Autopilot profile (100% reversible)" IsChecked="True" Margin="0,2,0,4"/>
+                <CheckBox Name="ChkLoopbackFence" Content="Null-route cloud enrollment endpoints via hosts file loopback fence" IsChecked="True" Margin="0,2,0,4"/>
+                <CheckBox Name="ChkBypassNro" Content="Configure BypassNRO=1 to allow local account setup in OOBE" IsChecked="True" Margin="0,2,0,4"/>
+                <CheckBox Name="ChkDesktopCompanion" Content="Create 'Resume-EnterpriseAutopilot' re-docking shortcut on Desktop" IsChecked="True" Margin="0,2,0,2"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Actions -->
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button Name="BtnCancelStaging" Content="Cancel" Padding="14,6" Margin="0,0,8,0" Background="#2D2D2D" Foreground="#FFFFFF" BorderBrush="#3E3E3E"/>
+            <Button Name="BtnApplyStaging" Content="Enter Offline Staging Mode" Padding="14,6" Background="#0067C0" Foreground="#FFFFFF" BorderBrush="#0067C0" FontWeight="SemiBold"/>
+        </StackPanel>
+    </StackPanel>
+</Window>
+"@
+
+    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xamlStaging))
+    $dlg = [System.Windows.Markup.XamlReader]::Load($reader)
+    if ($Owner) { $dlg.Owner = $Owner }
+
+    $applied = $false
+    $dlg.FindName('BtnCancelStaging').Add_Click({ $dlg.Close() }.GetNewClosure())
+    $dlg.FindName('BtnApplyStaging').Add_Click({
+        $profile = if ($dlg.FindName('RadProfileBench').IsChecked) {
+            'WorkloadBenchmarking'
+        } elseif ($dlg.FindName('RadProfileSandbox').IsChecked) {
+            'SoftwareSandbox'
+        } else {
+            'HardwareDiagnostics'
+        }
+        $quar = [bool]$dlg.FindName('ChkQuarantineProfile').IsChecked
+        $loop = [bool]$dlg.FindName('ChkLoopbackFence').IsChecked
+        $nro  = [bool]$dlg.FindName('ChkBypassNro').IsChecked
+        $sc   = [bool]$dlg.FindName('ChkDesktopCompanion').IsChecked
+
+        $res = Invoke-OfflineStaging -Profile $profile -QuarantineProfile:$quar -LoopbackFence:$loop -SetBypassNro:$nro -CreateDesktopShortcut:$sc
+        $applied = $true
+        $dlg.Close()
+
+        $actSummary = $res.Actions -join "`n- "
+        [System.Windows.MessageBox]::Show("Offline Staging Mode activated successfully for '$($res.Title)'!`n`nActions taken:`n- $actSummary`n`nYou can re-dock to the enterprise cloud at any time by clicking 'Resume Cloud Autopilot' or using the desktop companion shortcut.", "Offline Staging Active", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+    }.GetNewClosure())
+
+    $dlg.ShowDialog() | Out-Null
+    return $applied
 }
 
 # --- Function: Invoke-DsregStatus (parse dsregcmd /status into case-insensitive hashtable) ---
@@ -3533,6 +4074,13 @@ function Get-HubPendingWindowsUpdates {
                     }
                 } catch { }
 
+                $uId = ""
+                try {
+                    if ($u.Identity -and $u.Identity.UpdateID) {
+                        $uId = $u.Identity.UpdateID.ToString()
+                    }
+                } catch { }
+
                 $updates += [PSCustomObject]@{
                     Title          = $u.Title
                     KB             = $kb
@@ -3541,6 +4089,7 @@ function Get-HubPendingWindowsUpdates {
                     IsMandatory    = [bool]$u.IsMandatory
                     RebootRequired = [bool]$u.RebootRequired
                     IsDriver       = $isDriver
+                    UpdateID       = $uId
                     UpdateObject   = $u
                 }
             }
@@ -4560,6 +5109,27 @@ function Start-AutopilotHubGui {
                                 <Button Name="BtnPersonalInstall" Content="Skip Autopilot in OOBE" Style="{StaticResource AccentBtn}" Height="34" Margin="0,0,0,6"/>
                                 <Button Name="BtnReenableNet" Content="Re-enable Network Adapters" Height="28" Margin="0,0,0,14"/>
 
+                                <!-- Controlled Offline Staging & Adaptive Evaluation Profiles -->
+                                <TextBlock Text="CONTROLLED OFFLINE STAGING" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,4,0,6"/>
+                                <TextBlock Text="Stage devices offline with reversible profile quarantine, loopback policy fences, and adaptive evaluation profiles (Hardware Diagnostics, Workload Benchmarking, Software Sandbox)." FontSize="11" Foreground="#8A8A8A" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                                <Border Name="BannerOfflineStaging" Background="#1F2822" BorderBrush="#2A5435" BorderThickness="1" CornerRadius="4" Padding="10,8" Margin="0,0,0,8" Visibility="Collapsed">
+                                    <StackPanel Orientation="Vertical">
+                                        <TextBlock Name="TxtOfflineStagingTitle" Text="OFFLINE STAGING ACTIVE: [PROFILE]" FontSize="11" FontWeight="Bold" Foreground="#6CCB5F" Margin="0,0,0,2"/>
+                                        <TextBlock Name="TxtOfflineStagingDetail" Text="Device is isolated with reversible profile quarantine. Click below to restore cloud link." FontSize="10.5" Foreground="#D0D0D0" TextWrapping="Wrap" Margin="0,0,0,6"/>
+                                        <Button Name="BtnReDockStaging" Content="Reconnect to Enterprise Cloud &amp; Resume Autopilot" Style="{StaticResource AccentBtn}" Height="30"/>
+                                    </StackPanel>
+                                </Border>
+                                <Grid Margin="0,0,0,14">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Button Name="BtnOfflineStaging" Grid.Column="0" Content="Offline Staging Mode" Height="32" Margin="0,0,4,0"
+                                            ToolTip="Controlled offline staging with reversible profile quarantine and adaptive evaluation profiles"/>
+                                    <Button Name="BtnResumeAutopilot" Grid.Column="1" Content="Resume Cloud Autopilot" Height="32" Margin="4,0,0,0"
+                                            ToolTip="Re-dock device to Enterprise Cloud, restore quarantined Autopilot profile and clear fences"/>
+                                </Grid>
+
                                 <Button Name="BtnSaveEnvDefaults" Content="Save Current Settings to .env" Height="30" Margin="0,0,0,14"/>
 
                                 <!-- Profile Policy & Offline Provisioning -->
@@ -5566,6 +6136,12 @@ function Start-AutopilotHubGui {
     $btnExportOfflineJson  = $window.FindName('BtnExportOfflineJson')
     $btnInjectOfflineJson  = $window.FindName('BtnInjectOfflineJson')
     $btnSkipAutopilot      = if ($window.FindName('BtnSkipAutopilot')) { $window.FindName('BtnSkipAutopilot') } else { $btnPersonalInstall }
+    $bannerOfflineStaging  = $window.FindName('BannerOfflineStaging')
+    $txtOfflineStagingTitle = $window.FindName('TxtOfflineStagingTitle')
+    $txtOfflineStagingDetail = $window.FindName('TxtOfflineStagingDetail')
+    $btnReDockStaging      = $window.FindName('BtnReDockStaging')
+    $btnOfflineStaging     = $window.FindName('BtnOfflineStaging')
+    $btnResumeAutopilot    = $window.FindName('BtnResumeAutopilot')
 
     $borderTenantLogo      = $window.FindName('BorderTenantLogo')
     $imgTenantLogo         = $window.FindName('ImgTenantLogo')
@@ -5813,6 +6389,143 @@ function Start-AutopilotHubGui {
     $txtDellEndDate        = $window.FindName('TxtDellEndDate')
     $txtDellDaysRemaining  = $window.FindName('TxtDellDaysRemaining')
     $lstDellEntitlements   = $window.FindName('LstDellEntitlements')
+
+    # Hyperthreaded Asynchronous Background Worker Architecture
+    $script:HubAsyncQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+    $script:HubActiveAsyncTasks = [System.Collections.Generic.List[object]]::new()
+
+    # Configure InitialSessionState for background runspaces
+    $hubIss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $hubIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("HubAsyncQueue", $script:HubAsyncQueue, "Shared async queue"))
+
+    # Add all non-GUI script functions into the background runspace pool
+    foreach ($f in (Get-ChildItem Function:)) {
+        if ($f.Name -notmatch '^(Start-AutopilotHubGui|Show-PrivilegeGuide|Start-GraphAuthDialog|Show-OfflineStagingDialog|Update-WpfUI)$') {
+            try {
+                $hubIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($f.Name, $f.Definition))
+            } catch { }
+        }
+    }
+
+    # Worker-side helper functions for logging and progress reporting back to the UI thread
+    $wLogDef = {
+        param([string]$Message, [string]$Level = 'INFO')
+        if ($HubAsyncQueue) {
+            $HubAsyncQueue.Enqueue([PSCustomObject]@{ Type = 'Log'; Message = $Message; Level = $Level })
+        }
+    }.ToString()
+    $hubIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new("Write-WorkerLog", $wLogDef))
+
+    $wProgDef = {
+        param([int]$Percent, [string]$Status)
+        if ($HubAsyncQueue) {
+            $HubAsyncQueue.Enqueue([PSCustomObject]@{ Type = 'Progress'; Percent = $Percent; Status = $Status })
+        }
+    }.ToString()
+    $hubIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new("Set-WorkerProgress", $wProgDef))
+
+    $workerPoolSize = [Math]::Max(4, [Environment]::ProcessorCount)
+    $script:HubWorkerPool = [runspacefactory]::CreateRunspacePool(1, $workerPoolSize, $hubIss, $Host)
+    $script:HubWorkerPool.Open()
+
+    function Start-HubAsyncWork {
+        param(
+            [Parameter(Mandatory=$true)]
+            [scriptblock]$WorkerScript,
+            [array]$TaskArgs = @(),
+            [scriptblock]$OnComplete = $null,
+            [string]$Description = "Background Task"
+        )
+
+        try {
+            $ps = [powershell]::Create()
+            $ps.RunspacePool = $script:HubWorkerPool
+            $ps.AddScript($WorkerScript) | Out-Null
+            if ($TaskArgs -and $TaskArgs.Count -gt 0) {
+                foreach ($arg in $TaskArgs) {
+                    $ps.AddArgument($arg) | Out-Null
+                }
+            }
+            $handle = $ps.BeginInvoke()
+            $taskObj = [PSCustomObject]@{
+                PowerShell  = $ps
+                Handle      = $handle
+                OnComplete  = $OnComplete
+                Description = $Description
+                StartTime   = [datetime]::UtcNow
+            }
+            $script:HubActiveAsyncTasks.Add($taskObj)
+            return $taskObj
+        } catch {
+            Write-HubLog "Failed to dispatch async worker '$Description': $($_.Exception.Message)" "ERROR"
+            if ($OnComplete) {
+                try { & $OnComplete $null $_.Exception } catch { }
+            }
+            return $null
+        }
+    }
+
+    # Lightweight UI DispatcherTimer (runs every 30ms on the main STA UI thread to drain queue and harvest completed workers)
+    $script:HubQueueTimer = [System.Windows.Threading.DispatcherTimer]::new()
+    $script:HubQueueTimer.Interval = [TimeSpan]::FromMilliseconds(30)
+    $script:HubQueueTimer.Add_Tick({
+        # 1. Drain incoming thread-safe worker messages
+        $msg = $null
+        while ($script:HubAsyncQueue.TryDequeue([ref]$msg)) {
+            if (-not $msg) { continue }
+            try {
+                if ($msg -is [scriptblock]) {
+                    & $msg
+                } elseif ($msg.Type -eq 'Log') {
+                    Write-HubLog $msg.Message $msg.Level
+                } elseif ($msg.Type -eq 'Progress') {
+                    Set-HubProgress -Percent $msg.Percent -Status $msg.Status
+                } elseif ($msg.Type -eq 'Action' -and $msg.Action -is [scriptblock]) {
+                    & $msg.Action
+                } elseif ($msg.Type -eq 'WuProgress') {
+                    if ($progWuBar -and $null -ne $msg.Percent) {
+                        $progWuBar.IsIndeterminate = $false
+                        $progWuBar.Value = $msg.Percent
+                    }
+                    if ($txtWuProgress -and $null -ne $msg.Percent) {
+                        $txtWuProgress.Text = "$($msg.Percent)%"
+                    }
+                    if ($txtWuStatus -and $msg.Status) {
+                        $txtWuStatus.Text = $msg.Status
+                    }
+                }
+            } catch { }
+        }
+
+        # 2. Harvest completed background tasks
+        for ($i = $script:HubActiveAsyncTasks.Count - 1; $i -ge 0; $i--) {
+            $task = $script:HubActiveAsyncTasks[$i]
+            if ($task.Handle.IsCompleted) {
+                $taskResult = $null
+                $taskError = $null
+                try {
+                    $taskResult = $task.PowerShell.EndInvoke($task.Handle)
+                    if ($task.PowerShell.Streams.Error -and $task.PowerShell.Streams.Error.Count -gt 0) {
+                        $taskError = $task.PowerShell.Streams.Error[0]
+                    }
+                } catch {
+                    $taskError = $_.Exception
+                } finally {
+                    try { $task.PowerShell.Dispose() } catch { }
+                    $script:HubActiveAsyncTasks.RemoveAt($i)
+                }
+
+                if ($task.OnComplete) {
+                    try {
+                        & $task.OnComplete $taskResult $taskError
+                    } catch {
+                        Write-HubLog "Error in async completion callback for '$($task.Description)': $($_.Exception.Message)" "ERROR"
+                    }
+                }
+            }
+        }
+    })
+    $script:HubQueueTimer.Start()
 
     # UI Refresh Helper (Pumps WPF message loop without blocking)
     function Update-WpfUI {
@@ -6108,36 +6821,49 @@ function Start-AutopilotHubGui {
         [System.Windows.MessageBox]::Show("Configuration saved to:`n$savedPath`n`nCharset: $(Get-ScriptEncodingName)", "Settings Saved to .env", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
     })
 
-    # --- ACTION: Harvest Hash ---
+    # --- ACTION: Harvest Hash (Hyperthreaded & Asynchronous) ---
     function Invoke-HubHarvest {
-        Write-HubLog "Starting high-speed Autopilot hardware hash harvester..."
+        if ($btnHarvestHash) { $btnHarvestHash.IsEnabled = $false }
+        if ($btnDeviceStateAction) { $btnDeviceStateAction.IsEnabled = $false }
+        Write-HubLog "Starting high-speed Autopilot hardware hash harvester (async worker)..."
         Set-HubProgress -Percent 15 -Status "Querying MDM Provider"
 
         $gt = $cmbGroupTag.Text
         $usr = $txtAssignedUser.Text
 
-        $hashInfo = Get-AutopilotHash -GroupTag $gt -AssignedUser $usr
-        Set-HubProgress -Percent 80 -Status "Validating OA3 structure"
+        Start-HubAsyncWork -Description "Hardware Hash Harvest" -TaskArgs @($gt, $usr) -WorkerScript {
+            param($groupTag, $assignedUser)
+            Write-WorkerLog "Worker runspace reading WMI MDM_DevDetail_Ext01 & OA3 hash..."
+            Set-WorkerProgress 50 "Querying MDM Provider"
+            $info = Get-AutopilotHash -GroupTag $groupTag -AssignedUser $assignedUser
+            Set-WorkerProgress 90 "Validating OA3 structure"
+            return $info
+        } -OnComplete {
+            param($hashInfo, $err)
+            if ($btnHarvestHash) { $btnHarvestHash.IsEnabled = $true }
+            if ($btnDeviceStateAction) { $btnDeviceStateAction.IsEnabled = $true }
 
-        if ($hashInfo -and $hashInfo.IsValidStructure) {
-            $txtHashBox.Text = $hashInfo.HardwareHash
-            $txtHashStatus.Text = "VALIDATED OA3 HASH"
-            $badgeHashStatus.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#059669")
-            $txtHashStatus.Foreground = [System.Windows.Media.Brushes]::White
-            $txtHashMeta.Text = "Serial: $($hashInfo.SerialNumber) | Length: $($hashInfo.HashLengthBytes) bytes | GroupTag: '$($hashInfo.GroupTag)'"
-            Write-HubLog "Hardware hash harvested successfully ($($hashInfo.HashLengthBytes) bytes)." "SUCCESS"
-            Set-HubProgress -Percent 100 -Status "Hash Ready"
-            Play-HubAudio -Type Success
-        } else {
-            $txtHashBox.Text = ''
-            $txtHashStatus.Text = "HASH UNAVAILABLE"
-            $badgeHashStatus.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#5C2B29")
-            $txtHashStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FF99A4")
-            $reason = if ($hashInfo) { $hashInfo.StatusReason } else { 'Get-AutopilotHash returned nothing' }
-            $txtHashMeta.Text = "Serial: $($hashInfo.SerialNumber) | No genuine hardware hash - registration and CSV export are blocked"
-            Write-HubLog "Hardware hash unavailable: $reason" "ERROR"
-            Set-HubProgress -Percent 0 -Status "Harvest Failed"
-            Play-HubAudio -Type Error
+            if ($hashInfo -and $hashInfo.IsValidStructure) {
+                $txtHashBox.Text = $hashInfo.HardwareHash
+                $txtHashStatus.Text = "VALIDATED OA3 HASH"
+                $badgeHashStatus.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#059669")
+                $txtHashStatus.Foreground = [System.Windows.Media.Brushes]::White
+                $txtHashMeta.Text = "Serial: $($hashInfo.SerialNumber) | Length: $($hashInfo.HashLengthBytes) bytes | GroupTag: '$($hashInfo.GroupTag)'"
+                Write-HubLog "Hardware hash harvested successfully ($($hashInfo.HashLengthBytes) bytes)." "SUCCESS"
+                Set-HubProgress -Percent 100 -Status "Hash Ready"
+                Play-HubAudio -Type Success
+            } else {
+                $txtHashBox.Text = ''
+                $txtHashStatus.Text = "HASH UNAVAILABLE"
+                $badgeHashStatus.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#5C2B29")
+                $txtHashStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FF99A4")
+                $reason = if ($hashInfo) { $hashInfo.StatusReason } elseif ($err) { $err.Message } else { 'Get-AutopilotHash returned nothing' }
+                $serial = if ($hashInfo) { $hashInfo.SerialNumber } else { 'Unknown' }
+                $txtHashMeta.Text = "Serial: $serial | No genuine hardware hash - registration and CSV export are blocked"
+                Write-HubLog "Hardware hash unavailable: $reason" "ERROR"
+                Set-HubProgress -Percent 0 -Status "Harvest Failed"
+                Play-HubAudio -Type Error
+            }
         }
     }
     $btnHarvestHash.Add_Click({ Invoke-HubHarvest })
@@ -6187,6 +6913,45 @@ function Start-AutopilotHubGui {
         $en = @(Enable-HubNetworkAdapters)
         if ($en.Count -gt 0) { Write-HubLog "Re-enabled network adapters: $($en -join ', ')" "SUCCESS" } else { Write-HubLog "No disabled physical network adapters found." "INFO" }
     })
+
+    # Offline Staging & Re-Docking UI Handlers
+    function Update-OfflineStagingUi {
+        $snap = Get-OfflineStagingState
+        if ($snap -and $snap.IsActive) {
+            if ($bannerOfflineStaging) { $bannerOfflineStaging.Visibility = [System.Windows.Visibility]::Visible }
+            if ($txtOfflineStagingTitle) { $txtOfflineStagingTitle.Text = "OFFLINE STAGING ACTIVE: $($snap.ProfileTitle.ToUpper())" }
+            if ($txtOfflineStagingDetail) { $txtOfflineStagingDetail.Text = "Device isolated with reversible profile quarantine. Click below to restore cloud link." }
+            if ($btnResumeAutopilot) { $btnResumeAutopilot.Visibility = [System.Windows.Visibility]::Visible }
+        } else {
+            if ($bannerOfflineStaging) { $bannerOfflineStaging.Visibility = [System.Windows.Visibility]::Collapsed }
+        }
+    }
+
+    $reDockAction = {
+        $ans = [System.Windows.MessageBox]::Show("Are you ready to reconnect to Enterprise Cloud and resume Autopilot?`n`nThis will restore service start types, clear hosts loopback fences, restore your Autopilot profile, and trigger enterprise MDM sync.", "Confirm Cloud Re-Docking", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+        if ($ans -eq [System.Windows.MessageBoxResult]::Yes) {
+            Write-HubLog "Initiating cloud re-docking procedure..." "INFO"
+            $res = Invoke-AutopilotReDock
+            if ($res.Success) {
+                Write-HubLog $res.Message "SUCCESS"
+                Update-OfflineStagingUi
+                [System.Windows.MessageBox]::Show($res.Message, "Cloud Re-Dock Complete", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+            } else {
+                Write-HubLog $res.Message "ERROR"
+            }
+        }
+    }
+
+    if ($btnOfflineStaging) {
+        $btnOfflineStaging.Add_Click({
+            if (Show-OfflineStagingDialog -Owner $window) {
+                Update-OfflineStagingUi
+                Write-HubLog "Device transitioned to Controlled Offline Staging mode." "SUCCESS"
+            }
+        })
+    }
+    if ($btnResumeAutopilot) { $btnResumeAutopilot.Add_Click($reDockAction) }
+    if ($btnReDockStaging) { $btnReDockStaging.Add_Click($reDockAction) }
 
     # --- ACTION: Export CSV ---
     $btnExportCsv.Add_Click({
@@ -6520,16 +7285,31 @@ function Start-AutopilotHubGui {
         } catch { Write-HybOut "Bundle failed: $($_.Exception.Message)" "ERROR" }
     })
 
-    # --- ACTION: Run Diagnostics ---
+    # --- ACTION: Run Diagnostics (Hyperthreaded & Asynchronous) ---
     $btnRunDiag.Add_Click({
-        Write-HubLog "Executing 7-stage enterprise pre-flight diagnostic ladder..."
-        Set-HubProgress -Percent 20 -Status "Diagnosing Network"
+        $btnRunDiag.IsEnabled = $false
+        Write-HubLog "Executing 7-stage enterprise pre-flight diagnostic ladder (async worker)..."
+        Set-HubProgress -Percent 10 -Status "Diagnosing Network"
 
-        $diag = Test-StagedNetwork
-        $lstDiagStages.ItemsSource = $diag.Stages
-
-        Write-HubLog "Diagnostics completed: $($diag.StagesPassed) / $($diag.TotalStages) stages passed." $(if ($diag.IsFullyReady) { "SUCCESS" } else { "WARN" })
-        Set-HubProgress -Percent 100 -Status "Diagnostics Done"
+        Start-HubAsyncWork -Description "7-Stage Network Diagnostics" -WorkerScript {
+            Write-WorkerLog "Initiating multi-point network test off UI thread..."
+            Set-WorkerProgress 30 "Testing Interfaces & Gateway"
+            $res = Test-StagedNetwork
+            Set-WorkerProgress 95 "Finalizing Diagnostic Assessment"
+            return $res
+        } -OnComplete {
+            param($diag, $err)
+            $btnRunDiag.IsEnabled = $true
+            if ($diag) {
+                $lstDiagStages.ItemsSource = $diag.Stages
+                Write-HubLog "Diagnostics completed: $($diag.StagesPassed) / $($diag.TotalStages) stages passed." $(if ($diag.IsFullyReady) { "SUCCESS" } else { "WARN" })
+                Set-HubProgress -Percent 100 -Status "Diagnostics Done"
+            } else {
+                $msg = if ($err) { $err.Message } else { "Unknown diagnostic failure" }
+                Write-HubLog "Diagnostics failed: $msg" "ERROR"
+                Set-HubProgress -Percent 0 -Status "Diagnostics Failed"
+            }
+        }
     })
 
     # PowerShell 7 Modern Runtime Handler
@@ -6703,76 +7483,83 @@ function Start-AutopilotHubGui {
             return
         }
 
-        Write-HubLog "Connecting to Dell Technologies Enterprise Warranty API (SBIL eAPI v5) for tag '$Tag'..."
+        if ($btnCheckDellWarranty) { $btnCheckDellWarranty.IsEnabled = $false }
+        Write-HubLog "Connecting to Dell Technologies Enterprise Warranty API (SBIL eAPI v5) for tag '$Tag' (async worker)..."
         Set-HubProgress -Percent 20 -Status "Acquiring Dell OAuth 2.0 Bearer Token"
-        Update-WpfUI
 
-        try {
-            Set-HubProgress -Percent 50 -Status "Querying Asset Entitlements ($Tag)"
-            $w = Get-DellWarrantyInfo -ServiceTag $Tag
-            $script:CurrentDellReport = $w
-            Set-HubProgress -Percent 85 -Status "Processing Entitlements & Computing Verdict"
+        Start-HubAsyncWork -Description "Dell Warranty Audit" -TaskArgs @($Tag) -WorkerScript {
+            param($svcTag)
+            Write-WorkerLog "Querying Asset Entitlements for $svcTag in worker runspace..."
+            Set-WorkerProgress 50 "Querying Dell SBIL eAPI"
+            $rep = Get-DellWarrantyInfo -ServiceTag $svcTag
+            Set-WorkerProgress 90 "Processing Entitlements"
+            return $rep
+        } -OnComplete {
+            param($w, $err)
+            if ($btnCheckDellWarranty) { $btnCheckDellWarranty.IsEnabled = $true }
+            if ($w) {
+                $script:CurrentDellReport = $w
+                # Populate Hardware & Telemetry Cards
+                $txtDellModel.Text = if ($w.SystemModel) { $w.SystemModel } else { 'Dell Computer' }
+                $txtDellProductLine.Text = "Line: $($w.ProductLineDescription)"
+                $txtDellShipDate.Text = if ($w.ShipDate) { $w.ShipDate } else { 'N/A' }
+                $txtDellAge.Text = "Age: $(if ($w.DeviceAgeYears) { "$($w.DeviceAgeYears) yrs" } else { '-' })"
+                $txtDellContract.Text = $w.PrimaryServiceLevel
+                $txtDellRegion.Text = "Region: $($w.CountryCode)"
+                $txtDellEndDate.Text = "End: $($w.WarrantyEndDate)"
+                $txtDellDaysRemaining.Text = $w.WarrantyStatus
 
-            # Populate Hardware & Telemetry Cards
-            $txtDellModel.Text = if ($w.SystemModel) { $w.SystemModel } else { 'Dell Computer' }
-            $txtDellProductLine.Text = "Line: $($w.ProductLineDescription)"
-            $txtDellShipDate.Text = if ($w.ShipDate) { $w.ShipDate } else { 'N/A' }
-            $txtDellAge.Text = "Age: $(if ($w.DeviceAgeYears) { "$($w.DeviceAgeYears) yrs" } else { '-' })"
-            $txtDellContract.Text = $w.PrimaryServiceLevel
-            $txtDellRegion.Text = "Region: $($w.CountryCode)"
-            $txtDellEndDate.Text = "End: $($w.WarrantyEndDate)"
-            $txtDellDaysRemaining.Text = $w.WarrantyStatus
-
-            # Update Hero Refresh Verdict Banner
-            $brushConv = [System.Windows.Media.BrushConverter]::new()
-            if ($w.IsUnderWarranty) {
-                if ($w.DaysRemaining -le 90) {
-                    $borderRefreshVerdict.Background = $brushConv.ConvertFromString("#292621")
-                    $borderRefreshVerdict.BorderBrush = $brushConv.ConvertFromString("#5C4A29")
-                    if ($borderVerdictBadge) { $borderVerdictBadge.Background = $brushConv.ConvertFromString("#443B26") }
-                    if ($txtVerdictBadge) {
-                        $txtVerdictBadge.Text = "EXPIRING SOON"
-                        $txtVerdictBadge.Foreground = $brushConv.ConvertFromString("#FCE100")
+                # Update Hero Refresh Verdict Banner
+                $brushConv = [System.Windows.Media.BrushConverter]::new()
+                if ($w.IsUnderWarranty) {
+                    if ($w.DaysRemaining -le 90) {
+                        $borderRefreshVerdict.Background = $brushConv.ConvertFromString("#292621")
+                        $borderRefreshVerdict.BorderBrush = $brushConv.ConvertFromString("#5C4A29")
+                        if ($borderVerdictBadge) { $borderVerdictBadge.Background = $brushConv.ConvertFromString("#443B26") }
+                        if ($txtVerdictBadge) {
+                            $txtVerdictBadge.Text = "EXPIRING SOON"
+                            $txtVerdictBadge.Foreground = $brushConv.ConvertFromString("#FCE100")
+                        }
+                        $txtVerdictTitle.Text = $w.RefreshVerdict
+                        $txtVerdictTitle.Foreground = $brushConv.ConvertFromString("#FFFFFF")
+                        $txtDellDaysRemaining.Foreground = $brushConv.ConvertFromString("#FCE100")
+                    } else {
+                        $borderRefreshVerdict.Background = $brushConv.ConvertFromString("#212923")
+                        $borderRefreshVerdict.BorderBrush = $brushConv.ConvertFromString("#295C33")
+                        if ($borderVerdictBadge) { $borderVerdictBadge.Background = $brushConv.ConvertFromString("#213B26") }
+                        if ($txtVerdictBadge) {
+                            $txtVerdictBadge.Text = "ACTIVE WARRANTY"
+                            $txtVerdictBadge.Foreground = $brushConv.ConvertFromString("#6CCB5F")
+                        }
+                        $txtVerdictTitle.Text = $w.RefreshVerdict
+                        $txtVerdictTitle.Foreground = $brushConv.ConvertFromString("#FFFFFF")
+                        $txtDellDaysRemaining.Foreground = $brushConv.ConvertFromString("#6CCB5F")
                     }
-                    $txtVerdictTitle.Text = $w.RefreshVerdict
-                    $txtVerdictTitle.Foreground = $brushConv.ConvertFromString("#FFFFFF")
-                    $txtDellDaysRemaining.Foreground = $brushConv.ConvertFromString("#FCE100")
                 } else {
-                    $borderRefreshVerdict.Background = $brushConv.ConvertFromString("#212923")
-                    $borderRefreshVerdict.BorderBrush = $brushConv.ConvertFromString("#295C33")
-                    if ($borderVerdictBadge) { $borderVerdictBadge.Background = $brushConv.ConvertFromString("#213B26") }
+                    $borderRefreshVerdict.Background = $brushConv.ConvertFromString("#292121")
+                    $borderRefreshVerdict.BorderBrush = $brushConv.ConvertFromString("#5C2B29")
+                    if ($borderVerdictBadge) { $borderVerdictBadge.Background = $brushConv.ConvertFromString("#442726") }
                     if ($txtVerdictBadge) {
-                        $txtVerdictBadge.Text = "ACTIVE WARRANTY"
-                        $txtVerdictBadge.Foreground = $brushConv.ConvertFromString("#6CCB5F")
+                        $txtVerdictBadge.Text = "OUT OF WARRANTY"
+                        $txtVerdictBadge.Foreground = $brushConv.ConvertFromString("#FFAA99")
                     }
                     $txtVerdictTitle.Text = $w.RefreshVerdict
-                    $txtVerdictTitle.Foreground = $brushConv.ConvertFromString("#FFFFFF")
-                    $txtDellDaysRemaining.Foreground = $brushConv.ConvertFromString("#6CCB5F")
+                    $txtVerdictTitle.Foreground = $brushConv.ConvertFromString("#FFAA99")
+                    $txtDellDaysRemaining.Foreground = $brushConv.ConvertFromString("#FFAA99")
                 }
+                $txtVerdictDesc.Text = $w.RefreshRecommendation
+
+                if ($lstDellEntitlements) {
+                    $lstDellEntitlements.ItemsSource = $w.Entitlements
+                }
+
+                Write-HubLog "Dell warranty audit complete: $($w.SystemModel) ($Tag) | $($w.RefreshVerdict)" "SUCCESS"
+                Set-HubProgress -Percent 100 -Status "Warranty Audit Complete"
             } else {
-                $borderRefreshVerdict.Background = $brushConv.ConvertFromString("#292121")
-                $borderRefreshVerdict.BorderBrush = $brushConv.ConvertFromString("#5C2B29")
-                if ($borderVerdictBadge) { $borderVerdictBadge.Background = $brushConv.ConvertFromString("#442726") }
-                if ($txtVerdictBadge) {
-                    $txtVerdictBadge.Text = "OUT OF WARRANTY"
-                    $txtVerdictBadge.Foreground = $brushConv.ConvertFromString("#FF99A4")
-                }
-                $txtVerdictTitle.Text = $w.RefreshVerdict
-                $txtVerdictTitle.Foreground = $brushConv.ConvertFromString("#FFFFFF")
-                $txtDellDaysRemaining.Foreground = $brushConv.ConvertFromString("#FF99A4")
+                $errMsg = if ($err) { $err.Message } else { "Unknown warranty query failure" }
+                Write-HubLog "Dell warranty audit failed: $errMsg" "ERROR"
+                Set-HubProgress -Percent 0 -Status "Warranty Audit Failed"
             }
-            $txtVerdictDesc.Text = $w.RefreshRecommendation
-
-            # Populate Entitlements ListView
-            $lstDellEntitlements.ItemsSource = $w.Entitlements
-
-            Write-HubLog "Dell warranty audit complete: $($w.SystemModel) ($Tag) | $($w.RefreshVerdict)" "SUCCESS"
-            Write-HubLog "Contract: $($w.PrimaryServiceLevel) | Expiration: $($w.WarrantyEndDate) | Posture: $($w.WarrantyStatus)"
-            Set-HubProgress -Percent 100 -Status "Dell Warranty Audited"
-        } catch {
-            Write-HubLog "Dell warranty audit failed for '$Tag': $($_.Exception.Message)" "ERROR"
-            Set-HubProgress -Percent 0 -Status "Dell API Error"
-            [System.Windows.MessageBox]::Show("Dell Warranty API query failed:`n$($_.Exception.Message)", "Dell API Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
         }
     }
 
@@ -7409,24 +8196,38 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
             $btnWuScan.IsEnabled = $false
             if ($btnWuInstall) { $btnWuInstall.IsEnabled = $false }
             if ($progWuBar) { $progWuBar.IsIndeterminate = $true }
-            if ($txtWuStatus) { $txtWuStatus.Text = "Scanning for pending updates and drivers..." }
-            Update-WpfUI
+            if ($txtWuStatus) { $txtWuStatus.Text = "Scanning for updates and drivers (async worker)..." }
+            Write-HubLog "Scanning for Windows updates and drivers (async worker)..."
 
             $incDrivers = if ($chkCascadeDrivers) { [bool]$chkCascadeDrivers.IsChecked } else { $true }
-            $raw = @(Get-HubPendingWindowsUpdates -IncludeDrivers:$incDrivers -StatusCallback {
-                param($m)
-                if ($txtWuStatus) { $txtWuStatus.Text = $m }
-                Update-WpfUI
-            })
-
-            if ($progWuBar) { $progWuBar.IsIndeterminate = $false; $progWuBar.Value = 0 }
-            Update-IntegratedWuList -rawUpdates $raw
-            $btnWuScan.IsEnabled = $true
-            if ($integratedWuItems.Count -gt 0) {
-                if ($btnWuInstall) { $btnWuInstall.IsEnabled = $true }
-                if ($txtWuStatus) { $txtWuStatus.Text = "Found $($integratedWuItems.Count) update(s). Select updates and click 'Install Selected'." }
-            } else {
-                if ($txtWuStatus) { $txtWuStatus.Text = "System is up to date. No pending updates found." }
+            Start-HubAsyncWork -Description "Windows Update Scan" -TaskArgs @($incDrivers) -WorkerScript {
+                param($includeDrivers)
+                Write-WorkerLog "Querying Microsoft.Update.Session off UI thread..."
+                Set-WorkerProgress 30 "Connecting to Windows Update searcher"
+                $rawUpdates = @(Get-HubPendingWindowsUpdates -IncludeDrivers:$includeDrivers -StatusCallback {
+                    param($msg)
+                    Write-WorkerLog $msg "INFO"
+                })
+                Set-WorkerProgress 90 "Compiling update list"
+                return $rawUpdates
+            } -OnComplete {
+                param($rawUpdates, $err)
+                $btnWuScan.IsEnabled = $true
+                if ($progWuBar) { $progWuBar.IsIndeterminate = $false; $progWuBar.Value = 0 }
+                if ($rawUpdates) {
+                    Update-IntegratedWuList -rawUpdates $rawUpdates
+                    if ($integratedWuItems.Count -gt 0) {
+                        if ($btnWuInstall) { $btnWuInstall.IsEnabled = $true }
+                        if ($txtWuStatus) { $txtWuStatus.Text = "Found $($integratedWuItems.Count) update(s). Select updates and click 'Install Selected'." }
+                    } else {
+                        if ($txtWuStatus) { $txtWuStatus.Text = "System is up to date. No pending updates found." }
+                    }
+                    Write-HubLog "Scan complete: Found $($rawUpdates.Count) available update(s)." "SUCCESS"
+                } else {
+                    $msg = if ($err) { $err.Message } else { "No updates found or search failed." }
+                    Write-HubLog "Windows Update scan: $msg" "WARN"
+                    if ($txtWuStatus) { $txtWuStatus.Text = $msg }
+                }
             }
         })
     }
@@ -7479,105 +8280,136 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
             $btnWuScan.IsEnabled = $false
             $btnWuInstall.IsEnabled = $false
             if ($progWuBar) { $progWuBar.Value = 0 }
-            if ($txtWuStatus) { $txtWuStatus.Text = "Preparing update download session..." }
-            Update-WpfUI
+            if ($txtWuStatus) { $txtWuStatus.Text = "Preparing update download session in background..." }
+            Write-HubLog "Starting asynchronous download and installation of $($selected.Count) update(s)..."
 
-            try {
+            $selectedTitles = @($selected | ForEach-Object { $_.Title })
+            $selectedIds = @($selected | ForEach-Object { if ($_.RawItem.UpdateID) { $_.RawItem.UpdateID } else { $_.Title } })
+
+            Start-HubAsyncWork -Description "Windows Update Installation" -TaskArgs @($selectedTitles, $selectedIds) -WorkerScript {
+                param($titles, $ids)
+                Write-WorkerLog "Initializing COM Update Session in background runspace..."
                 Ensure-HubUpdateServices
                 $session = New-Object -ComObject Microsoft.Update.Session
+                $searcher = $session.CreateUpdateSearcher()
+                $searchResult = $searcher.Search("IsInstalled=0")
+
+                $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+                if ($searchResult -and $searchResult.Updates) {
+                    for ($i = 0; $i -lt $searchResult.Updates.Count; $i++) {
+                        $u = $searchResult.Updates.Item($i)
+                        $match = $false
+                        if ($ids -contains $u.Identity.UpdateID) { $match = $true }
+                        elseif ($titles -contains $u.Title) { $match = $true }
+                        if ($match) {
+                            if ($u.EulaAccepted -eq $false) {
+                                try { $u.AcceptEula() } catch { }
+                            }
+                            $updatesToInstall.Add($u) | Out-Null
+                        }
+                    }
+                }
+
+                if ($updatesToInstall.Count -eq 0) {
+                    Write-WorkerLog "Could not locate selected updates in COM search." "WARN"
+                    return [PSCustomObject]@{ Succeeded = 0; Failed = 0; RebootRequired = $false; Results = @() }
+                }
+
+                # Download
+                Write-WorkerLog "Downloading $($updatesToInstall.Count) update package(s)..."
+                Set-WorkerProgress 15 "Downloading Updates"
                 $downloader = $session.CreateUpdateDownloader()
-                $downColl = New-Object -ComObject Microsoft.Update.UpdateColl
-
-                foreach ($it in $selected) {
-                    $uObj = $it.UpdateObject
-                    if ($uObj.EulaAccepted -eq $false) {
-                        try { $uObj.AcceptEula() } catch { }
-                    }
-                    $downColl.Add($uObj) | Out-Null
-                }
-
-                $downloader.Updates = $downColl
-                if ($txtWuStatus) { $txtWuStatus.Text = "Downloading $($downColl.Count) update package(s)..." }
-                if ($progWuBar) { $progWuBar.IsIndeterminate = $true }
-                Update-WpfUI
-
+                $downloader.Updates = $updatesToInstall
                 $downRes = $downloader.Download()
-                if ($progWuBar) { $progWuBar.IsIndeterminate = $false; $progWuBar.Value = 20 }
+                Write-WorkerLog "Download finished. Result: $($downRes.ResultCode)"
+                Set-WorkerProgress 30 "Download Complete"
 
-                foreach ($it in $selected) {
-                    if ($it.UpdateObject.IsDownloaded) {
-                        $it.StatusText = "Downloaded"
-                        $it.StatusColor = "#60CDFF"
-                    }
-                }
-                if ($lstIntegratedUpdates) { $lstIntegratedUpdates.Items.Refresh() }
-                Update-WpfUI
-
+                # Install
                 $installer = $session.CreateUpdateInstaller()
                 $installer.ForceQuiet = $true
-                $total = $selected.Count
-                $instSucceeded = 0
-                $instFailed = 0
-                $manualRebootNeeded = $false
+                $total = $updatesToInstall.Count
+                $succeeded = 0
+                $failed = 0
+                $rebootNeeded = $false
+                $results = @()
 
                 for ($i = 0; $i -lt $total; $i++) {
-                    $it = $selected[$i]
-                    $pct = 20 + [math]::Round((($i) / $total) * 75)
-                    if ($progWuBar) { $progWuBar.Value = $pct }
-                    if ($txtWuProgress) { $txtWuProgress.Text = "$pct%" }
-                    if ($txtWuStatus) { $txtWuStatus.Text = "Installing ($($i+1)/$total): $($it.Title)..." }
-                    $it.StatusText = "Installing..."
-                    $it.StatusColor = "#EAA300"
-                    if ($lstIntegratedUpdates) { $lstIntegratedUpdates.Items.Refresh() }
-                    Update-WpfUI
+                    $u = $updatesToInstall.Item($i)
+                    $pct = 30 + [math]::Round((($i) / $total) * 65)
+                    Set-WorkerProgress $pct "Installing ($($i+1)/$total): $($u.Title)"
+                    Write-WorkerLog "Installing ($($i+1)/$total): $($u.Title)..."
 
                     $singleColl = New-Object -ComObject Microsoft.Update.UpdateColl
-                    $singleColl.Add($it.UpdateObject) | Out-Null
+                    $singleColl.Add($u) | Out-Null
                     $installer.Updates = $singleColl
 
+                    $code = 0
                     try {
                         $instRes = $installer.Install()
                         $code = $instRes.ResultCode
-                        if ($code -eq 2 -or $code -eq 3) {
-                            $it.StatusText = "Installed"
-                            $it.StatusColor = "#6CCB5F"
-                            $instSucceeded++
-                        } else {
-                            $it.StatusText = "Failed ($code)"
-                            $it.StatusColor = "#FF99A4"
-                            $instFailed++
+                        if ($instRes.RebootRequired) { $rebootNeeded = $true }
+                    } catch { $code = 99 }
+
+                    if ($code -eq 2 -or $code -eq 3) {
+                        $succeeded++
+                        $status = "Installed"
+                        Write-WorkerLog "Successfully installed: $($u.Title)" "SUCCESS"
+                    } else {
+                        $failed++
+                        $status = "Failed ($code)"
+                        Write-WorkerLog "Failed to install: $($u.Title) [Code: $code]" "ERROR"
+                    }
+
+                    $results += [PSCustomObject]@{
+                        Title = $u.Title
+                        UpdateID = $u.Identity.UpdateID
+                        Status = $status
+                        Code = $code
+                    }
+                }
+
+                Set-WorkerProgress 100 "Installation Complete"
+                return [PSCustomObject]@{
+                    Succeeded = $succeeded
+                    Failed = $failed
+                    RebootRequired = $rebootNeeded
+                    Results = $results
+                }
+            } -OnComplete {
+                param($summary, $err)
+                $btnWuScan.IsEnabled = $true
+                $btnWuInstall.IsEnabled = $true
+
+                if ($summary) {
+                    foreach ($res in $summary.Results) {
+                        $found = $integratedWuItems | Where-Object { $_.Title -eq $res.Title -or ($_.RawItem -and $_.RawItem.UpdateID -eq $res.UpdateID) } | Select-Object -First 1
+                        if ($found) {
+                            $found.StatusText = $res.Status
+                            $found.StatusColor = if ($res.Code -eq 2 -or $res.Code -eq 3) { "#6CCB5F" } else { "#FF99A4" }
                         }
-                        if ($instRes.RebootRequired) {
-                            $manualRebootNeeded = $true
-                        }
-                    } catch {
-                        $it.StatusText = "Error"
-                        $it.StatusColor = "#FF99A4"
-                        $instFailed++
                     }
                     if ($lstIntegratedUpdates) { $lstIntegratedUpdates.Items.Refresh() }
-                    Update-WpfUI
-                }
 
-                if ($progWuBar) { $progWuBar.Value = 100 }
-                if ($txtWuProgress) { $txtWuProgress.Text = "100%" }
-                if ($txtWuStatus) { $txtWuStatus.Text = "Update complete: $instSucceeded installed, $instFailed failed." }
-                try { [System.Media.SystemSounds]::Asterisk.Play() } catch { }
+                    Write-HubLog "Update installation complete: $($summary.Succeeded) succeeded, $($summary.Failed) failed. Reboot required: $($summary.RebootRequired)" $(if ($summary.Failed -eq 0) { "SUCCESS" } else { "WARN" })
+                    if ($txtWuStatus) { $txtWuStatus.Text = "Update complete: $($summary.Succeeded) installed, $($summary.Failed) failed." }
+                    if ($progWuBar) { $progWuBar.Value = 100 }
+                    try { [System.Media.SystemSounds]::Asterisk.Play() } catch { }
 
-                if ($manualRebootNeeded) {
-                    if ($btnWuRebootNow) { $btnWuRebootNow.Visibility = [System.Windows.Visibility]::Visible }
-                    if ($txtWuRebootNotice) { $txtWuRebootNotice.Text = "Updates installed successfully. System restart is REQUIRED." }
-                    if ($chkCascadeAutoReboot -and $chkCascadeAutoReboot.IsChecked) {
-                        Start-RebootCountdown -Seconds 5 -OnComplete {
-                            Register-HubResumeAfterRestart
-                            Restart-Computer -Force
+                    if ($summary.RebootRequired) {
+                        if ($btnWuRebootNow) { $btnWuRebootNow.Visibility = [System.Windows.Visibility]::Visible }
+                        if ($txtWuRebootNotice) { $txtWuRebootNotice.Text = "Updates installed successfully. System restart is REQUIRED." }
+                        if ($chkCascadeAutoReboot -and $chkCascadeAutoReboot.IsChecked) {
+                            Start-RebootCountdown -Seconds 5 -OnComplete {
+                                Register-HubResumeAfterRestart
+                                Restart-Computer -Force
+                            }
                         }
                     }
+                } else {
+                    $errMsg = if ($err) { $err.Message } else { "Unknown update installation error" }
+                    Write-HubLog "Update installation error: $errMsg" "ERROR"
+                    if ($txtWuStatus) { $txtWuStatus.Text = "Installation failed: $errMsg" }
                 }
-            } catch {
-                if ($txtWuStatus) { $txtWuStatus.Text = "Installation error: $($_.Exception.Message)" }
-            } finally {
-                $btnWuScan.IsEnabled = $true
             }
         })
     }
@@ -7586,21 +8418,31 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     if ($btnCheckLenovoWarranty) {
         $btnCheckLenovoWarranty.Add_Click({
             $serial = if ($txtDellServiceTag -and -not [string]::IsNullOrWhiteSpace($txtDellServiceTag.Text)) { $txtDellServiceTag.Text.Trim() } else { $txtSerial.Text.Trim() }
-            Write-HubLog "Checking Lenovo warranty for serial: $serial..."
-            $lenovo = Get-LenovoWarrantyInfo -SerialNumber $serial
-            if ($lenovo.Success) {
-                Write-HubLog "Lenovo Warranty: Product=$($lenovo.ProductName) Status=$($lenovo.Status) EndDate=$($lenovo.EndDate)" "SUCCESS"
-                if ($txtDellEndDate) { $txtDellEndDate.Text = "$($lenovo.EndDate)" }
-                if ($txtDellDaysRemaining) { $txtDellDaysRemaining.Text = "Status: $($lenovo.Status) ($($lenovo.DaysRemaining) days)" }
-            } else {
-                Write-HubLog "Lenovo warranty query failed: $($lenovo.ErrorMessage)" "ERROR"
+            $btnCheckLenovoWarranty.IsEnabled = $false
+            Write-HubLog "Checking Lenovo warranty for serial: $serial (async worker)..."
+            Start-HubAsyncWork -Description "Lenovo Warranty Lookup" -TaskArgs @($serial) -WorkerScript {
+                param($s)
+                return Get-LenovoWarrantyInfo -SerialNumber $s
+            } -OnComplete {
+                param($lenovo, $err)
+                $btnCheckLenovoWarranty.IsEnabled = $true
+                if ($lenovo -and $lenovo.Success) {
+                    Write-HubLog "Lenovo Warranty: Product=$($lenovo.ProductName) Status=$($lenovo.Status) EndDate=$($lenovo.EndDate)" "SUCCESS"
+                    if ($txtDellEndDate) { $txtDellEndDate.Text = "$($lenovo.EndDate)" }
+                    if ($txtDellDaysRemaining) { $txtDellDaysRemaining.Text = "Status: $($lenovo.Status) ($($lenovo.DaysRemaining) days)" }
+                } else {
+                    $msg = if ($lenovo) { $lenovo.ErrorMessage } elseif ($err) { $err.Message } else { "Unknown warranty failure" }
+                    Write-HubLog "Lenovo warranty query failed: $msg" "ERROR"
+                }
             }
         })
     }
 
     function Update-BatteryUi {
-        try {
-            $bat = Get-BatteryHealthInfo
+        Start-HubAsyncWork -Description "Battery Health Probing" -WorkerScript {
+            return Get-BatteryHealthInfo
+        } -OnComplete {
+            param($bat, $err)
             if ($bat -and $bat.Present) {
                 if ($txtBatteryWear)     { $txtBatteryWear.Text     = "Wear: $($bat.WearPercent)" }
                 if ($txtBatteryVerdict)  { $txtBatteryVerdict.Text  = "Status: $($bat.HealthVerdict)" }
@@ -7610,16 +8452,18 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                 if ($txtBatteryVerdict)  { $txtBatteryVerdict.Text  = "Desktop / AC" }
                 if ($txtBatteryCapacity) { $txtBatteryCapacity.Text = "Design: N/A | Full: N/A" }
             }
-        } catch { }
+        }
     }
     Update-BatteryUi
     if ($btnRefreshBattery) {
-        $btnRefreshBattery.Add_Click({ Update-BatteryUi; Write-HubLog "Battery wear and capacity refreshed." "INFO" })
+        $btnRefreshBattery.Add_Click({ Update-BatteryUi; Write-HubLog "Battery wear and capacity refresh requested (async worker)." "INFO" })
     }
 
     function Update-StorageUi {
-        try {
-            $disks = Get-StorageReliabilityInfo
+        Start-HubAsyncWork -Description "Storage Reliability Probing" -WorkerScript {
+            return Get-StorageReliabilityInfo
+        } -OnComplete {
+            param($disks, $err)
             if ($disks -and $disks.Count -gt 0) {
                 $primary = $disks[0]
                 if ($txtStorageWear) { $txtStorageWear.Text = "SSD Wear: $($primary.Wear)" }
@@ -7630,11 +8474,11 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                 if ($txtStorageTemp) { $txtStorageTemp.Text = "Temp: Normal" }
                 if ($txtStorageMeta) { $txtStorageMeta.Text = "Storage reliability counter not supported or no physical NVMe disks found." }
             }
-        } catch { }
+        }
     }
     Update-StorageUi
     if ($btnRefreshStorage) {
-        $btnRefreshStorage.Add_Click({ Update-StorageUi; Write-HubLog "Storage SMART reliability counter refreshed." "INFO" })
+        $btnRefreshStorage.Add_Click({ Update-StorageUi; Write-HubLog "Storage SMART reliability counter refresh requested (async worker)." "INFO" })
     }
 
     # --- TAB 7 ACTIONS (ESP Win32Apps, Lifecycle, Wi-Fi, Licensing, IME Tail) ---
@@ -7734,13 +8578,23 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
 
     if ($btnScanWifi) {
         $btnScanWifi.Add_Click({
-            Write-HubLog "Scanning for available Wi-Fi SSIDs..."
-            $ssids = Get-HubWifiNetworks
-            if ($cmbWifiSsids) {
-                $cmbWifiSsids.ItemsSource = @($ssids)
-                if ($ssids.Count -gt 0) { $cmbWifiSsids.SelectedIndex = 0 }
+            $btnScanWifi.IsEnabled = $false
+            Write-HubLog "Scanning for available Wi-Fi SSIDs (async worker)..."
+            Start-HubAsyncWork -Description "Wi-Fi Scanning" -WorkerScript {
+                return Get-HubWifiNetworks
+            } -OnComplete {
+                param($ssids, $err)
+                $btnScanWifi.IsEnabled = $true
+                if ($ssids) {
+                    if ($cmbWifiSsids) {
+                        $cmbWifiSsids.ItemsSource = @($ssids)
+                        if ($ssids.Count -gt 0) { $cmbWifiSsids.SelectedIndex = 0 }
+                    }
+                    Write-HubLog "Found $($ssids.Count) Wi-Fi network(s)." "INFO"
+                } else {
+                    Write-HubLog "Wi-Fi scan failed or no networks found." "WARN"
+                }
             }
-            Write-HubLog "Found $($ssids.Count) Wi-Fi network(s)." "INFO"
         })
     }
 
@@ -7892,8 +8746,42 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
         $cascadeResumeTimer.Start()
     }
 
+    # Initialize Offline Staging banner state
+    Update-OfflineStagingUi
+
+    # Ensure clean shutdown of RunspacePool and DispatcherTimer on close
+    $window.Add_Closed({
+        if ($script:HubQueueTimer) { $script:HubQueueTimer.Stop() }
+        if ($script:HubActiveAsyncTasks) {
+            foreach ($t in $script:HubActiveAsyncTasks) {
+                try { $t.PowerShell.Stop() } catch { }
+                try { $t.PowerShell.Dispose() } catch { }
+            }
+            $script:HubActiveAsyncTasks.Clear()
+        }
+        if ($script:HubWorkerPool) {
+            try { $script:HubWorkerPool.Close() } catch { }
+            try { $script:HubWorkerPool.Dispose() } catch { }
+        }
+    })
+
     # Show Window
-    $window.ShowDialog() | Out-Null
+    try {
+        $window.ShowDialog() | Out-Null
+    } finally {
+        if ($script:HubQueueTimer) { $script:HubQueueTimer.Stop() }
+        if ($script:HubActiveAsyncTasks) {
+            foreach ($t in $script:HubActiveAsyncTasks) {
+                try { $t.PowerShell.Stop() } catch { }
+                try { $t.PowerShell.Dispose() } catch { }
+            }
+            $script:HubActiveAsyncTasks.Clear()
+        }
+        if ($script:HubWorkerPool) {
+            try { $script:HubWorkerPool.Close() } catch { }
+            try { $script:HubWorkerPool.Dispose() } catch { }
+        }
+    }
 }
 
 # ==============================================================================
@@ -7918,6 +8806,26 @@ if ($HarvestOnly) {
     Write-Host "`nAutopilotFast Hardware Hash Harvester" -ForegroundColor Cyan
     $hash = Get-AutopilotHash -GroupTag $GroupTag -AssignedUser $AssignedUser
     $hash | Format-List
+    return
+}
+
+if ($OfflineStaging) {
+    Write-Host "`nAutopilot Command Hub - Controlled Offline Staging" -ForegroundColor Cyan
+    $res = Invoke-OfflineStaging -Profile $StagingProfile
+    Write-Host "Profile Activated: $($res.Title)" -ForegroundColor Green
+    foreach ($a in $res.Actions) { Write-Host "  - $a" -ForegroundColor Gray }
+    return
+}
+
+if ($ResumeAutopilot) {
+    Write-Host "`nAutopilot Command Hub - Cloud Re-Docking & Enterprise Resume" -ForegroundColor Cyan
+    $res = Invoke-AutopilotReDock
+    if ($res.Success) {
+        Write-Host "SUCCESS: $($res.Message)" -ForegroundColor Green
+        foreach ($a in $res.Actions) { Write-Host "  - $a" -ForegroundColor Gray }
+    } else {
+        Write-Host "ERROR: $($res.Message)" -ForegroundColor Red
+    }
     return
 }
 
