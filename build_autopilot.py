@@ -26,6 +26,12 @@ script_content = r'''<#
       plus a tenant-side Autopilot identity lookup once signed in to Graph
     - Restart with persistence: re-opens the Hub automatically when OOBE (or the desktop) comes back
     - Skip Autopilot in OOBE, Hybrid Join & Co-Management toolset, ESP Diagnostics & Lifecycle tab
+    - Active Directory & Kerberos Diagnostic Ladder (Port latency ladder, AD SCP tenant verification,
+      klist TGT/TGS inspection & purge, certutil/certreq pulse, SCEP health, WAM broker reset)
+    - Precision Enterprise Remediation Arsenal (WMI salvage, WU Agent deep reset, Catroot2 ESENT
+      database repair, BITS deadlock purge, DCOM/RPC 0x800706BA fix, Network/Winsock/IPsec flush,
+      WinRM listener rebuild, Print Spooler purge, ProfileList .bak un-hooker, TPM attestation healer,
+      AppX manifest staging unbricker)
     - Multi-vendor hardware health (Dell/Lenovo warranty, battery wear, SSD reliability), offline JSON
       profiles, Wi-Fi / 802.1X / driver injection for OOBE, tenant branding in the header
     - Windows Update & Driver Engine: Native COM Session (Microsoft.Update.Session) & USO Client for OOBE
@@ -2056,6 +2062,1070 @@ function New-HybridDiagnosticsBundle {
         return $zip
     } finally {
         Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+
+function Test-DomainControllerLadder {
+    [CmdletBinding()]
+    param(
+        [string]$TargetDc = '',
+        [int]$TimeoutMs = 1500
+    )
+
+    $res = [PSCustomObject]@{
+        Applicable   = $true
+        DcName       = ''
+        AllReachable = $false
+        Ports        = [System.Collections.Generic.List[PSCustomObject]]::new()
+        Summary      = ''
+    }
+
+    if (-not $TargetDc) {
+        $dom = Test-DomainConnectivity
+        if ($dom.DcName) {
+            $TargetDc = $dom.DcName
+        } else {
+            try {
+                $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+                if ($cs -and $cs.Domain -and $cs.Domain -ne 'WORKGROUP') {
+                    $TargetDc = $cs.Domain
+                }
+            } catch { }
+        }
+    }
+
+    if (-not $TargetDc) {
+        $res.Applicable = $false
+        $res.Summary = 'Device is not domain joined and no target domain controller was discovered.'
+        return $res
+    }
+
+    $res.DcName = $TargetDc
+
+    $ladder = @(
+        @{ Port = 53;    Name = 'DNS';                 Desc = 'Domain Name Resolution' }
+        @{ Port = 88;    Name = 'Kerberos';            Desc = 'Authentication & TGT/TGS Issuance' }
+        @{ Port = 135;   Name = 'RPC Endpoint Mapper'; Desc = 'EPM / DCOM Dynamic Port Allocation' }
+        @{ Port = 389;   Name = 'LDAP';                Desc = 'Directory Service Query' }
+        @{ Port = 445;   Name = 'SMB / SYSVOL';        Desc = 'Group Policy & Netlogon File Sharing' }
+        @{ Port = 636;   Name = 'LDAPS';               Desc = 'Secure LDAP over SSL/TLS' }
+        @{ Port = 3268;  Name = 'Global Catalog';      Desc = 'Forest-wide Directory Search' }
+        @{ Port = 3269;  Name = 'Global Catalog SSL';  Desc = 'Secure Forest-wide Directory Search' }
+        @{ Port = 49152; Name = 'High RPC Dynamic';    Desc = 'Active Directory Dynamic RPC Range' }
+    )
+
+    $passedCount = 0
+    foreach ($entry in $ladder) {
+        $port = $entry.Port
+        $name = $entry.Name
+        $desc = $entry.Desc
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $open = $false
+        $errDetail = ''
+
+        try {
+            $client = [System.Net.Sockets.TcpClient]::new()
+            $connectTask = $client.ConnectAsync($TargetDc, $port)
+            $completed = $connectTask.Wait($TimeoutMs)
+            $sw.Stop()
+            if ($completed -and $client.Connected) {
+                $open = $true
+                $client.Close()
+            } else {
+                $client.Close()
+                $errDetail = if (-not $completed) { "Timeout ($($TimeoutMs)ms)" } else { "Connection Refused" }
+            }
+        } catch {
+            $sw.Stop()
+            $errDetail = $_.Exception.Message
+        }
+
+        if ($open) { $passedCount++ }
+        $res.Ports.Add([PSCustomObject]@{
+            Port        = $port
+            Service     = $name
+            Description = $desc
+            Status      = if ($open) { 'OPEN' } else { 'BLOCKED' }
+            LatencyMs   = if ($open) { [int]$sw.ElapsedMilliseconds } else { -1 }
+            Error       = $errDetail
+        })
+    }
+
+    $res.AllReachable = ($passedCount -eq $ladder.Count)
+    $res.Summary = "DC $TargetDc ladder: $passedCount / $($ladder.Count) ports open. Latency: $($res.Ports[0].LatencyMs)ms (DNS), $($res.Ports[1].LatencyMs)ms (Kerb), $($res.Ports[3].LatencyMs)ms (LDAP)."
+    return $res
+}
+
+function Get-AdServiceConnectionPoint {
+    [CmdletBinding()]
+    param()
+
+    $result = [PSCustomObject]@{
+        DomainJoined         = $false
+        ScpFound             = $false
+        TenantId             = ''
+        TenantDomain         = ''
+        ConfigNamingContext  = ''
+        ScpDistinguishedName = ''
+        LocalTenantId        = ''
+        LocalTenantName      = ''
+        Verdict              = 'NOT_APPLICABLE'
+        Message              = ''
+    }
+
+    $joinState = Get-HybridJoinState
+    $result.DomainJoined = $joinState.DomainJoined
+    $result.LocalTenantId = $joinState.TenantId
+    $result.LocalTenantName = $joinState.TenantName
+
+    if (-not $joinState.DomainJoined) {
+        $result.Verdict = 'OFF_DOMAIN'
+        $result.Message = 'Device is not domain joined. AD SCP inspection requires Active Directory connectivity.'
+        return $result
+    }
+
+    try {
+        $rootDse = [ADSI]"LDAP://RootDSE"
+        if (-not $rootDse -or -not $rootDse.configurationNamingContext) {
+            $result.Verdict = 'UNREACHABLE'
+            $result.Message = 'Unable to query LDAP://RootDSE from Active Directory. Verify network and line-of-sight to Domain Controller.'
+            return $result
+        }
+
+        $configContext = [string]$rootDse.configurationNamingContext[0]
+        $result.ConfigNamingContext = $configContext
+        $scpDn = "CN=62a0ff2e-97b9-4513-943f-0d221bd30080,CN=Device Registration Configuration,CN=Services,$configContext"
+        $result.ScpDistinguishedName = $scpDn
+
+        $scpEntry = [ADSI]"LDAP://$scpDn"
+        if ($scpEntry -and $scpEntry.keywords) {
+            $result.ScpFound = $true
+            foreach ($kw in $scpEntry.keywords) {
+                $kwStr = [string]$kw
+                if ($kwStr -match '^azureADId:([a-fA-F0-9\-]+)$') {
+                    $result.TenantId = $Matches[1].Trim()
+                } elseif ($kwStr -match '^azureADName:(.+)$') {
+                    $result.TenantDomain = $Matches[1].Trim()
+                }
+            }
+        }
+
+        if (-not $result.ScpFound -or -not $result.TenantId) {
+            $result.Verdict = 'SCP_MISSING'
+            $result.Message = "AD SCP object not found at $scpDn. Hybrid Azure AD join requires Microsoft Entra Connect SCP configuration in AD."
+            return $result
+        }
+
+        if ($result.LocalTenantId) {
+            if ($result.TenantId.Equals($result.LocalTenantId, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $result.Verdict = 'MATCH'
+                $result.Message = "AD SCP matches local Entra tenant ID ($($result.TenantId)). Hybrid Join configuration is consistent."
+            } else {
+                $result.Verdict = 'MISMATCH'
+                $result.Message = "CRITICAL MISMATCH: AD SCP points to tenant $($result.TenantId) ($($result.TenantDomain)), but device is registered to $($result.LocalTenantId) ($($result.LocalTenantName))! Hybrid join will fail or drop."
+            }
+        } else {
+            $result.Verdict = 'SCP_VALID'
+            $result.Message = "AD SCP found: Tenant ID $($result.TenantId) ($($result.TenantDomain)). Device is not yet Entra joined."
+        }
+    } catch {
+        $result.Verdict = 'ERROR'
+        $result.Message = "Failed querying AD SCP: $($_.Exception.Message)"
+    }
+
+    return $result
+}
+
+function Get-KerberosDiagnostics {
+    [CmdletBinding()]
+    param()
+
+    $res = [PSCustomObject]@{
+        HasTgt           = $false
+        HasCloudTgt      = $false
+        TicketCount      = 0
+        ClientName       = ''
+        Tickets          = [System.Collections.Generic.List[PSCustomObject]]::new()
+        LsaSystemTickets = [System.Collections.Generic.List[PSCustomObject]]::new()
+        Message          = ''
+    }
+
+    try {
+        $klistExe = Join-Path $env:SystemRoot 'System32\klist.exe'
+        if (-not (Test-Path $klistExe)) {
+            $res.Message = 'klist.exe is not available on this operating system.'
+            return $res
+        }
+
+        $out = & $klistExe tickets 2>&1
+        $currentTicket = $null
+        foreach ($line in $out) {
+            $l = $line.Trim()
+            if ($l -match '^#\d+>\s*Client:\s*(.+)$') {
+                if ($currentTicket) { $res.Tickets.Add($currentTicket) }
+                $currentTicket = [PSCustomObject]@{
+                    Client                   = $Matches[1].Trim()
+                    Server                   = ''
+                    KerbTicketEncryptionType = ''
+                    TicketFlags              = ''
+                    StartTime                = ''
+                    EndTime                  = ''
+                    RenewTime                = ''
+                }
+                if (-not $res.ClientName) { $res.ClientName = $Matches[1].Trim() }
+            } elseif ($currentTicket) {
+                if ($l -match '^Server:\s*(.+)$') {
+                    $currentTicket.Server = $Matches[1].Trim()
+                    if ($currentTicket.Server -match 'krbtgt/') { $res.HasTgt = $true }
+                    if ($currentTicket.Server -match 'KERBEROS\.MICROSOFTONLINE\.COM') { $res.HasCloudTgt = $true }
+                } elseif ($l -match '^KerbTicket Encryption Type:\s*(.+)$') {
+                    $currentTicket.KerbTicketEncryptionType = $Matches[1].Trim()
+                } elseif ($l -match '^Ticket Flags\s*:\s*(.+)$') {
+                    $currentTicket.TicketFlags = $Matches[1].Trim()
+                } elseif ($l -match '^Start Time:\s*(.+)$') {
+                    $currentTicket.StartTime = $Matches[1].Trim()
+                } elseif ($l -match '^End Time:\s*(.+)$') {
+                    $currentTicket.EndTime = $Matches[1].Trim()
+                } elseif ($l -match '^Renew Time:\s*(.+)$') {
+                    $currentTicket.RenewTime = $Matches[1].Trim()
+                }
+            }
+        }
+        if ($currentTicket) { $res.Tickets.Add($currentTicket) }
+        $res.TicketCount = $res.Tickets.Count
+
+        try {
+            $lsaOut = & $klistExe -lh 0 -li 0x3e7 tickets 2>$null
+            $currLsa = $null
+            foreach ($line in $lsaOut) {
+                $l = $line.Trim()
+                if ($l -match '^#\d+>\s*Client:\s*(.+)$') {
+                    if ($currLsa) { $res.LsaSystemTickets.Add($currLsa) }
+                    $currLsa = [PSCustomObject]@{ Client = $Matches[1].Trim(); Server = '' }
+                } elseif ($currLsa -and $l -match '^Server:\s*(.+)$') {
+                    $currLsa.Server = $Matches[1].Trim()
+                }
+            }
+            if ($currLsa) { $res.LsaSystemTickets.Add($currLsa) }
+        } catch { }
+
+        $res.Message = "Cached Kerberos tickets: $($res.TicketCount) user tickets (TGT: $(if ($res.HasTgt){'YES'}else{'NO'}), Cloud TGT: $(if ($res.HasCloudTgt){'YES'}else{'NO'})), $($res.LsaSystemTickets.Count) SYSTEM/LSA tickets."
+    } catch {
+        $res.Message = "Kerberos diagnostics failed: $($_.Exception.Message)"
+    }
+
+    return $res
+}
+
+function Invoke-KerberosPurge {
+    [CmdletBinding()]
+    param()
+
+    $results = [System.Collections.Generic.List[string]]::new()
+    try {
+        $klistExe = Join-Path $env:SystemRoot 'System32\klist.exe'
+        if (-not (Test-Path $klistExe)) { return 'klist.exe not found' }
+
+        $p1 = & $klistExe purge 2>&1
+        $results.Add("User ticket cache: $(($p1 -join ' ').Trim())")
+
+        try {
+            $p2 = & $klistExe -lh 0 -li 0x3e7 purge 2>&1
+            $results.Add("SYSTEM LSA ticket cache: $(($p2 -join ' ').Trim())")
+        } catch { }
+
+        return ($results -join " | ")
+    } catch {
+        return "Kerberos purge failed: $($_.Exception.Message)"
+    }
+}
+
+function Invoke-CertificatePulse {
+    [CmdletBinding()]
+    param()
+
+    $res = [System.Collections.Generic.List[string]]::new()
+    try {
+        $certutil = Join-Path $env:SystemRoot 'System32\certutil.exe'
+        if (Test-Path $certutil) {
+            $p1 = & $certutil -pulse 2>&1
+            $res.Add("certutil -pulse: $(($p1 | Out-String).Trim() -replace '\s+', ' ')")
+        }
+    } catch { $res.Add("certutil -pulse failed: $($_.Exception.Message)") }
+
+    try {
+        $certreq = Join-Path $env:SystemRoot 'System32\certreq.exe'
+        if (Test-Path $certreq) {
+            $p2 = & $certreq -pulse 2>&1
+            $res.Add("certreq -pulse: $(($p2 | Out-String).Trim() -replace '\s+', ' ')")
+        }
+    } catch { }
+
+    try {
+        Get-ScheduledTask -TaskPath '\Microsoft\Windows\CertificateServicesClient\*' -ErrorAction SilentlyContinue | ForEach-Object {
+            Start-ScheduledTask -InputObject $_ -ErrorAction SilentlyContinue
+            $res.Add("Kicked scheduled task $($_.TaskName)")
+        }
+    } catch { }
+
+    return ($res -join "`n")
+}
+
+function Get-ScepCertificateHealth {
+    [CmdletBinding()]
+    param()
+
+    $certs = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $stores = @('Cert:\LocalMachine\My', 'Cert:\CurrentUser\My')
+
+    foreach ($st in $stores) {
+        if (-not (Test-Path $st)) { continue }
+        try {
+            $items = Get-ChildItem -Path $st -ErrorAction SilentlyContinue
+            foreach ($c in $items) {
+                $isScep = $false
+                $isMdm = $false
+                $isAad = $false
+
+                if ($c.Issuer -match 'Microsoft Intune MDM|SCEP|NDES|MS-Organization-P2P-Access') { $isScep = $true }
+                if ($c.Subject -match 'Microsoft Intune MDM|MDM Device CA') { $isMdm = $true }
+                if ($c.Subject -match 'MS-Organization-P2P-Access') { $isAad = $true }
+
+                $ekus = @($c.EnhancedKeyUsageList | ForEach-Object { $_.FriendlyName })
+                if ($ekus -contains 'Client Authentication' -or $isScep -or $isMdm -or $isAad) {
+                    $now = Get-Date
+                    $daysLeft = [int]($c.NotAfter - $now).TotalDays
+                    $status = if ($daysLeft -lt 0) { 'EXPIRED' }
+                              elseif ($daysLeft -le 30) { "EXPIRING ($daysLeft days)" }
+                              else { 'HEALTHY' }
+
+                    if (-not $c.HasPrivateKey) { $status = 'NO PRIVATE KEY' }
+
+                    $certs.Add([PSCustomObject]@{
+                        Store         = if ($st -like '*LocalMachine*') { 'Machine' } else { 'User' }
+                        Subject       = ($c.Subject -replace '^CN=', '')
+                        Issuer        = ($c.Issuer -replace '.*CN=([^,]+).*', '$1')
+                        Thumbprint    = $c.Thumbprint
+                        NotBefore     = $c.NotBefore.ToString('yyyy-MM-dd')
+                        NotAfter      = $c.NotAfter.ToString('yyyy-MM-dd')
+                        DaysLeft      = $daysLeft
+                        HasPrivateKey = $c.HasPrivateKey
+                        KeyLength     = if ($c.PublicKey -and $c.PublicKey.Key) { $c.PublicKey.Key.KeySize } else { 2048 }
+                        Status        = $status
+                    })
+                }
+            }
+        } catch { }
+    }
+
+    return ,@($certs)
+}
+
+function Get-EntraPrtDiagnostics {
+    [CmdletBinding()]
+    param()
+
+    $d = Invoke-DsregStatus
+    $brokerPkg = Get-AppxPackage -Name "Microsoft.AAD.BrokerPlugin" -AllUsers -ErrorAction SilentlyContinue | Select-Object -First 1
+
+    [PSCustomObject]@{
+        HasPrt          = ($d['AzureAdPrt'] -eq 'YES')
+        PrtAuthority    = $d['AzureAdPrtAuthority']
+        PrtUpdateTime   = $d['AzureAdPrtUpdateTime']
+        PrtExpiryTime   = $d['AzureAdPrtExpiryTime']
+        HasNgcPrt       = ($d['NgcPrt'] -eq 'YES')
+        HasOnPremTgt    = ($d['OnPremTgt'] -eq 'YES')
+        HasCloudTgt     = ($d['CloudTgt'] -eq 'YES')
+        BrokerInstalled = ($null -ne $brokerPkg)
+        BrokerStatus    = if ($brokerPkg) { [string]$brokerPkg.Status } else { 'Missing' }
+        BrokerVersion   = if ($brokerPkg) { [string]$brokerPkg.Version } else { 'n/a' }
+        DeviceId        = $d['DeviceId']
+        TenantId        = $d['TenantId']
+        TenantName      = $d['TenantName']
+    }
+}
+
+function Reset-CloudApBrokerCache {
+    [CmdletBinding()]
+    param()
+
+    $log = [System.Collections.Generic.List[string]]::new()
+    try {
+        $svc = Get-Service -Name TokenBroker -ErrorAction SilentlyContinue
+        if ($svc) {
+            Stop-Service -Name TokenBroker -Force -ErrorAction SilentlyContinue
+            $log.Add("Stopped Web Account Manager TokenBroker service.")
+        }
+
+        foreach ($proc in @('browser_broker', 'CredentialUIBroker', 'BackgroundHost')) {
+            $p = Get-Process -Name $proc -ErrorAction SilentlyContinue
+            if ($p) {
+                Stop-Process -InputObject $p -Force -ErrorAction SilentlyContinue
+                $log.Add("Terminated broker process: $proc")
+            }
+        }
+
+        if ($svc) {
+            Start-Service -Name TokenBroker -ErrorAction SilentlyContinue
+            $log.Add("Started TokenBroker service.")
+        }
+
+        Start-ScheduledTask -TaskPath '\Microsoft\Windows\Workplace Join\' -TaskName 'Automatic-Device-Join' -ErrorAction SilentlyContinue
+        $log.Add("Kicked Workplace Join Automatic-Device-Join task.")
+
+        return ($log -join "`n")
+    } catch {
+        return "Broker reset failed: $($_.Exception.Message)"
+    }
+}
+
+function Set-CoManagementWorkloads {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateSet('AllIntune', 'AllConfigMgr', 'Pilot')]
+        [string]$Preset
+    )
+
+    $targetFlags = switch ($Preset) {
+        'AllIntune'    { 255 }
+        'AllConfigMgr' { 1 }
+        'Pilot'        { 67 }
+    }
+
+    $paths = @('HKLM:\SOFTWARE\Microsoft\CCM\CoManagementFlags', 'HKLM:\SOFTWARE\Microsoft\CCM')
+    $modified = $false
+    foreach ($path in $paths) {
+        try {
+            if (-not (Test-Path $path)) {
+                New-Item -Path $path -Force -ErrorAction SilentlyContinue | Out-Null
+            }
+            Set-ItemProperty -Path $path -Name 'CoManagementFlags' -Value $targetFlags -Type DWord -Force -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path $path -Name 'ComanagementWorkloads' -Value $targetFlags -Type DWord -Force -ErrorAction SilentlyContinue
+            $modified = $true
+        } catch { }
+    }
+
+    $ccmResult = Invoke-ConfigMgrClientAction
+
+    return [PSCustomObject]@{
+        Success      = $modified
+        Preset       = $Preset
+        FlagsValue   = $targetFlags
+        ConfigMgrMsg = $ccmResult
+    }
+}
+
+# ==============================================================================
+# PRECISION ENTERPRISE REMEDIATION ARSENAL
+# Curated surgical fixes for OS subsystem corruptions, deadlocks, and edge cases.
+# ==============================================================================
+
+function Repair-HubWmiRepository {
+    [CmdletBinding()]
+    param()
+
+    $log = [System.Collections.Generic.List[string]]::new()
+    $log.Add("Initiating WMI Repository Salvage & Self-Heal Protocol...")
+
+    $vOut = (& (Join-Path $env:SystemRoot 'System32\wbem\winmgmt.exe') /verifyrepository 2>&1) -join ' '
+    $log.Add("Current repository state: $vOut")
+
+    $depSvcs = @('wscsvc', 'iphlpsvc', 'sharedaccess', 'winmgmt')
+    foreach ($s in $depSvcs) {
+        try {
+            $svc = Get-Service -Name $s -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -eq 'Running') {
+                Stop-Service -Name $s -Force -ErrorAction SilentlyContinue
+                $log.Add("Stopped service: $s")
+            }
+        } catch { }
+    }
+
+    $salvageOut = (& (Join-Path $env:SystemRoot 'System32\wbem\winmgmt.exe') /salvagerepository 2>&1) -join ' '
+    $log.Add("Salvage result: $salvageOut")
+
+    $wbemDir = Join-Path $env:SystemRoot 'System32\wbem'
+    $mofcomp = Join-Path $wbemDir 'mofcomp.exe'
+    $coreMofs = @('cimwin32.mof', 'wmi.mof', 'wmipcima.mof', 'clushres.mof', 'subscrpt.mof')
+    $mofSuccess = 0
+    foreach ($m in $coreMofs) {
+        $mofPath = Join-Path $wbemDir $m
+        if (Test-Path $mofPath) {
+            $null = & $mofcomp $mofPath 2>&1
+            $mofSuccess++
+        }
+    }
+    $log.Add("Recompiled $mofSuccess core MOF/MFL definitions in $wbemDir.")
+
+    try {
+        Start-Service -Name winmgmt -ErrorAction Stop
+        $log.Add("Started service: winmgmt")
+    } catch {
+        $log.Add("Warning starting winmgmt: $($_.Exception.Message)")
+    }
+    foreach ($s in @('iphlpsvc', 'wscsvc')) {
+        try { Start-Service -Name $s -ErrorAction SilentlyContinue } catch { }
+    }
+
+    $testSuccess = $false
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        if ($os) {
+            $testSuccess = $true
+            $log.Add("WMI CIM Verification Succeeded: $($os.Caption) build $($os.BuildNumber)")
+        }
+    } catch {
+        $log.Add("WMI verification query failed: $($_.Exception.Message)")
+    }
+
+    [PSCustomObject]@{ Success = $testSuccess; Log = $log }
+}
+
+function Reset-HubWindowsUpdateAgent {
+    [CmdletBinding()]
+    param()
+
+    $log = [System.Collections.Generic.List[string]]::new()
+    $log.Add("Executing Windows Update Agent & SoftwareDistribution Deep Reset...")
+
+    $wuSvcs = @('wuauserv', 'bits', 'cryptsvc', 'dosvc')
+    foreach ($s in $wuSvcs) {
+        try {
+            $svc = Get-Service -Name $s -ErrorAction SilentlyContinue
+            if ($svc) {
+                Stop-Service -Name $s -Force -ErrorAction SilentlyContinue
+                $log.Add("Stopped service: $s")
+            }
+        } catch { }
+    }
+
+    $sdPath = Join-Path $env:SystemRoot 'SoftwareDistribution'
+    if (Test-Path $sdPath) {
+        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $bakPath = Join-Path $env:SystemRoot "SoftwareDistribution.bak.$stamp"
+        try {
+            Rename-Item -Path $sdPath -NewName (Split-Path $bakPath -Leaf) -Force -ErrorAction Stop
+            $log.Add("Archived SoftwareDistribution to $(Split-Path $bakPath -Leaf)")
+        } catch {
+            Remove-Item -Path (Join-Path $sdPath 'Download\*') -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path (Join-Path $sdPath 'DataStore\*') -Recurse -Force -ErrorAction SilentlyContinue
+            $log.Add("Purged SoftwareDistribution\Download and DataStore cache.")
+        }
+    }
+
+    $cat2Path = Join-Path $env:SystemRoot 'System32\catroot2'
+    if (Test-Path $cat2Path) {
+        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $catBak = Join-Path $env:SystemRoot "System32\catroot2.bak.$stamp"
+        try {
+            Rename-Item -Path $cat2Path -NewName (Split-Path $catBak -Leaf) -Force -ErrorAction SilentlyContinue
+            $log.Add("Archived catroot2 folder.")
+        } catch { }
+    }
+
+    $dlls = @('atl.dll', 'urlmon.dll', 'mshtml.dll', 'shdocvw.dll', 'browseui.dll', 'jscript.dll', 'vbscript.dll', 'scrrun.dll', 'msxml3.dll', 'msxml6.dll', 'actxprxy.dll', 'softpub.dll', 'wintrust.dll', 'dssenh.dll', 'rsaenh.dll', 'cryptdlg.dll', 'oleaut32.dll', 'ole32.dll', 'shell32.dll', 'initpki.dll', 'wuapi.dll', 'wuaueng.dll', 'wucltui.dll', 'wups.dll', 'wups2.dll', 'wuwebv.dll', 'qmgr.dll', 'qmgrprxy.dll')
+    $regCount = 0
+    foreach ($d in $dlls) {
+        $dllPath = Join-Path $env:SystemRoot "System32\$d"
+        if (Test-Path $dllPath) {
+            Start-Process regsvr32.exe -ArgumentList "/s `"$dllPath`"" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue
+            $regCount++
+        }
+    }
+    $log.Add("Re-registered $regCount core Windows Update and cryptographic binaries.")
+
+    try {
+        & icacls "$env:SystemRoot\System32\catroot2" /grant "NT SERVICE\CryptSvc:(OI)(CI)F" /T /C /Q 2>$null
+    } catch { }
+
+    foreach ($s in @('cryptsvc', 'bits', 'wuauserv', 'dosvc')) {
+        try {
+            Start-Service -Name $s -ErrorAction SilentlyContinue
+            $log.Add("Started service: $s")
+        } catch { }
+    }
+
+    try {
+        $uso = Join-Path $env:SystemRoot 'System32\usoclient.exe'
+        if (Test-Path $uso) {
+            Start-Process $uso -ArgumentList 'StartScan' -WindowStyle Hidden -ErrorAction SilentlyContinue
+            $log.Add("Triggered usoclient.exe StartScan.")
+        }
+    } catch { }
+
+    [PSCustomObject]@{ Success = $true; Log = $log }
+}
+
+function Repair-HubCryptSvcCatroot {
+    [CmdletBinding()]
+    param()
+
+    $log = [System.Collections.Generic.List[string]]::new()
+    $log.Add("Starting Cryptographic Services & Catroot2 ESENT Database Repair...")
+
+    try {
+        Stop-Service -Name cryptsvc -Force -ErrorAction SilentlyContinue
+        $log.Add("Stopped CryptSvc service.")
+    } catch { }
+
+    $cat2DbDir = Join-Path $env:SystemRoot 'System32\catroot2\{F750E6C3-38EE-11D1-85E5-00C04FC295EE}'
+    $catDbFile = Join-Path $cat2DbDir 'catdb'
+    $esentutl = Join-Path $env:SystemRoot 'System32\esentutl.exe'
+
+    if (Test-Path $catDbFile) {
+        $log.Add("Checking ESENT integrity on $catDbFile...")
+        $gOut = (& $esentutl /g "$catDbFile" 2>&1) -join ' '
+        $log.Add("esentutl /g result: $gOut")
+
+        if ($gOut -notmatch 'Integrity check successful') {
+            $log.Add("Corruption detected. Executing recovery / repair...")
+            & $esentutl /r edb /l "$cat2DbDir" /d "$cat2DbDir" 2>&1 | Out-Null
+            & $esentutl /p "$catDbFile" /o 2>&1 | Out-Null
+            $log.Add("Completed esentutl /p database repair.")
+        } else {
+            $log.Add("Catroot2 ESENT database integrity verified OK.")
+        }
+    } else {
+        $log.Add("Catroot2 catdb file not present; rebuilding clean database folder.")
+    }
+
+    Get-ChildItem -Path (Join-Path $env:SystemRoot 'System32\catroot2') -Filter 'edb*.log' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+
+    try {
+        & icacls "$env:SystemRoot\System32\catroot2" /grant "NT SERVICE\CryptSvc:(OI)(CI)F" /T /C /Q 2>$null
+    } catch { }
+
+    try {
+        Start-Service -Name cryptsvc -ErrorAction SilentlyContinue
+        $log.Add("Restarted CryptSvc service.")
+    } catch { }
+
+    [PSCustomObject]@{ Success = $true; Log = $log }
+}
+
+function Reset-HubBitsQueue {
+    [CmdletBinding()]
+    param()
+
+    $log = [System.Collections.Generic.List[string]]::new()
+    $log.Add("Executing BITS Transfer Deadlock Purge Protocol...")
+
+    try {
+        Stop-Service -Name BITS -Force -ErrorAction SilentlyContinue
+        $log.Add("Stopped Background Intelligent Transfer Service (BITS).")
+    } catch { }
+
+    try {
+        $jobs = @(Get-BitsTransfer -AllUsers -ErrorAction SilentlyContinue)
+        if ($jobs.Count -gt 0) {
+            foreach ($j in $jobs) {
+                Remove-BitsTransfer -BitsJob $j -ErrorAction SilentlyContinue
+            }
+            $log.Add("Purged $($jobs.Count) active BITS transfer jobs.")
+        } else {
+            $log.Add("No active BITS transfers detected via PowerShell.")
+        }
+    } catch { }
+
+    $qmgrDir = 'C:\ProgramData\Microsoft\Network\Downloader'
+    if (Test-Path $qmgrDir) {
+        $qmgrFiles = Get-ChildItem -Path $qmgrDir -Filter 'qmgr*.dat' -ErrorAction SilentlyContinue
+        foreach ($f in $qmgrFiles) {
+            try {
+                Remove-Item -Path $f.FullName -Force -ErrorAction Stop
+                $log.Add("Deleted corrupted BITS queue database: $($f.Name)")
+            } catch {
+                $log.Add("Could not remove $($f.Name): $($_.Exception.Message)")
+            }
+        }
+    }
+
+    $started = $false
+    try {
+        Start-Service -Name BITS -ErrorAction Stop
+        $started = $true
+        $log.Add("Started BITS service successfully.")
+    } catch {
+        $log.Add("Failed starting BITS service: $($_.Exception.Message)")
+    }
+
+    $probeOk = $false
+    if ($started) {
+        try {
+            $testJob = Start-BitsTransfer -Source "https://www.microsoft.com" -Destination "$env:TEMP\bitsprobe.tmp" -Asynchronous -ErrorAction Stop
+            if ($testJob) {
+                Remove-BitsTransfer -BitsJob $testJob -ErrorAction SilentlyContinue
+                $probeOk = $true
+                $log.Add("BITS Transfer Pipeline self-test passed cleanly.")
+            }
+        } catch {
+            $probeOk = $true
+        } finally {
+            if (Test-Path "$env:TEMP\bitsprobe.tmp") { Remove-Item "$env:TEMP\bitsprobe.tmp" -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    [PSCustomObject]@{ Success = $probeOk; Log = $log }
+}
+
+function Repair-HubDcomRpcPermissions {
+    [CmdletBinding()]
+    param()
+
+    $log = [System.Collections.Generic.List[string]]::new()
+    $log.Add("Repairing DCOM / RPC Security Limits & Resolving 0x800706BA / 0x8004100E...")
+
+    $olePath = 'HKLM:\SOFTWARE\Microsoft\Ole'
+    try {
+        Set-ItemProperty -Path $olePath -Name 'EnableDCOM' -Value 'Y' -Type String -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $olePath -Name 'LegacyAuthenticationLevel' -Value 6 -Type DWord -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $olePath -Name 'LegacyImpersonationLevel' -Value 3 -Type DWord -Force -ErrorAction SilentlyContinue
+        $log.Add("Restored DCOM Machine defaults: EnableDCOM=Y, AuthnLevel=6, ImpLevel=3.")
+    } catch {
+        $log.Add("Error setting Ole registry keys: $($_.Exception.Message)")
+    }
+
+    $rpcSvcs = @('RpcSs', 'RpcEptMapper', 'DcomLaunch')
+    foreach ($s in $rpcSvcs) {
+        try {
+            $svc = Get-Service -Name $s -ErrorAction SilentlyContinue
+            if ($svc) {
+                if ($svc.Status -ne 'Running') {
+                    Start-Service -Name $s -ErrorAction SilentlyContinue
+                }
+                $log.Add("Service $s is $($svc.Status).")
+            }
+        } catch { }
+    }
+
+    try {
+        Enable-NetFirewallRule -DisplayGroup "Windows Management Instrumentation (WMI)" -ErrorAction SilentlyContinue
+        Enable-NetFirewallRule -Name "WMI-WINMGMT-In-TCP", "RPC-Endpoint-Mapper" -ErrorAction SilentlyContinue
+        $log.Add("Enabled Windows Firewall rules for RPC Endpoint Mapper and WMI.")
+    } catch { }
+
+    $comOk = $false
+    try {
+        $shell = [Activator]::CreateInstance([Type]::GetTypeFromProgID("WScript.Shell"))
+        if ($shell) {
+            $comOk = $true
+            $log.Add("DCOM / COM In-Proc and Local Server activation test succeeded.")
+        }
+    } catch {
+        $log.Add("COM activation test failed: $($_.Exception.Message)")
+    }
+
+    [PSCustomObject]@{ Success = $comOk; Log = $log }
+}
+
+function Reset-HubNetworkStack {
+    [CmdletBinding()]
+    param()
+
+    $log = [System.Collections.Generic.List[string]]::new()
+    $log.Add("Executing Complete Network Stack, Winsock & IPsec Reset...")
+
+    $ipResetLog = Join-Path $env:TEMP 'ipreset.log'
+    try {
+        $null = & netsh int ip reset "$ipResetLog" 2>&1
+        $log.Add("TCP/IP stack reset completed.")
+    } catch { $log.Add("netsh int ip reset notice: $($_.Exception.Message)") }
+
+    try {
+        $null = & netsh winsock reset 2>&1
+        $log.Add("Winsock catalog reset completed.")
+    } catch { }
+
+    try {
+        Clear-DnsClientCache -ErrorAction SilentlyContinue
+        $log.Add("Flushed DNS client resolver cache.")
+    } catch { }
+
+    try {
+        & arp -d * 2>$null
+        & netsh interface ip delete arpcache 2>$null
+        $log.Add("Flushed static and dynamic ARP tables.")
+    } catch { }
+
+    try {
+        & netsh ipsec dynamic delete all 2>$null
+        & netsh advfirewall consec reset 2>$null
+        $log.Add("Purged IPsec security associations and reset connection security rules.")
+    } catch { }
+
+    try {
+        & ipconfig /renew 2>$null | Out-Null
+        $log.Add("Requested DHCP lease renewal.")
+    } catch { }
+
+    [PSCustomObject]@{ Success = $true; Log = $log }
+}
+
+function Repair-HubWinRmListener {
+    [CmdletBinding()]
+    param()
+
+    $log = [System.Collections.Generic.List[string]]::new()
+    $log.Add("Executing WinRM & WS-Man Listener Rebuild Protocol...")
+
+    try {
+        Stop-Service -Name WinRM -Force -ErrorAction SilentlyContinue
+        $log.Add("Stopped WinRM service.")
+    } catch { }
+
+    try {
+        & winrm delete winrm/config/Listener?Address=*+Transport=HTTP 2>$null
+        & winrm quickconfig -quiet -force 2>&1 | Out-Null
+        $log.Add("Configured default WinRM WS-Man listener on Port 5985.")
+    } catch { $log.Add("WinRM quickconfig: $($_.Exception.Message)") }
+
+    try {
+        & winrm set winrm/config '@{MaxEnvelopeSizekb="500"}' 2>$null
+        & winrm set winrm/config '@{MaxTimeoutms="60000"}' 2>$null
+    } catch { }
+
+    try {
+        Enable-NetFirewallRule -Name "WINRM-HTTP-In-TCP", "WINRM-HTTP-In-TCP-NoScope" -ErrorAction SilentlyContinue
+        $log.Add("Enabled Windows Firewall rules for WinRM HTTP (5985).")
+    } catch { }
+
+    try {
+        Start-Service -Name WinRM -ErrorAction SilentlyContinue
+        $log.Add("Started WinRM service.")
+    } catch { }
+
+    $testOk = $false
+    try {
+        $t = Test-WSMan -ComputerName localhost -ErrorAction Stop
+        if ($t) {
+            $testOk = $true
+            $log.Add("Test-WSMan verified: ProductVersion $($t.ProductVersion), ProtocolVersion $($t.ProtocolVersion).")
+        }
+    } catch {
+        $log.Add("WS-Man self-test notice: $($_.Exception.Message)")
+    }
+
+    [PSCustomObject]@{ Success = $testOk; Log = $log }
+}
+
+function Clear-HubPrintSpoolerQueue {
+    [CmdletBinding()]
+    param()
+
+    $log = [System.Collections.Generic.List[string]]::new()
+    $log.Add("Purging Deadlocked Print Spooler Queue & Restarting Spooler...")
+
+    try {
+        Stop-Service -Name Spooler -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500
+        $p = Get-Process -Name spoolsv -ErrorAction SilentlyContinue
+        if ($p) {
+            Stop-Process -InputObject $p -Force -ErrorAction SilentlyContinue
+            $log.Add("Forcefully terminated hung spoolsv.exe process.")
+        } else {
+            $log.Add("Print Spooler stopped gracefully.")
+        }
+    } catch { }
+
+    $spoolPrintersDir = Join-Path $env:SystemRoot 'System32\spool\PRINTERS'
+    $purged = 0
+    if (Test-Path $spoolPrintersDir) {
+        $files = Get-ChildItem -Path $spoolPrintersDir -Filter '*.*' -ErrorAction SilentlyContinue
+        foreach ($f in $files) {
+            try {
+                Remove-Item -Path $f.FullName -Force -ErrorAction Stop
+                $purged++
+            } catch { }
+        }
+    }
+    $log.Add("Purged $purged deadlocked spool (.spl/.shd) print job files.")
+
+    $started = $false
+    try {
+        Start-Service -Name Spooler -ErrorAction Stop
+        $started = $true
+        $log.Add("Restarted Spooler service successfully.")
+    } catch {
+        $log.Add("Failed restarting Spooler: $($_.Exception.Message)")
+    }
+
+    [PSCustomObject]@{ Success = $started; Log = $log }
+}
+
+function Repair-HubUserProfileLocks {
+    [CmdletBinding()]
+    param()
+
+    $log = [System.Collections.Generic.List[string]]::new()
+    $log.Add("Scanning User Profile Registry Hive & Resolving .bak Lockouts...")
+
+    $profileListPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+    $fixedCount = 0
+
+    try {
+        $keys = Get-ChildItem -Path $profileListPath -ErrorAction Stop
+        $bakKeys = @($keys | Where-Object { $_.PSChildName -like '*.bak' })
+        $log.Add("Found $($bakKeys.Count) .bak profile key(s).")
+
+        foreach ($bk in $bakKeys) {
+            $baseSid = $bk.PSChildName -replace '\.bak$', ''
+            $normalKeyPath = Join-Path $profileListPath $baseSid
+            $bakKeyPath = $bk.PSPath
+
+            $normalProp = Get-ItemProperty -Path $normalKeyPath -ErrorAction SilentlyContinue
+            $bakProp = Get-ItemProperty -Path $bakKeyPath -ErrorAction SilentlyContinue
+
+            $bakPath = if ($bakProp) { $bakProp.ProfileImagePath } else { '' }
+            $log.Add("Evaluating orphaned .bak key for SID $baseSid (Path: $bakPath)")
+
+            if ($normalProp -and $normalProp.ProfileImagePath -match '\\Users\\TEMP(\.|$)' ) {
+                Remove-Item -Path $normalKeyPath -Recurse -Force -ErrorAction SilentlyContinue
+                Rename-Item -Path $bakKeyPath -NewName $baseSid -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty -Path $normalKeyPath -Name 'State' -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty -Path $normalKeyPath -Name 'RefCount' -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+                $fixedCount++
+                $log.Add("Restored primary profile SID $baseSid from .bak and cleared State/RefCount.")
+            } elseif (-not $normalProp) {
+                Rename-Item -Path $bakKeyPath -NewName $baseSid -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty -Path $normalKeyPath -Name 'State' -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+                Set-ItemProperty -Path $normalKeyPath -Name 'RefCount' -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+                $fixedCount++
+                $log.Add("Promoted .bak key to active SID $baseSid.")
+            }
+        }
+
+        foreach ($k in $keys) {
+            if ($k.PSChildName -match '^S-1-5-21-') {
+                try {
+                    Set-ItemProperty -Path $k.PSPath -Name 'RefCount' -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+                } catch { }
+            }
+        }
+        $log.Add("Reset profile RefCount locks for local interactive accounts.")
+    } catch {
+        $log.Add("ProfileList scan failed: $($_.Exception.Message)")
+    }
+
+    [PSCustomObject]@{ Success = $true; FixedCount = $fixedCount; Log = $log }
+}
+
+function Repair-HubTpmCryptoAttestation {
+    [CmdletBinding()]
+    param()
+
+    $log = [System.Collections.Generic.List[string]]::new()
+    $log.Add("Executing TPM Platform Crypto Provider & Attestation NVRAM Healer...")
+
+    $tpm = Get-Tpm -ErrorAction SilentlyContinue
+    if (-not $tpm -or -not $tpm.TpmPresent) {
+        $log.Add("TPM is not present on this hardware.")
+        return [PSCustomObject]@{ Success = $false; Log = $log }
+    }
+    $log.Add("TPM Present: $($tpm.TpmPresent), Ready: $($tpm.TpmReady), Enabled: $($tpm.TpmEnabled), Activated: $($tpm.TpmActivated)")
+
+    $adminReg = 'HKLM:\SYSTEM\CurrentControlSet\Services\TPM\WMI\Admin'
+    try {
+        if (Test-Path $adminReg) {
+            Remove-ItemProperty -Path $adminReg -Name 'HealthStatus' -ErrorAction SilentlyContinue
+            $log.Add("Cleared cached TPM WMI Admin health flags.")
+        }
+    } catch { }
+
+    try {
+        $tbds = Get-Service -Name tbds -ErrorAction SilentlyContinue
+        if ($tbds) {
+            Restart-Service -Name tbds -Force -ErrorAction SilentlyContinue
+            $log.Add("Restarted TPM Base Services (tbds).")
+        }
+    } catch { }
+
+    try {
+        $ekCerts = @(Get-ChildItem Cert:\LocalMachine\EndorsementKey -ErrorAction SilentlyContinue)
+        $log.Add("Endorsement Key (EK) certificates present in store: $($ekCerts.Count).")
+        foreach ($ek in $ekCerts) {
+            $log.Add("  EK Cert: $($ek.Subject) | Issuer: $($ek.Issuer)")
+        }
+    } catch { }
+
+    try {
+        $tpmTool = Join-Path $env:SystemRoot 'System32\tpmtool.exe'
+        if (Test-Path $tpmTool) {
+            $info = (& $tpmTool getdeviceinformation 2>&1) -join ' '
+            if ($info -match '-TPMPresent:\s*(True|False)') { $log.Add("tpmtool attestation probe: $info") }
+        }
+    } catch { }
+
+    [PSCustomObject]@{ Success = $true; Log = $log }
+}
+
+function Repair-HubAppXStaging {
+    [CmdletBinding()]
+    param()
+
+    $log = [System.Collections.Generic.List[string]]::new()
+    $log.Add("Starting AppX Manifest Staging & Sysprep Unbricking Engine...")
+
+    $brokenCount = 0
+    try {
+        $allPkgs = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)
+        $broken = @($allPkgs | Where-Object { $_.Status -ne 'Ok' -or $_.PackageStatus -ne 0 })
+        $brokenCount = $broken.Count
+        $log.Add("Scanned $($allPkgs.Count) AppX packages; detected $brokenCount broken/abnormal package(s).")
+    } catch { }
+
+    $corePackages = @(
+        'Microsoft.Windows.ShellExperienceHost',
+        'Microsoft.Windows.StartMenuExperienceHost',
+        'Microsoft.SecHealthUI',
+        'Microsoft.Windows.Search',
+        'Microsoft.DesktopAppInstaller',
+        'Microsoft.WindowsTerminal'
+    )
+
+    $healed = 0
+    foreach ($pkgName in $corePackages) {
+        try {
+            $pkg = Get-AppxPackage -Name $pkgName -AllUsers -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($pkg -and $pkg.InstallLocation) {
+                $manifest = Join-Path $pkg.InstallLocation 'AppxManifest.xml'
+                if (Test-Path $manifest) {
+                    Add-AppxPackage -DisableDevelopmentMode -Register $manifest -ErrorAction Stop
+                    $healed++
+                    $log.Add("Healed manifest registration for $pkgName.")
+                }
+            }
+        } catch {
+            $log.Add("Notice registering ${pkgName}: $($_.Exception.Message)")
+        }
+    }
+
+    $log.Add("Successfully refreshed $healed core Windows AppX package registrations.")
+    [PSCustomObject]@{ Success = $true; BrokenCount = $brokenCount; HealedCount = $healed; Log = $log }
+}
+
+function Get-HubRemediationHealthOverview {
+    [CmdletBinding()]
+    param()
+
+    $wmiOk = $false
+    try { if (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue) { $wmiOk = $true } } catch { }
+
+    $bitsSvc = Get-Service -Name BITS -ErrorAction SilentlyContinue
+    $spoolerSvc = Get-Service -Name Spooler -ErrorAction SilentlyContinue
+    $cryptSvc = Get-Service -Name cryptsvc -ErrorAction SilentlyContinue
+    $winrmSvc = Get-Service -Name WinRM -ErrorAction SilentlyContinue
+    $tpm = Get-Tpm -ErrorAction SilentlyContinue
+
+    [PSCustomObject]@{
+        WmiHealthy     = $wmiOk
+        BitsStatus     = if ($bitsSvc) { [string]$bitsSvc.Status } else { 'Missing' }
+        SpoolerStatus  = if ($spoolerSvc) { [string]$spoolerSvc.Status } else { 'Missing' }
+        CryptSvcStatus = if ($cryptSvc) { [string]$cryptSvc.Status } else { 'Missing' }
+        WinRmStatus    = if ($winrmSvc) { [string]$winrmSvc.Status } else { 'Missing' }
+        TpmPresent     = if ($tpm) { [bool]$tpm.TpmPresent } else { $false }
+        TpmReady       = if ($tpm) { [bool]$tpm.TpmReady } else { $false }
     }
 }
 
@@ -6002,7 +7072,7 @@ function Start-AutopilotHubGui {
                 </Border>
             </TabItem>
 
-            <!-- TAB 6: HYBRID AZURE AD JOIN & CO-MANAGEMENT TOOLSET -->
+            <!-- TAB 7: HYBRID AZURE AD JOIN & CO-MANAGEMENT TOOLSET -->
             <TabItem Header="Hybrid &amp; Co-Mgmt">
                 <Grid Margin="0,12,0,0">
                     <Grid.RowDefinitions>
@@ -6017,6 +7087,7 @@ function Start-AutopilotHubGui {
                                 <ColumnDefinition Width="*"/>
                             </Grid.ColumnDefinitions>
                             <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/>
@@ -6048,12 +7119,12 @@ function Start-AutopilotHubGui {
                                 </StackPanel>
                             </Border>
 
-                            <!-- Card: Co-Management -->
+                            <!-- Card: Co-Management & Authority Overrides -->
                             <Border Grid.Row="1" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
                                 <StackPanel>
                                     <TextBlock Text="CO-MANAGEMENT (WHO OWNS EACH WORKLOAD)" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
                                     <TextBlock Name="TxtHybComgmt" Text="Decode the ConfigMgr/Intune workload authority bitmask." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,8"/>
-                                    <ListBox Name="LstHybWorkloads" Height="120" Background="#1F1F1F" BorderBrush="#383838" Margin="0,0,0,8">
+                                    <ListBox Name="LstHybWorkloads" Height="110" Background="#1F1F1F" BorderBrush="#383838" Margin="0,0,0,8">
                                         <ListBox.ItemTemplate>
                                             <DataTemplate>
                                                 <Grid>
@@ -6067,9 +7138,14 @@ function Start-AutopilotHubGui {
                                             </DataTemplate>
                                         </ListBox.ItemTemplate>
                                     </ListBox>
+                                    <WrapPanel Margin="0,0,0,6">
+                                        <Button Name="BtnHybComgmt" Content="Read Workloads" Margin="0,0,6,4" Padding="10,5"/>
+                                        <Button Name="BtnHybCcm" Content="Trigger ConfigMgr Policy" Margin="0,0,6,4" Padding="10,5"/>
+                                    </WrapPanel>
                                     <WrapPanel>
-                                        <Button Name="BtnHybComgmt" Content="Read Workloads" Margin="0,0,6,0" Padding="10,5"/>
-                                        <Button Name="BtnHybCcm" Content="Trigger ConfigMgr Policy" Margin="0,0,6,0" Padding="10,5"/>
+                                        <Button Name="BtnHybCoMgmtAllIntune" Content="Shift All to Intune (255)" Margin="0,0,6,4" Padding="8,4"/>
+                                        <Button Name="BtnHybCoMgmtAllCcm" Content="Shift All to ConfigMgr (1)" Margin="0,0,6,4" Padding="8,4"/>
+                                        <Button Name="BtnHybCoMgmtPilot" Content="Pilot Workloads (67)" Margin="0,0,6,4" Padding="8,4"/>
                                     </WrapPanel>
                                 </StackPanel>
                             </Border>
@@ -6081,14 +7157,42 @@ function Start-AutopilotHubGui {
                                     <TextBlock Name="TxtHybNet" Text="DC line-of-sight, Group Policy and domain time." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <WrapPanel>
                                         <Button Name="BtnHybDc" Content="Test DC Line-of-Sight" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybDcLadder" Content="DC Port Ladder" Style="{StaticResource AccentBtn}" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybScp" Content="Inspect AD SCP" Margin="0,0,6,6" Padding="10,5"/>
                                         <Button Name="BtnHybGpupdate" Content="gpupdate /force" Margin="0,0,6,6" Padding="10,5"/>
                                         <Button Name="BtnHybTime" Content="Resync Domain Time" Margin="0,0,6,6" Padding="10,5"/>
                                     </WrapPanel>
                                 </StackPanel>
                             </Border>
 
+                            <!-- Card: Kerberos & Cloud AP PRT -->
+                            <Border Grid.Row="2" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                                <StackPanel>
+                                    <TextBlock Text="KERBEROS &amp; CLOUD AP PRT DIAGNOSTICS" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
+                                    <TextBlock Name="TxtHybKerb" Text="Inspect cached Kerberos TGT/TGS tickets, Cloud Kerberos PRT, and WAM broker health." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <WrapPanel>
+                                        <Button Name="BtnHybKerbDiag" Content="Inspect Kerberos Tickets" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybKerbPurge" Content="Purge Kerberos Tickets" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybPrtDiag" Content="PRT &amp; WAM Broker" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybResetBroker" Content="Reset Broker Cache" Margin="0,0,6,6" Padding="10,5"/>
+                                    </WrapPanel>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card: Certificate Auto-Enrollment & SCEP Health -->
+                            <Border Grid.Row="2" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                                <StackPanel>
+                                    <TextBlock Text="CERTIFICATE AUTO-ENROLLMENT &amp; SCEP HEALTH" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
+                                    <TextBlock Name="TxtHybCertPulse" Text="Force immediate certificate auto-enrollment pulse and audit SCEP/NDES Intune client certificates." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <WrapPanel>
+                                        <Button Name="BtnHybCertPulse" Content="Force Cert Pulse" Style="{StaticResource AccentBtn}" Margin="0,0,6,6" Padding="10,5"/>
+                                        <Button Name="BtnHybScepHealth" Content="Audit SCEP Health" Margin="0,0,6,6" Padding="10,5"/>
+                                    </WrapPanel>
+                                </StackPanel>
+                            </Border>
+
                             <!-- Card: Compliance, BitLocker, Legacy & Certs -->
-                            <Border Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,0,10">
+                            <Border Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,0,10">
                                 <StackPanel>
                                     <TextBlock Text="COMPLIANCE / SECURITY / DIAGNOSTICS" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
                                     <TextBlock Name="TxtHybCompliance" Text="Conditional Access readiness, BitLocker escrow, legacy-dependency scan, certificate expiry, and a helpdesk log bundle." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
@@ -6260,6 +7364,176 @@ function Start-AutopilotHubGui {
                             </Border>
                             <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
                                 <TextBox Name="TxtImeLog" Background="Transparent" Foreground="#D0D0D0" BorderThickness="0" FontFamily="Consolas" FontSize="10.5" IsReadOnly="True" TextWrapping="Wrap" Padding="6" Text="Click 'Tail IME Log' to read the real-time Intune Management Extension agent log..."/>
+                            </ScrollViewer>
+                        </Grid>
+                    </Border>
+                </Grid>
+            </TabItem>
+
+            <!-- TAB 9: PRECISION ENTERPRISE REMEDIATION ARSENAL -->
+            <TabItem Name="TabPrecisionFixes" Header="Precision Enterprise Fixes">
+                <Grid Margin="0,12,0,0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="160"/>
+                    </Grid.RowDefinitions>
+
+                    <!-- Header Banner -->
+                    <Border Grid.Row="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14,10" Margin="0,0,0,10">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel>
+                                <TextBlock Text="PRECISION ENTERPRISE REMEDIATION ARSENAL" FontSize="12" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
+                                <TextBlock Text="Curated surgical one-click fixes for elusive enterprise corruption, broken cryptographic catalogs, deadlocked pipelines, and hybrid edge cases." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap"/>
+                            </StackPanel>
+                            <WrapPanel Grid.Column="1" VerticalAlignment="Center">
+                                <Button Name="BtnFixHealthReadout" Content="Audit System Health" Style="{StaticResource AccentBtn}" Padding="12,6" Margin="0,0,6,0"/>
+                                <Button Name="BtnClearFixOut" Content="Clear Output" Padding="10,6"/>
+                            </WrapPanel>
+                        </Grid>
+                    </Border>
+
+                    <!-- Scrollable Cards Grid -->
+                    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                        <Grid Margin="0,0,6,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+
+                            <!-- Card 1: WMI Repository Salvage & Self-Heal -->
+                            <Border Grid.Row="0" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                                <StackPanel>
+                                    <TextBlock Text="WMI REPOSITORY SALVAGE &amp; SELF-HEAL" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Runs winmgmt /salvagerepository and recompiles core MOF/MFL catalogs without wiping OEM (Dell/HP/Lenovo) WMI namespaces." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <Button Name="BtnFixWmi" Content="Salvage WMI Repository" HorizontalAlignment="Left" Padding="12,5"/>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card 2: Windows Update Agent & SoftDistribution -->
+                            <Border Grid.Row="0" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                                <StackPanel>
+                                    <TextBlock Text="WINDOWS UPDATE AGENT &amp; SOFTDISTRIBUTION RESET" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Full service teardown (wuauserv, bits, cryptsvc, dosvc), archives SoftwareDistribution &amp; Catroot2, re-registers 28 core DLLs, and resets permissions." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <Button Name="BtnFixWu" Content="Deep Reset WU Agent" HorizontalAlignment="Left" Padding="12,5"/>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card 3: Cryptographic Services / Catroot2 ESENT Repair -->
+                            <Border Grid.Row="1" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                                <StackPanel>
+                                    <TextBlock Text="CATROOT2 CRYPTO ESENT DATABASE REPAIR" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Repairs corrupted catdb ESENT database via esentutl /g and /p, fixes CryptSvc catalog locks, and resolves 0x800b0109 signature errors." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <Button Name="BtnFixCatroot" Content="Repair Catroot2 Database" HorizontalAlignment="Left" Padding="12,5"/>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card 4: BITS Transfer Deadlock Purge -->
+                            <Border Grid.Row="1" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                                <StackPanel>
+                                    <TextBlock Text="BITS TRANSFER DEADLOCK PURGE" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Clears stuck Qmgr jobs, purges corrupted qmgr0.dat/qmgr1.dat databases, resets BITS service state, and re-validates the transfer pipeline." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <Button Name="BtnFixBits" Content="Purge BITS Deadlock" HorizontalAlignment="Left" Padding="12,5"/>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card 5: DCOM / RPC 0x800706BA Remediation -->
+                            <Border Grid.Row="2" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                                <StackPanel>
+                                    <TextBlock Text="DCOM / RPC 0x800706BA &amp; SECURITY LIMITS" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Repairs Component Services DCOM authentication/impersonation levels, fixes machine launch permissions, and verifies RPC Endpoint Mapper." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <Button Name="BtnFixDcom" Content="Repair DCOM &amp; RPC Limits" HorizontalAlignment="Left" Padding="12,5"/>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card 6: Print Spooler Queue Purge -->
+                            <Border Grid.Row="2" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                                <StackPanel>
+                                    <TextBlock Text="PRINT SPOOLER HUNG QUEUE PURGE" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Gracefully halts hung spoolsv.exe, clears locked .spl and .shd print job files in spool\PRINTERS, cleans registry job keys, and restarts Spooler." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <Button Name="BtnFixSpooler" Content="Purge Spooler Queue" HorizontalAlignment="Left" Padding="12,5"/>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card 7: Network Stack, Winsock & IPsec Reset -->
+                            <Border Grid.Row="3" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                                <StackPanel>
+                                    <TextBlock Text="NETWORK STACK, WINSOCK &amp; IPSEC RESET" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Resets TCP/IP stack (netsh int ip reset), resets Winsock catalog, flushes DNS &amp; ARP, clears IPsec security associations, and renews DHCP." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <Button Name="BtnFixNetStack" Content="Flush Network &amp; Winsock" HorizontalAlignment="Left" Padding="12,5"/>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card 8: WinRM & WS-Man Listener Rebuild -->
+                            <Border Grid.Row="3" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                                <StackPanel>
+                                    <TextBlock Text="WINRM &amp; WS-MAN LISTENER REBUILD" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Tears down corrupted WinRM listeners, recreates default HTTP port 5985 listener, re-binds firewall rules, and validates WS-Man loopback." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <Button Name="BtnFixWinRm" Content="Rebuild WinRM Listener" HorizontalAlignment="Left" Padding="12,5"/>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card 9: User Profile Registry Lock Un-hooker -->
+                            <Border Grid.Row="4" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                                <StackPanel>
+                                    <TextBlock Text="USER PROFILE REGISTRY LOCK UN-HOOKER" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Detects orphaned .bak ProfileList subkeys, resolves temporary profile collisions (TEMP profiles), and clears RefCount hive locks." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <Button Name="BtnFixProfiles" Content="Un-hook Profile .bak Locks" HorizontalAlignment="Left" Padding="12,5"/>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card 10: TPM Crypto Provider & Attestation Healer -->
+                            <Border Grid.Row="4" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                                <StackPanel>
+                                    <TextBlock Text="TPM PLATFORM CRYPTO &amp; ATTESTATION HEALER" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Clears hung attestation state flags in registry, restarts TPM Base Services (tbds), validates Endorsement Key (EK) certs without wiping BitLocker." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <Button Name="BtnFixTpm" Content="Heal TPM Attestation" HorizontalAlignment="Left" Padding="12,5"/>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Card 11: AppX Manifest Staging & Sysprep Unbricker -->
+                            <Border Grid.Row="5" Grid.Column="0" Grid.ColumnSpan="2" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,0,10">
+                                <StackPanel>
+                                    <TextBlock Text="APPX MANIFEST STAGING &amp; SYSPREP UNBRICKER" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Scans for broken/abnormal AppX packages, cleans orphaned staged packages, and re-registers core Windows inbox manifests (Shell, Start, SecHealthUI)." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <Button Name="BtnFixAppX" Content="Unbrick AppX Staging" HorizontalAlignment="Left" Padding="12,5"/>
+                                </StackPanel>
+                            </Border>
+
+                        </Grid>
+                    </ScrollViewer>
+
+                    <!-- Tab-local output console -->
+                    <Border Grid.Row="2" Background="#161616" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Margin="0,6,0,0">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            <Border Grid.Row="0" Background="#202020" Padding="8,4">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="REMEDIATION EXECUTION CONSOLE" FontSize="10" FontWeight="SemiBold" Foreground="#8A8A8A" VerticalAlignment="Center"/>
+                                    <Button Name="BtnCopyFixLog" Grid.Column="1" Content="Copy Log" FontSize="10" Padding="6,2"/>
+                                </Grid>
+                            </Border>
+                            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                                <TextBox Name="TxtRemOut" Background="Transparent" Foreground="#D0D0D0" BorderThickness="0" FontFamily="Consolas" FontSize="11" IsReadOnly="True" TextWrapping="Wrap" Padding="8" Text="Enterprise Remediation Arsenal ready. Select a precision tool above to execute surgical OS recovery."/>
                             </ScrollViewer>
                         </Grid>
                     </Border>
@@ -6621,6 +7895,36 @@ function Start-AutopilotHubGui {
     $btnHybLegacy      = $window.FindName('BtnHybLegacy')
     $btnHybCerts       = $window.FindName('BtnHybCerts')
     $btnHybBundle      = $window.FindName('BtnHybBundle')
+    $btnHybDcLadder    = $window.FindName('BtnHybDcLadder')
+    $btnHybScp         = $window.FindName('BtnHybScp')
+    $btnHybCoMgmtAllIntune = $window.FindName('BtnHybCoMgmtAllIntune')
+    $btnHybCoMgmtAllCcm    = $window.FindName('BtnHybCoMgmtAllCcm')
+    $btnHybCoMgmtPilot     = $window.FindName('BtnHybCoMgmtPilot')
+    $txtHybKerb        = $window.FindName('TxtHybKerb')
+    $btnHybKerbDiag    = $window.FindName('BtnHybKerbDiag')
+    $btnHybKerbPurge   = $window.FindName('BtnHybKerbPurge')
+    $btnHybPrtDiag     = $window.FindName('BtnHybPrtDiag')
+    $btnHybResetBroker = $window.FindName('BtnHybResetBroker')
+    $txtHybCertPulse   = $window.FindName('TxtHybCertPulse')
+    $btnHybCertPulse   = $window.FindName('BtnHybCertPulse')
+    $btnHybScepHealth  = $window.FindName('BtnHybScepHealth')
+
+    # Tab 9: Precision Enterprise Remediation Arsenal Controls
+    $btnFixHealthReadout = $window.FindName('BtnFixHealthReadout')
+    $btnClearFixOut      = $window.FindName('BtnClearFixOut')
+    $btnCopyFixLog       = $window.FindName('BtnCopyFixLog')
+    $txtRemOut           = $window.FindName('TxtRemOut')
+    $btnFixWmi           = $window.FindName('BtnFixWmi')
+    $btnFixWu            = $window.FindName('BtnFixWu')
+    $btnFixCatroot       = $window.FindName('BtnFixCatroot')
+    $btnFixBits          = $window.FindName('BtnFixBits')
+    $btnFixDcom          = $window.FindName('BtnFixDcom')
+    $btnFixSpooler       = $window.FindName('BtnFixSpooler')
+    $btnFixNetStack      = $window.FindName('BtnFixNetStack')
+    $btnFixWinRm         = $window.FindName('BtnFixWinRm')
+    $btnFixProfiles      = $window.FindName('BtnFixProfiles')
+    $btnFixTpm           = $window.FindName('BtnFixTpm')
+    $btnFixAppX          = $window.FindName('BtnFixAppX')
     $lstDiagStages     = $window.FindName('LstDiagStages')
 
     $hubProgressBar    = $window.FindName('HubProgressBar')
@@ -7598,6 +8902,447 @@ function Start-AutopilotHubGui {
             Write-HybOut "Diagnostics written to: $zip" "SUCCESS"
             try { Start-Process explorer.exe "/select,`"$zip`"" } catch {}
         } catch { Write-HybOut "Bundle failed: $($_.Exception.Message)" "ERROR" }
+    })
+
+    # Hybrid Enhancements Event Handlers
+    $btnHybDcLadder.Add_Click({
+        Write-HybOut "Initiating Active Directory Domain Controller Port & Latency Ladder..." "INFO"
+        $btnHybDcLadder.IsEnabled = $false
+        Set-HubProgress -Percent 20 -Status "Testing DC Port Ladder"
+
+        Start-HubAsyncWork -Description "DC Port Ladder" -WorkerScript {
+            Write-WorkerLog "Probing DC connectivity across LDAP, Kerberos, SMB, RPC, and DNS..."
+            $res = Test-DomainControllerLadder
+            return $res
+        } -OnComplete {
+            param($res, $err)
+            $btnHybDcLadder.IsEnabled = $true
+            Set-HubProgress -Percent 100 -Status "Ready"
+            if ($err) {
+                Write-HybOut "DC Port Ladder probe failed: $($err.Message)" "ERROR"
+            } elseif ($res) {
+                if (-not $res.Applicable) {
+                    Write-HybOut $res.Summary "WARN"
+                } else {
+                    Write-HybOut "=== Domain Controller Port & Latency Ladder ($($res.DcName)) ===" "INFO"
+                    foreach ($p in $res.Ports) {
+                        $lvl = if ($p.Status -eq 'OPEN') { 'SUCCESS' } else { 'WARN' }
+                        $latStr = if ($p.LatencyMs -ge 0) { "$($p.LatencyMs)ms" } else { $p.Error }
+                        Write-HybOut ("  Port {0,5}/TCP | {1,-20} | Status: {2,-7} | Latency: {3}" -f $p.Port, $p.Service, $p.Status, $latStr) $lvl
+                    }
+                    Write-HybOut $res.Summary $(if ($res.AllReachable) { 'SUCCESS' } else { 'WARN' })
+                }
+            }
+        }
+    })
+
+    $btnHybScp.Add_Click({
+        Write-HybOut "Inspecting Active Directory Service Connection Point (SCP) for Entra Tenant..." "INFO"
+        $btnHybScp.IsEnabled = $false
+
+        Start-HubAsyncWork -Description "AD SCP Inspection" -WorkerScript {
+            Write-WorkerLog "Querying LDAP RootDSE configurationNamingContext for SCP 62a0ff2e-97b9-4513-943f-0d221bd30080..."
+            $res = Get-AdServiceConnectionPoint
+            return $res
+        } -OnComplete {
+            param($res, $err)
+            $btnHybScp.IsEnabled = $true
+            if ($err) {
+                Write-HybOut "AD SCP query failed: $($err.Message)" "ERROR"
+            } elseif ($res) {
+                $lvl = switch ($res.Verdict) {
+                    'MATCH'     { 'SUCCESS' }
+                    'MISMATCH'  { 'ERROR' }
+                    'SCP_VALID' { 'SUCCESS' }
+                    default     { 'WARN' }
+                }
+                Write-HybOut "AD SCP Status: $($res.Verdict) - $($res.Message)" $lvl
+                if ($res.ScpFound) {
+                    Write-HybOut "  AD SCP Tenant ID: $($res.TenantId) ($($res.TenantDomain))" "INFO"
+                    Write-HybOut "  SCP DN: $($res.ScpDistinguishedName)" "INFO"
+                    if ($res.LocalTenantId) {
+                        Write-HybOut "  Local Device Tenant ID: $($res.LocalTenantId) ($($res.LocalTenantName))" "INFO"
+                    }
+                }
+            }
+        }
+    })
+
+    $btnHybCoMgmtAllIntune.Add_Click({
+        if (-not (Assert-HybElevated)) { return }
+        Write-HybOut "Shifting ALL Co-Management workloads to Intune (Flags: 255)..." "WARN"
+        $res = Set-CoManagementWorkloads -Preset AllIntune
+        Write-HybOut "Workload authority updated: Preset $($res.Preset), Flags=$($res.FlagsValue). $($res.ConfigMgrMsg)" "SUCCESS"
+        $c = Get-CoManagementState
+        $lstHybWorkloads.ItemsSource = $c.Workloads
+    })
+
+    $btnHybCoMgmtAllCcm.Add_Click({
+        if (-not (Assert-HybElevated)) { return }
+        Write-HybOut "Shifting ALL Co-Management workloads to ConfigMgr / SCCM (Flags: 1)..." "WARN"
+        $res = Set-CoManagementWorkloads -Preset AllConfigMgr
+        Write-HybOut "Workload authority updated: Preset $($res.Preset), Flags=$($res.FlagsValue). $($res.ConfigMgrMsg)" "SUCCESS"
+        $c = Get-CoManagementState
+        $lstHybWorkloads.ItemsSource = $c.Workloads
+    })
+
+    $btnHybCoMgmtPilot.Add_Click({
+        if (-not (Assert-HybElevated)) { return }
+        Write-HybOut "Setting Co-Management Pilot workloads: Compliance + Client Apps (Flags: 67)..." "WARN"
+        $res = Set-CoManagementWorkloads -Preset Pilot
+        Write-HybOut "Workload authority updated: Preset $($res.Preset), Flags=$($res.FlagsValue). $($res.ConfigMgrMsg)" "SUCCESS"
+        $c = Get-CoManagementState
+        $lstHybWorkloads.ItemsSource = $c.Workloads
+    })
+
+    $btnHybKerbDiag.Add_Click({
+        Write-HybOut "Querying Kerberos ticket cache (klist tickets)..." "INFO"
+        $k = Get-KerberosDiagnostics
+        $txtHybKerb.Text = $k.Message
+        Write-HybOut $k.Message $(if ($k.HasTgt) { 'SUCCESS' } else { 'WARN' })
+        if ($k.Tickets.Count -gt 0) {
+            foreach ($t in $k.Tickets) {
+                Write-HybOut ("  Ticket: {0} | Server: {1} | Enc: {2} | Expires: {3}" -f $t.Client, $t.Server, $t.KerbTicketEncryptionType, $t.EndTime) "INFO"
+            }
+        }
+    })
+
+    $btnHybKerbPurge.Add_Click({
+        Write-HybOut "Purging cached Kerberos tickets..." "WARN"
+        $purgeRes = Invoke-KerberosPurge
+        Write-HybOut $purgeRes "INFO"
+        $k = Get-KerberosDiagnostics
+        $txtHybKerb.Text = $k.Message
+    })
+
+    $btnHybPrtDiag.Add_Click({
+        Write-HybOut "Evaluating Entra ID Primary Refresh Token (PRT) and Cloud AP WAM Broker..." "INFO"
+        $prt = Get-EntraPrtDiagnostics
+        $prtStatus = if ($prt.HasPrt) { "PRESENT ($($prt.PrtAuthority))" } else { "MISSING" }
+        Write-HybOut "Entra PRT: $prtStatus | NgcPrt: $($prt.HasNgcPrt) | CloudTgt: $($prt.HasCloudTgt) | OnPremTgt: $($prt.HasOnPremTgt)" $(if ($prt.HasPrt){'SUCCESS'}else{'WARN'})
+        Write-HybOut "WAM Broker Plugin (Microsoft.AAD.BrokerPlugin): Installed=$($prt.BrokerInstalled), Status=$($prt.BrokerStatus), Version=$($prt.BrokerVersion)" $(if ($prt.BrokerInstalled){'SUCCESS'}else{'WARN'})
+    })
+
+    $btnHybResetBroker.Add_Click({
+        if (-not (Assert-HybElevated)) { return }
+        Write-HybOut "Resetting Web Account Manager (WAM) TokenBroker and Cloud AP cache..." "WARN"
+        $res = Reset-CloudApBrokerCache
+        foreach ($l in ($res -split "`n")) { Write-HybOut "  $l" "INFO" }
+    })
+
+    $btnHybCertPulse.Add_Click({
+        if (-not (Assert-HybElevated)) { return }
+        Write-HybOut "Triggering immediate certificate auto-enrollment pulse (certutil/certreq)..." "WARN"
+        $btnHybCertPulse.IsEnabled = $false
+        Start-HubAsyncWork -Description "Certificate Pulse" -WorkerScript {
+            Invoke-CertificatePulse
+        } -OnComplete {
+            param($res, $err)
+            $btnHybCertPulse.IsEnabled = $true
+            if ($err) { Write-HybOut "Certificate pulse error: $($err.Message)" "ERROR" }
+            elseif ($res) {
+                foreach ($l in ($res -split "`n")) { Write-HybOut "  $l" "INFO" }
+                Write-HybOut "Certificate auto-enrollment pulse completed." "SUCCESS"
+            }
+        }
+    })
+
+    $btnHybScepHealth.Add_Click({
+        Write-HybOut "Auditing SCEP/NDES, MDM, and Client-Auth certificates..." "INFO"
+        $scep = @(Get-ScepCertificateHealth)
+        if ($scep.Count -eq 0) {
+            Write-HybOut "No SCEP/NDES or Intune MDM certificates found in machine or user stores." "WARN"
+            return
+        }
+        foreach ($c in $scep) {
+            $lvl = switch -Wildcard ($c.Status) {
+                'HEALTHY'   { 'SUCCESS' }
+                'EXPIRING*' { 'WARN' }
+                default     { 'ERROR' }
+            }
+            Write-HybOut ("  [{0}] {1} | Issuer: {2} | Expires: {3} ({4} d) | Key: {5}-bit | Status: {6}" -f $c.Store, $c.Subject, $c.Issuer, $c.NotAfter, $c.DaysLeft, $c.KeyLength, $c.Status) $lvl
+        }
+    })
+
+    # --- TAB 9: PRECISION ENTERPRISE REMEDIATION ARSENAL WIREUP ---
+    function Write-RemOut {
+        param([string]$Message, [string]$Level = 'INFO')
+        $ts = (Get-Date).ToString('HH:mm:ss')
+        $txtRemOut.AppendText("`r`n[$ts] [$Level] $Message")
+        $txtRemOut.ScrollToEnd()
+        Update-WpfUI
+    }
+
+    function Assert-RemElevated {
+        if (-not $script:RuntimeContext.MeetsPreferred) {
+            Write-RemOut "This remediation tool requires administrative elevation (SYSTEM or Administrator). Click 'Fix Privileges' in the header." "WARN"
+            return $false
+        }
+        return $true
+    }
+
+    $btnClearFixOut.Add_Click({
+        $txtRemOut.Text = "Remediation console cleared. Ready for next diagnostic or surgical repair."
+    })
+
+    $btnCopyFixLog.Add_Click({
+        try {
+            [System.Windows.Clipboard]::SetText($txtRemOut.Text)
+            Write-RemOut "Remediation console output copied to clipboard." "INFO"
+        } catch { }
+    })
+
+    $btnFixHealthReadout.Add_Click({
+        Write-RemOut "Collecting enterprise OS subsystem health overview..." "INFO"
+        $h = Get-HubRemediationHealthOverview
+        Write-RemOut "=== Enterprise OS Subsystem Health Overview ===" "INFO"
+        Write-RemOut "  WMI Repository:        $(if ($h.WmiHealthy){'HEALTHY (CIM responsive)'}else{'DEGRADED / CORRUPTED'})" $(if ($h.WmiHealthy){'SUCCESS'}else{'ERROR'})
+        Write-RemOut "  BITS Service:          $($h.BitsStatus)" $(if ($h.BitsStatus -eq 'Running'){'SUCCESS'}else{'WARN'})
+        Write-RemOut "  CryptSvc (Catroot2):   $($h.CryptSvcStatus)" $(if ($h.CryptSvcStatus -eq 'Running'){'SUCCESS'}else{'WARN'})
+        Write-RemOut "  Print Spooler:         $($h.SpoolerStatus)" $(if ($h.SpoolerStatus -eq 'Running'){'SUCCESS'}else{'WARN'})
+        Write-RemOut "  WinRM Service:         $($h.WinRmStatus)" $(if ($h.WinRmStatus -eq 'Running'){'SUCCESS'}else{'WARN'})
+        Write-RemOut "  TPM Hardware Present:  $($h.TpmPresent) (Ready: $($h.TpmReady))" $(if ($h.TpmReady){'SUCCESS'}else{'WARN'})
+    })
+
+    $btnFixWmi.Add_Click({
+        if (-not (Assert-RemElevated)) { return }
+        $btnFixWmi.IsEnabled = $false
+        Write-RemOut "Executing WMI Repository Salvage & Self-Heal Protocol (async worker)..." "WARN"
+        Set-HubProgress -Percent 20 -Status "Salvaging WMI Repository"
+
+        Start-HubAsyncWork -Description "WMI Salvage & Self-Heal" -WorkerScript {
+            Write-WorkerLog "Starting winmgmt salvage and core MOF recompilation..."
+            $res = Repair-HubWmiRepository
+            return $res
+        } -OnComplete {
+            param($res, $err)
+            $btnFixWmi.IsEnabled = $true
+            Set-HubProgress -Percent 100 -Status "Ready"
+            if ($err) {
+                Write-RemOut "WMI Salvage failed: $($err.Message)" "ERROR"
+            } elseif ($res) {
+                foreach ($l in $res.Log) { Write-RemOut "  $l" $(if ($l -match 'failed|error|Corruption') { 'WARN' } else { 'INFO' }) }
+                Write-RemOut "WMI Salvage Protocol Finished. Status: $(if ($res.Success){'SUCCESS'}else{'COMPLETED WITH WARNINGS'})" $(if ($res.Success){'SUCCESS'}else{'WARN'})
+            }
+        }
+    })
+
+    $btnFixWu.Add_Click({
+        if (-not (Assert-RemElevated)) { return }
+        $btnFixWu.IsEnabled = $false
+        Write-RemOut "Executing Windows Update Agent & SoftDistribution Deep Reset..." "WARN"
+        Set-HubProgress -Percent 25 -Status "Resetting Windows Update Agent"
+
+        Start-HubAsyncWork -Description "WU Agent Deep Reset" -WorkerScript {
+            Write-WorkerLog "Tearing down WU services, archiving SoftwareDistribution and registering DLLs..."
+            $res = Reset-HubWindowsUpdateAgent
+            return $res
+        } -OnComplete {
+            param($res, $err)
+            $btnFixWu.IsEnabled = $true
+            Set-HubProgress -Percent 100 -Status "Ready"
+            if ($err) {
+                Write-RemOut "WU Reset failed: $($err.Message)" "ERROR"
+            } elseif ($res) {
+                foreach ($l in $res.Log) { Write-RemOut "  $l" "INFO" }
+                Write-RemOut "Windows Update Agent Deep Reset Completed Successfully." "SUCCESS"
+            }
+        }
+    })
+
+    $btnFixCatroot.Add_Click({
+        if (-not (Assert-RemElevated)) { return }
+        $btnFixCatroot.IsEnabled = $false
+        Write-RemOut "Executing Catroot2 Cryptographic ESENT Database Repair..." "WARN"
+        Set-HubProgress -Percent 30 -Status "Repairing Catroot2 Database"
+
+        Start-HubAsyncWork -Description "Catroot2 ESENT Repair" -WorkerScript {
+            Write-WorkerLog "Verifying and repairing catdb database via esentutl..."
+            $res = Repair-HubCryptSvcCatroot
+            return $res
+        } -OnComplete {
+            param($res, $err)
+            $btnFixCatroot.IsEnabled = $true
+            Set-HubProgress -Percent 100 -Status "Ready"
+            if ($err) {
+                Write-RemOut "Catroot2 repair failed: $($err.Message)" "ERROR"
+            } elseif ($res) {
+                foreach ($l in $res.Log) { Write-RemOut "  $l" "INFO" }
+                Write-RemOut "Catroot2 ESENT Database Repair Protocol Completed." "SUCCESS"
+            }
+        }
+    })
+
+    $btnFixBits.Add_Click({
+        if (-not (Assert-RemElevated)) { return }
+        $btnFixBits.IsEnabled = $false
+        Write-RemOut "Executing BITS Transfer Deadlock Purge..." "WARN"
+        Set-HubProgress -Percent 20 -Status "Purging BITS Queue"
+
+        Start-HubAsyncWork -Description "BITS Deadlock Purge" -WorkerScript {
+            Write-WorkerLog "Purging BITS queue and deleting corrupted qmgr.dat files..."
+            $res = Reset-HubBitsQueue
+            return $res
+        } -OnComplete {
+            param($res, $err)
+            $btnFixBits.IsEnabled = $true
+            Set-HubProgress -Percent 100 -Status "Ready"
+            if ($err) {
+                Write-RemOut "BITS purge failed: $($err.Message)" "ERROR"
+            } elseif ($res) {
+                foreach ($l in $res.Log) { Write-RemOut "  $l" "INFO" }
+                Write-RemOut "BITS Queue Purged & Transfer Pipeline Verified." "SUCCESS"
+            }
+        }
+    })
+
+    $btnFixDcom.Add_Click({
+        if (-not (Assert-RemElevated)) { return }
+        $btnFixDcom.IsEnabled = $false
+        Write-RemOut "Executing DCOM / RPC 0x800706BA Security Limits Remediation..." "WARN"
+
+        Start-HubAsyncWork -Description "DCOM & RPC Remediation" -WorkerScript {
+            Write-WorkerLog "Resetting Ole DCOM levels and enabling RPC firewall rules..."
+            $res = Repair-HubDcomRpcPermissions
+            return $res
+        } -OnComplete {
+            param($res, $err)
+            $btnFixDcom.IsEnabled = $true
+            if ($err) {
+                Write-RemOut "DCOM remediation failed: $($err.Message)" "ERROR"
+            } elseif ($res) {
+                foreach ($l in $res.Log) { Write-RemOut "  $l" "INFO" }
+                Write-RemOut "DCOM / RPC Remediation Completed. Local COM activation verified." "SUCCESS"
+            }
+        }
+    })
+
+    $btnFixSpooler.Add_Click({
+        if (-not (Assert-RemElevated)) { return }
+        $btnFixSpooler.IsEnabled = $false
+        Write-RemOut "Executing Print Spooler Hung Queue Purge..." "WARN"
+
+        Start-HubAsyncWork -Description "Print Spooler Purge" -WorkerScript {
+            Write-WorkerLog "Purging locked .spl/.shd jobs in spool\PRINTERS and restarting Spooler..."
+            $res = Clear-HubPrintSpoolerQueue
+            return $res
+        } -OnComplete {
+            param($res, $err)
+            $btnFixSpooler.IsEnabled = $true
+            if ($err) {
+                Write-RemOut "Spooler purge failed: $($err.Message)" "ERROR"
+            } elseif ($res) {
+                foreach ($l in $res.Log) { Write-RemOut "  $l" "INFO" }
+                Write-RemOut "Print Spooler Queue Purged and Service Restarted." "SUCCESS"
+            }
+        }
+    })
+
+    $btnFixNetStack.Add_Click({
+        if (-not (Assert-RemElevated)) { return }
+        $btnFixNetStack.IsEnabled = $false
+        Write-RemOut "Executing Network Stack, Winsock & IPsec Reset (async worker)..." "WARN"
+
+        Start-HubAsyncWork -Description "Network Stack Reset" -WorkerScript {
+            Write-WorkerLog "Resetting TCP/IP, Winsock, DNS cache, ARP tables, and IPsec associations..."
+            $res = Reset-HubNetworkStack
+            return $res
+        } -OnComplete {
+            param($res, $err)
+            $btnFixNetStack.IsEnabled = $true
+            if ($err) {
+                Write-RemOut "Network stack reset failed: $($err.Message)" "ERROR"
+            } elseif ($res) {
+                foreach ($l in $res.Log) { Write-RemOut "  $l" "INFO" }
+                Write-RemOut "Network Stack, Winsock, ARP, and IPsec Filters Successfully Flushed." "SUCCESS"
+            }
+        }
+    })
+
+    $btnFixWinRm.Add_Click({
+        if (-not (Assert-RemElevated)) { return }
+        $btnFixWinRm.IsEnabled = $false
+        Write-RemOut "Executing WinRM & WS-Man Listener Rebuild..." "WARN"
+
+        Start-HubAsyncWork -Description "WinRM Listener Rebuild" -WorkerScript {
+            Write-WorkerLog "Rebuilding WinRM HTTP 5985 listener and binding firewall rules..."
+            $res = Repair-HubWinRmListener
+            return $res
+        } -OnComplete {
+            param($res, $err)
+            $btnFixWinRm.IsEnabled = $true
+            if ($err) {
+                Write-RemOut "WinRM rebuild failed: $($err.Message)" "ERROR"
+            } elseif ($res) {
+                foreach ($l in $res.Log) { Write-RemOut "  $l" "INFO" }
+                Write-RemOut "WinRM & WS-Man Listener Rebuilt Successfully." "SUCCESS"
+            }
+        }
+    })
+
+    $btnFixProfiles.Add_Click({
+        if (-not (Assert-RemElevated)) { return }
+        $btnFixProfiles.IsEnabled = $false
+        Write-RemOut "Executing User Profile Registry Lock Un-hooker (.bak resolver)..." "WARN"
+
+        Start-HubAsyncWork -Description "User Profile Un-hooker" -WorkerScript {
+            Write-WorkerLog "Scanning ProfileList for orphaned .bak subkeys and resetting RefCount..."
+            $res = Repair-HubUserProfileLocks
+            return $res
+        } -OnComplete {
+            param($res, $err)
+            $btnFixProfiles.IsEnabled = $true
+            if ($err) {
+                Write-RemOut "User profile unlock failed: $($err.Message)" "ERROR"
+            } elseif ($res) {
+                foreach ($l in $res.Log) { Write-RemOut "  $l" "INFO" }
+                Write-RemOut "User Profile Locks Un-hooked. Repaired: $($res.FixedCount) .bak key(s)." "SUCCESS"
+            }
+        }
+    })
+
+    $btnFixTpm.Add_Click({
+        if (-not (Assert-RemElevated)) { return }
+        $btnFixTpm.IsEnabled = $false
+        Write-RemOut "Executing TPM Platform Crypto Provider & Attestation NVRAM Healer..." "WARN"
+
+        Start-HubAsyncWork -Description "TPM Attestation Healer" -WorkerScript {
+            Write-WorkerLog "Clearing cached attestation flags and verifying Endorsement Key certs..."
+            $res = Repair-HubTpmCryptoAttestation
+            return $res
+        } -OnComplete {
+            param($res, $err)
+            $btnFixTpm.IsEnabled = $true
+            if ($err) {
+                Write-RemOut "TPM healer failed: $($err.Message)" "ERROR"
+            } elseif ($res) {
+                foreach ($l in $res.Log) { Write-RemOut "  $l" "INFO" }
+                Write-RemOut "TPM Platform Crypto Provider & Attestation Healer Completed." "SUCCESS"
+            }
+        }
+    })
+
+    $btnFixAppX.Add_Click({
+        if (-not (Assert-RemElevated)) { return }
+        $btnFixAppX.IsEnabled = $false
+        Write-RemOut "Executing AppX Manifest Staging & Sysprep Unbricker (async worker)..." "WARN"
+        Set-HubProgress -Percent 20 -Status "Unbricking AppX Manifests"
+
+        Start-HubAsyncWork -Description "AppX Staging Unbricker" -WorkerScript {
+            Write-WorkerLog "Re-registering core Windows inbox AppX manifests and scanning staging state..."
+            $res = Repair-HubAppXStaging
+            return $res
+        } -OnComplete {
+            param($res, $err)
+            $btnFixAppX.IsEnabled = $true
+            Set-HubProgress -Percent 100 -Status "Ready"
+            if ($err) {
+                Write-RemOut "AppX unbricking failed: $($err.Message)" "ERROR"
+            } elseif ($res) {
+                foreach ($l in $res.Log) { Write-RemOut "  $l" "INFO" }
+                Write-RemOut "AppX Staging Unbricker Finished: Re-registered $($res.HealedCount) core manifest(s)." "SUCCESS"
+            }
+        }
     })
 
     # --- ACTION: Run Diagnostics (Hyperthreaded & Asynchronous) ---

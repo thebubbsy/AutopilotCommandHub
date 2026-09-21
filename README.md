@@ -139,9 +139,31 @@ For hybrid (on-prem domain-joined **and** Entra-registered) and co-managed (Conf
 
 * **Join & Identity**: decoded `dsregcmd` (join type, PRT/SSO-token health, tenant, device ID), retry hybrid Azure AD join, and a machine secure-channel test (`Test-ComputerSecureChannel`) for the "trust relationship failed" case.
 * **MDM / Intune**: force an immediate Intune sync (the `EnterpriseMgmt` PushLaunch task), Intune Management Extension health + one-click restart (when IME hangs, Win32 apps and PS scripts silently stop), and force GPO-style MDM auto-enrollment.
-* **Co-Management**: decodes the ConfigMgr/Intune workload authority bitmask so you can see, per workload (Compliance, Device Config, Endpoint Protection, Client Apps, Office, Windows Update, Resource Access), whether **Intune or ConfigMgr wins** - the usual source of "conflicting policy" mysteries. Plus trigger a ConfigMgr machine-policy retrieval.
+* **Co-Management & Guided Authority Overrides**: decodes the ConfigMgr/Intune workload authority bitmask (Compliance, Device Config, Endpoint Protection, Client Apps, Office, Windows Update, Resource Access) with one-click authority shifts: **Shift All to Intune** (255), **Shift All to ConfigMgr** (1), or **Pilot Workloads** (67).
+* **Domain Controller Port & Latency Ladder**: 9-port live TCP latency ladder testing reachability across LDAP (389), LDAPS (636), Kerberos (88), SMB (445), RPC Endpoint Mapper (135), DNS (53), and high RPC dynamic range.
+* **Active Directory SCP Tenant Verification**: queries AD Configuration container (`CN=62a0ff2e-97b9-4513-943f-0d221bd30080`) to verify whether on-prem AD SCP `azureADId` matches the local Entra registration tenant.
+* **Kerberos Diagnostics & Purge**: inspects cached user and SYSTEM/LSA tickets (`klist`), identifies TGT/TGS, validates Cloud Kerberos TGT (`krbtgt/KERBEROS.MICROSOFTONLINE.COM`), and performs ticket cache purging.
+* **Entra PRT & WAM Broker Reset**: audits Primary Refresh Token state, NgcPrt, and Web Account Manager package (`Microsoft.AAD.BrokerPlugin`), with one-click WAM TokenBroker cache reset.
+* **Certificate Auto-Enrollment & SCEP Health**: triggers immediate machine/user certificate pulse (`certutil -pulse` / `certreq -pulse`) and audits Intune MDM, SCEP, and NDES client-auth certificate health and expiration.
 * **Policy & Connectivity**: DC line-of-sight (`nltest /dsgetdc`), `gpupdate /force`, and domain time resync (`w32tm`) for the Kerberos/cert failures that clock skew causes.
-* **Compliance / Security / Diagnostics**: Conditional Access readiness (Entra join + PRT + MDM enrollment) so you know *why* a device is blocked; one-click BitLocker recovery-key escrow to Entra (and AD); a legacy-dependency scan (SMBv1, NTLM level, Credential Guard, mapped drives) for what security baselines will break; machine certificate expiry (802.1x/VPN/SCEP); and a **Collect Hybrid Diagnostics** bundle (`dsregcmd`, `gpresult`, `mdmdiagnosticstool`, IME logs) zipped for the helpdesk.
+* **Compliance / Security / Diagnostics**: Conditional Access readiness (Entra join + PRT + MDM enrollment); BitLocker recovery-key escrow to Entra (and AD); legacy-dependency scan (SMBv1, NTLM level, Credential Guard, mapped drives); and a **Collect Hybrid Diagnostics** bundle (`dsregcmd`, `gpresult`, `mdmdiagnosticstool`, IME logs) zipped for the helpdesk.
+
+### 5c. Precision Enterprise Remediation Arsenal (Tab 9)
+Curated surgical one-click fixes for elusive enterprise corruption, broken cryptographic catalogs, deadlocked pipelines, and hybrid edge cases:
+
+* **WMI Repository Salvage & Self-Heal**: runs `winmgmt /salvagerepository` and recompiles core system MOF/MFL catalogs without wiping third-party OEM (Dell, HP, Lenovo) WMI namespaces.
+* **Windows Update Agent & SoftDistribution Deep Reset**: full service teardown (`wuauserv`, `bits`, `cryptsvc`, `dosvc`), archives `SoftwareDistribution` and `Catroot2`, re-registers 28 core WU/crypto DLLs, and resets catalog permissions.
+* **Catroot2 Crypto ESENT Database Repair**: repairs corrupted `catdb` ESENT database via `esentutl /g` and `/p`, fixes CryptSvc catalog locks, and resolves 0x800b0109 signature errors.
+* **BITS Transfer Deadlock Purge**: clears stuck Qmgr jobs, purges corrupted `qmgr0.dat`/`qmgr1.dat` databases, resets BITS service state, and re-validates the transfer pipeline with a live probe.
+* **DCOM / RPC 0x800706BA Remediation**: repairs Component Services DCOM authentication/impersonation levels, fixes machine launch/activation permissions, and verifies RPC Endpoint Mapper.
+* **Network Stack, Winsock & IPsec Reset**: resets TCP/IP stack (`netsh int ip reset`), resets Winsock catalog, flushes DNS & ARP, clears IPsec security associations, and renews DHCP leases.
+* **WinRM & WS-Man Listener Rebuild**: tears down corrupted WinRM listeners, recreates default HTTP port 5985 listener, re-binds firewall rules, and validates WS-Man loopback.
+* **Print Spooler Hung Queue Purge**: gracefully halts hung `spoolsv.exe`, clears locked `.spl` and `.shd` print job files in `spool\PRINTERS`, cleans registry job keys, and restarts Spooler.
+* **User Profile Registry Lock Un-hooker**: detects orphaned `.bak` ProfileList subkeys, resolves temporary profile collisions (`C:\Users\TEMP`), and clears RefCount hive locks.
+* **TPM Platform Crypto & Attestation Healer**: clears hung attestation state flags in registry, restarts TPM Base Services (`tbds`), and validates Endorsement Key (EK) certs without wiping BitLocker.
+* **AppX Manifest Staging Unbricker**: scans for broken/abnormal AppX packages, cleans orphaned staged packages, and re-registers core Windows inbox manifests (Shell, Start, SecHealthUI).
+* **System Health Audit Readout**: unified instant status assessment across WMI, BITS, CryptSvc, Spooler, WinRM, and TPM.
+
 
 ### 4b. Multi-Vendor Hardware Health & Lenovo Warranty
 * **Lenovo warranty** alongside Dell (`Assess Lenovo` / `-LenovoWarranty [-LenovoSerialNumber]`) via Lenovo's public warranty API.
