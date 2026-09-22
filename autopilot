@@ -755,7 +755,11 @@ function Invoke-AutopilotBypass {
     $disabledAdapters = [System.Collections.Generic.List[string]]::new()
 
     # 1. The only thing that matters: no Autopilot profile may drive this OOBE. Remove anything cached.
-    foreach ($jsonPath in @("$env:SystemRoot\ServiceState\wmansvc\AutopilotDDSZTDFile.json", "$env:SystemRoot\Provisioning\Autopilot\AutopilotConfigurationFile.json")) {
+    foreach ($jsonPath in @(
+        "$env:SystemRoot\ServiceState\wmansvc\AutopilotDDSZTDFile.json",
+        "$env:SystemRoot\Provisioning\Autopilot\AutopilotConfigurationFile.json",
+        "$env:SystemRoot\System32\oobe\info\default\v1\AutopilotConfigurationFile.json"
+    )) {
         if (Test-Path $jsonPath) {
             try { Remove-Item -Path $jsonPath -Force -ErrorAction Stop; $actions.Add("Removed cached Autopilot profile: $jsonPath") }
             catch { $actions.Add("FAILED to remove $jsonPath : $($_.Exception.Message)") }
@@ -773,15 +777,37 @@ function Invoke-AutopilotBypass {
         $actions.Add("Set IsAutopilotDisabled=1 and cleared CloudAssigned* under Provisioning\Diagnostics\AutoPilot")
     } catch { $actions.Add("FAILED to write Autopilot diagnostics key: $($_.Exception.Message)") }
 
-    # 3. Let OOBE finish without internet / with a local account (BypassNRO for older builds; ms-cxh:localonly for 24H2+)
+    # 2b. Purge tenant policy cache so Windows OOBE cannot lock into corporate work/school flow
+    try {
+        $policyCache = 'HKLM:\SOFTWARE\Microsoft\Provisioning\AutopilotPolicyCache'
+        if (Test-Path $policyCache) {
+            Remove-Item -Path $policyCache -Recurse -Force -ErrorAction Stop
+            $actions.Add("Purged AutopilotPolicyCache registry key")
+        }
+    } catch { $actions.Add("FAILED to purge AutopilotPolicyCache: $($_.Exception.Message)") }
+
+    # 2c. Decommission MDM enrollment keys
+    try {
+        foreach ($k in @(Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue)) {
+            $pv = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
+            if ($pv -and $pv.ProviderID -eq 'MS DM Server') {
+                Remove-Item -Path $k.PSPath -Recurse -Force -ErrorAction Stop
+                $actions.Add("Purged MDM Enrollment key $($k.PSChildName)")
+            }
+        }
+    } catch { }
+
+    # 3. Unlock offline setup & Personal Account options in OOBE
     try {
         $oobeKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE'
         if (-not (Test-Path $oobeKey)) { New-Item -Path $oobeKey -Force | Out-Null }
         Set-ItemProperty -Path $oobeKey -Name 'BypassNRO' -Value 1 -Type DWord -ErrorAction Stop
-        $actions.Add("Set OOBE\BypassNRO=1 (offline / local-account path allowed)")
-    } catch { $actions.Add("FAILED to set BypassNRO: $($_.Exception.Message)") }
+        Set-ItemProperty -Path $oobeKey -Name 'HidePersonalAccountOption' -Value 0 -Type DWord -ErrorAction Stop
+        Remove-ItemProperty -Path $oobeKey -Name 'HideWorkOrSchoolOption' -ErrorAction SilentlyContinue
+        $actions.Add("Set OOBE\BypassNRO=1 and HidePersonalAccountOption=0 (offline and personal account unlocked)")
+    } catch { $actions.Add("FAILED to set OOBE flags: $($_.Exception.Message)") }
 
-    # 4. Optionally cut the network so the Deployment Service cannot be contacted for the rest of OOBE
+    # 4. Optionally cut network so Deployment Service cannot be contacted for offline setup
     if ($DisableNetwork) {
         try {
             foreach ($ad in @(Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -ne 'Disabled' })) {
@@ -819,6 +845,283 @@ function Enable-HubNetworkAdapters {
         }
     }
     return ,$enabled
+}
+
+# --- Function: Invoke-HubSystemReboot (Multi-tier resilient system reboot) ---
+function Invoke-HubSystemReboot {
+    [CmdletBinding()]
+    param(
+        [string]$Reason = "Autopilot Hub Restart",
+        [int]$DelaySeconds = 0
+    )
+    Write-HubLog "Executing system reboot (Delay: ${DelaySeconds}s, Reason: '$Reason')..." "WARN"
+
+    # Tier 1: shutdown.exe /r /t <delay> /f (works across SYSTEM, Administrator, defaultuser0, and OOBE)
+    try {
+        $shutdownExe = Join-Path $env:SystemRoot 'System32\shutdown.exe'
+        if (Test-Path $shutdownExe) {
+            $argList = "/r /t $DelaySeconds /f /c `"$Reason`""
+            $p = Start-Process -FilePath $shutdownExe -ArgumentList $argList -NoNewWindow -PassThru -ErrorAction SilentlyContinue
+            if ($p) {
+                Write-HubLog "Initiated reboot via shutdown.exe /r /t $DelaySeconds /f" "SUCCESS"
+                return
+            }
+        }
+    } catch {
+        Write-HubLog "shutdown.exe invocation warning: $($_.Exception.Message)" "WARN"
+    }
+
+    # Tier 2: Win32 API InitiateSystemShutdownEx & ExitWindowsEx
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'Win32NativeShutdown').Type) {
+            Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32NativeShutdown {
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    public static extern bool InitiateSystemShutdownEx(string lpMachineName, string lpMessage, uint dwTimeout, bool bForceAppsClosed, bool bRebootAfterShutdown, uint dwReason);
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool ExitWindowsEx(uint uFlags, uint dwReason);
+}
+"@ -ErrorAction SilentlyContinue
+        }
+        if (([System.Management.Automation.PSTypeName]'Win32NativeShutdown').Type) {
+            $res = [Win32NativeShutdown]::InitiateSystemShutdownEx($null, $Reason, [uint32]$DelaySeconds, $true, $true, 0x40000004)
+            if ($res) {
+                Write-HubLog "Initiated reboot via Win32 InitiateSystemShutdownEx" "SUCCESS"
+                return
+            }
+            $res2 = [Win32NativeShutdown]::ExitWindowsEx(0x6, 0x40000004)
+            if ($res2) {
+                Write-HubLog "Initiated reboot via Win32 ExitWindowsEx" "SUCCESS"
+                return
+            }
+        }
+    } catch { }
+
+    # Tier 3: Invoke-HubSystemReboot -Reason 'Autonomous System Restart' fallback
+    try {
+        Invoke-HubSystemReboot -Reason 'Autonomous System Restart' -ErrorAction Stop
+        Write-HubLog "Initiated reboot via Invoke-HubSystemReboot -Reason 'Autonomous System Restart'" "SUCCESS"
+    } catch {
+        Write-HubLog "Restart-Computer failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+# --- Function: Invoke-HubCreateLocalUser (Create Local Admin / User in OOBE or Desktop) ---
+function Invoke-HubCreateLocalUser {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$UserName,
+        [string]$Password = '',
+        [string]$FullName = '',
+        [switch]$MakeAdmin = $true,
+        [switch]$PasswordNeverExpires = $true,
+        [switch]$SkipRemainingOobe = $false
+    )
+    $actions = [System.Collections.Generic.List[string]]::new()
+    $cleanName = $UserName.Trim()
+    if ([string]::IsNullOrWhiteSpace($cleanName)) {
+        throw "Username cannot be empty or whitespace."
+    }
+
+    $created = $false
+    try {
+        $passVal = if ($Password) { $Password } else { '' }
+        $secPass = ConvertTo-SecureString $passVal -AsPlainText -Force
+        New-LocalUser -Name $cleanName -Password $secPass -FullName $FullName -Description "Created via Autopilot Command Hub" -PasswordNeverExpires:$PasswordNeverExpires -ErrorAction Stop | Out-Null
+        $created = $true
+        $actions.Add("Created local user account '$cleanName' via New-LocalUser")
+    } catch {
+        try {
+            $netArgs = if ($Password) { "user `"$cleanName`" `"$Password`" /add" } else { "user `"$cleanName`" /add" }
+            $netProc = Start-Process -FilePath "net.exe" -ArgumentList $netArgs -NoNewWindow -Wait -PassThru
+            if ($netProc.ExitCode -eq 0) {
+                $created = $true
+                $actions.Add("Created local user account '$cleanName' via net.exe")
+            } else {
+                throw "net.exe returned exit code $($netProc.ExitCode)"
+            }
+        } catch {
+            throw "Failed to create user account '$cleanName': $($_.Exception.Message)"
+        }
+    }
+
+    if ($MakeAdmin) {
+        $adminAdded = $false
+        try {
+            Add-LocalGroupMember -Group "Administrators" -Member $cleanName -ErrorAction Stop
+            $adminAdded = $true
+            $actions.Add("Added '$cleanName' to local Administrators group")
+        } catch {
+            try {
+                $netGrp = Start-Process -FilePath "net.exe" -ArgumentList "localgroup administrators `"$cleanName`" /add" -NoNewWindow -Wait -PassThru
+                if ($netGrp.ExitCode -eq 0) {
+                    $adminAdded = $true
+                    $actions.Add("Added '$cleanName' to local Administrators group via net.exe")
+                }
+            } catch { }
+        }
+        if (-not $adminAdded) {
+            $actions.Add("WARNING: Could not verify Administrators group membership for '$cleanName'")
+        }
+    }
+
+    if ($PasswordNeverExpires) {
+        try {
+            Set-LocalUser -Name $cleanName -PasswordNeverExpires $true -ErrorAction SilentlyContinue
+            $actions.Add("Set password never expires for '$cleanName'")
+        } catch {
+            try { Start-Process -FilePath "wmic.exe" -ArgumentList "useraccount where name='$cleanName' set passwordexpires=FALSE" -NoNewWindow -Wait -ErrorAction SilentlyContinue } catch { }
+        }
+    }
+
+    try {
+        $setupKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\OOBE'
+        if (-not (Test-Path $setupKey)) { New-Item -Path $setupKey -Force | Out-Null }
+        Set-ItemProperty -Path $setupKey -Name 'UnattendCreatedUser' -Value 1 -Type DWord -ErrorAction SilentlyContinue
+        $actions.Add("Set UnattendCreatedUser=1 in OOBE setup registry")
+        if ($SkipRemainingOobe) {
+            Set-ItemProperty -Path $setupKey -Name 'OOBEInProgress' -Value 0 -Type DWord -ErrorAction SilentlyContinue
+            $actions.Add("Set OOBEInProgress=0 to bypass remaining setup screens")
+        }
+    } catch { }
+
+    return [PSCustomObject]@{
+        Success  = $true
+        UserName = $cleanName
+        IsAdmin  = [bool]$MakeAdmin
+        Actions  = $actions
+    }
+}
+
+# --- Function: Invoke-HubSetupPersonalAccount (Unlock Personal Microsoft Account in OOBE) ---
+function Invoke-HubSetupPersonalAccount {
+    [CmdletBinding()]
+    param()
+    $actions = [System.Collections.Generic.List[string]]::new()
+
+    # Purge corporate Autopilot & MDM caches without cutting network
+    $bypass = Invoke-AutopilotBypass -DisableNetwork:$false
+    foreach ($a in $bypass.Actions) { $actions.Add($a) }
+
+    # Re-enable network adapters for active online sign-in
+    $en = @(Enable-HubNetworkAdapters)
+    if ($en.Count -gt 0) {
+        $actions.Add("Re-enabled network adapters for online sign-in: $($en -join ', ')")
+    }
+
+    # Unlock Personal Account selection in OOBE
+    try {
+        $oobeKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE'
+        if (-not (Test-Path $oobeKey)) { New-Item -Path $oobeKey -Force | Out-Null }
+        Set-ItemProperty -Path $oobeKey -Name 'HidePersonalAccountOption' -Value 0 -Type DWord -ErrorAction Stop
+        Remove-ItemProperty -Path $oobeKey -Name 'HideWorkOrSchoolOption' -ErrorAction SilentlyContinue
+        $actions.Add("Configured OOBE\HidePersonalAccountOption=0 (Personal Microsoft Account enabled)")
+    } catch { }
+
+    return $actions
+}
+
+# --- Function: Show-CreateLocalUserDialog (Interactive OOBE / Desktop User Provisioning) ---
+function Show-CreateLocalUserDialog {
+    param([System.Windows.Window]$Owner = $null)
+
+    if ($script:RuntimeContext -and -not $script:RuntimeContext.MeetsPreferred) {
+        [System.Windows.MessageBox]::Show("Creating a local user account requires administrative privileges. Please click 'Fix Privileges' in the header first.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+        return
+    }
+
+    $xamlUser = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Create Local User Account"
+        Width="490" SizeToContent="Height" WindowStartupLocation="CenterOwner"
+        Background="#F3F4F6" Foreground="#1E293B" FontFamily="Segoe UI Variable Text, Segoe UI, sans-serif" ResizeMode="NoResize">
+    <StackPanel Margin="18">
+        <TextBlock Text="CREATE LOCAL USER ACCOUNT" FontSize="11" FontWeight="SemiBold" Foreground="#64748B" Margin="0,0,0,4"/>
+        <TextBlock Text="Provision a local Windows user account directly during OOBE or desktop staging without entering a Microsoft Account or corporate tenant." FontSize="11.5" Foreground="#475569" TextWrapping="Wrap" Margin="0,0,0,12"/>
+
+        <Border Background="#FFFFFF" CornerRadius="6" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14,12" Margin="0,0,0,14">
+            <StackPanel>
+                <TextBlock Text="Username:" FontSize="11" FontWeight="SemiBold" Foreground="#334155" Margin="0,0,0,3"/>
+                <TextBox Name="TxtNewUserName" Text="Admin" Height="28" Padding="6,3" Margin="0,0,0,10" Background="#FFFFFF" Foreground="#1E293B" BorderBrush="#CBD5E1"/>
+
+                <TextBlock Text="Full Name (Optional):" FontSize="11" FontWeight="SemiBold" Foreground="#334155" Margin="0,0,0,3"/>
+                <TextBox Name="TxtNewUserFullName" Height="28" Padding="6,3" Margin="0,0,0,10" Background="#FFFFFF" Foreground="#1E293B" BorderBrush="#CBD5E1"/>
+
+                <Grid Margin="0,0,0,10">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="10"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0">
+                        <TextBlock Text="Password (Optional):" FontSize="11" FontWeight="SemiBold" Foreground="#334155" Margin="0,0,0,3"/>
+                        <PasswordBox Name="TxtNewUserPass" Height="28" Padding="6,3" Background="#FFFFFF" Foreground="#1E293B" BorderBrush="#CBD5E1"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="2">
+                        <TextBlock Text="Confirm Password:" FontSize="11" FontWeight="SemiBold" Foreground="#334155" Margin="0,0,0,3"/>
+                        <PasswordBox Name="TxtNewUserConfirm" Height="28" Padding="6,3" Background="#FFFFFF" Foreground="#1E293B" BorderBrush="#CBD5E1"/>
+                    </StackPanel>
+                </Grid>
+
+                <CheckBox Name="ChkMakeAdmin" Content="Add to local Administrators group" IsChecked="True" Foreground="#1E293B" FontSize="11.5" Margin="0,2,0,6"/>
+                <CheckBox Name="ChkNeverExpires" Content="Password never expires" IsChecked="True" Foreground="#1E293B" FontSize="11.5" Margin="0,0,0,6"/>
+                <CheckBox Name="ChkSkipOobe" Content="Mark user setup complete in OOBE setup registry" IsChecked="True" Foreground="#1E293B" FontSize="11.5" Margin="0,0,0,0"/>
+            </StackPanel>
+        </Border>
+
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button Name="BtnCancelUser" Content="Cancel" Padding="14,6" Margin="0,0,8,0" Background="#FFFFFF" Foreground="#1E293B" BorderBrush="#CBD5E1"/>
+            <Button Name="BtnCreateUserConfirm" Content="Create Account" Padding="16,6" Background="#0067C0" Foreground="#FFFFFF" BorderBrush="#0067C0" FontWeight="SemiBold"/>
+        </StackPanel>
+    </StackPanel>
+</Window>
+"@
+
+    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xamlUser))
+    $dlg = [System.Windows.Markup.XamlReader]::Load($reader)
+    if ($Owner) { $dlg.Owner = $Owner }
+
+    $txtName = $dlg.FindName('TxtNewUserName')
+    $txtFull = $dlg.FindName('TxtNewUserFullName')
+    $txtPass = $dlg.FindName('TxtNewUserPass')
+    $txtConf = $dlg.FindName('TxtNewUserConfirm')
+    $chkAdm  = $dlg.FindName('ChkMakeAdmin')
+    $chkExp  = $dlg.FindName('ChkNeverExpires')
+    $chkOobe = $dlg.FindName('ChkSkipOobe')
+    $btnOk   = $dlg.FindName('BtnCreateUserConfirm')
+    $btnCan  = $dlg.FindName('BtnCancelUser')
+
+    $btnCan.Add_Click({ $dlg.Close() })
+    $btnOk.Add_Click({
+        $uName = $txtName.Text.Trim()
+        if ([string]::IsNullOrWhiteSpace($uName)) {
+            [System.Windows.MessageBox]::Show("Please enter a username.", "Validation Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+            return
+        }
+        $pass = $txtPass.Password
+        $conf = $txtConf.Password
+        if ($pass -ne $conf) {
+            [System.Windows.MessageBox]::Show("Passwords do not match. Please re-enter passwords.", "Validation Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+            return
+        }
+
+        try {
+            $res = Invoke-HubCreateLocalUser -UserName $uName -Password $pass -FullName $txtFull.Text.Trim() -MakeAdmin:([bool]$chkAdm.IsChecked) -PasswordNeverExpires:([bool]$chkExp.IsChecked) -SkipRemainingOobe:([bool]$chkOobe.IsChecked)
+            foreach ($act in $res.Actions) { Write-HubLog "  $act" "INFO" }
+            Write-HubLog "Local user '$uName' successfully created (Admin: $([bool]$chkAdm.IsChecked))." "SUCCESS"
+            [System.Windows.MessageBox]::Show("Local user account '$uName' created successfully!`n`nRole: $(if ($chkAdm.IsChecked) { 'Administrator' } else { 'Standard User' })`nPassword: $(if ($pass) { 'Configured' } else { 'None (blank)' })`n`nYou can now log in with this account or continue Windows Setup.", "User Created", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+            $dlg.Close()
+        } catch {
+            Write-HubLog "Failed to create local user '$uName': $($_.Exception.Message)" "ERROR"
+            [System.Windows.MessageBox]::Show("Failed to create user account '$uName':`n$($_.Exception.Message)", "Creation Failed", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+        }
+    })
+
+    $dlg.ShowDialog() | Out-Null
 }
 
 # ==============================================================================
@@ -942,13 +1245,13 @@ function Invoke-OfflineStaging {
             $oobeKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE'
             if (-not (Test-Path $oobeKey)) { New-Item -Path $oobeKey -Force | Out-Null }
             Set-ItemProperty -Path $oobeKey -Name 'BypassNRO' -Value 1 -Type DWord -ErrorAction Stop
-            $actions.Add("Set OOBE\BypassNRO=1 (local account / offline setup unlocked)")
-            if ($script:RuntimeContext -and $script:RuntimeContext.IsOobe) {
-                try {
-                    Start-Process 'ms-cxh:localonly' -ErrorAction SilentlyContinue
-                    $actions.Add("Triggered ms-cxh:localonly protocol for direct offline account creation")
-                } catch { }
-            }
+            Set-ItemProperty -Path $oobeKey -Name 'HidePersonalAccountOption' -Value 0 -Type DWord -ErrorAction Stop
+            Remove-ItemProperty -Path $oobeKey -Name 'HideWorkOrSchoolOption' -ErrorAction SilentlyContinue
+            $actions.Add("Set OOBE\BypassNRO=1 and HidePersonalAccountOption=0 (offline and personal account unlocked)")
+            try {
+                $cacheKey = 'HKLM:\SOFTWARE\Microsoft\Provisioning\AutopilotPolicyCache'
+                if (Test-Path $cacheKey) { Remove-Item -Path $cacheKey -Recurse -Force -ErrorAction Stop; $actions.Add("Purged AutopilotPolicyCache registry key") }
+            } catch { }
         } catch {
             $actions.Add("FAILED to set BypassNRO: $($_.Exception.Message)")
         }
@@ -1388,9 +1691,9 @@ function Show-OfflineStagingDialog {
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Controlled Offline Staging &amp; Adaptive Evaluation Profiles"
         Width="680" SizeToContent="Height" WindowStartupLocation="CenterOwner"
-        Background="#1F1F1F" Foreground="#FFFFFF" FontFamily="Segoe UI" ResizeMode="NoResize">
+        Background="#F3F4F6" Foreground="#1E293B" FontFamily="Segoe UI Variable Text, Segoe UI, sans-serif" ResizeMode="NoResize">
     <StackPanel Margin="22">
-        <TextBlock Text="CONTROLLED OFFLINE STAGING &amp; ADAPTIVE PROFILES" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,0,0,8"/>
+        <TextBlock Text="CONTROLLED OFFLINE STAGING &amp; ADAPTIVE PROFILES" FontSize="11" FontWeight="SemiBold" Foreground="#64748B" Margin="0,0,0,8"/>
         <TextBlock Text="Safely isolate this device during OOBE without permanently destroying the Autopilot profile link. Select an adaptive profile to optimize background behavior, then reconnect to the enterprise cloud at any time." FontSize="12" Foreground="#D0D0D0" TextWrapping="Wrap" Margin="0,0,0,14"/>
 
         <!-- Profile Selection Options -->
@@ -1684,7 +1987,7 @@ function Show-PrivilegeGuide {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Privilege Check" Width="620" SizeToContent="Height" WindowStartupLocation="CenterOwner"
-        Background="#1F1F1F" Foreground="#FFFFFF" FontFamily="Segoe UI" ResizeMode="NoResize">
+        Background="#F3F4F6" Foreground="#1E293B" FontFamily="Segoe UI Variable Text, Segoe UI, sans-serif" ResizeMode="NoResize">
     <StackPanel Margin="20">
         <TextBlock Text="PRIVILEGE CHECK" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,0,0,10"/>
         <Grid Margin="0,0,0,12">
@@ -3935,7 +4238,7 @@ function Start-GraphAuthDialog {
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Microsoft Graph &amp; Intune Authentication"
         Height="470" Width="540" WindowStartupLocation="CenterOwner"
-        Background="#202020" Foreground="#FFFFFF"
+        Background="#F3F4F6" Foreground="#1E293B"
         ResizeMode="NoResize" WindowStyle="ToolWindow"
         FontFamily="Segoe UI Variable Text, Segoe UI, sans-serif">
     <Window.Resources>
@@ -5777,7 +6080,7 @@ function Start-HubWindowsUpdate {
         if ($StatusCallback) { & $StatusCallback "System restart required. Scheduling restart-resume task and rebooting in 5 seconds..." }
         Register-HubResumeAfterRestart
         Start-Sleep -Seconds 5
-        Restart-Computer -Force
+        Invoke-HubSystemReboot -Reason 'Autonomous System Restart'
     }
 
     return [PSCustomObject]@{
@@ -5916,7 +6219,7 @@ function Start-HubAutonomousPatchCascade {
             Register-HubResumeAfterRestart
             if ($StatusCallback) { & $StatusCallback "Restarting system automatically in 5 seconds..." }
             Start-Sleep -Seconds 5
-            Restart-Computer -Force
+            Invoke-HubSystemReboot -Reason 'Autonomous System Restart'
             return [PSCustomObject]@{
                 Completed      = $false
                 CurrentPass    = $currentPass
@@ -5930,7 +6233,7 @@ function Start-HubAutonomousPatchCascade {
                 & $StatusCallback "Reached MaxPasses ($MaxPasses). Final reboot to commit installed updates..."
             }
             Start-Sleep -Seconds 5
-            Restart-Computer -Force
+            Invoke-HubSystemReboot -Reason 'Autonomous System Restart'
             return [PSCustomObject]@{
                 Completed      = $true
                 CurrentPass    = $currentPass
@@ -5963,28 +6266,28 @@ function Start-AutopilotHubGui {
         Title="Autopilot Provisioning Hub - Enterprise Endpoint Deployment"
         Height="900" Width="1480" MinHeight="700" MinWidth="1240"
         WindowStartupLocation="CenterScreen"
-        Background="#202020" Foreground="#FFFFFF"
+        Background="#F3F4F6" Foreground="#1E293B"
         FontFamily="Segoe UI Variable Text, Segoe UI, sans-serif">
 
     <Window.Resources>
-        <!-- WinUI 3 Dark Neutral Palette -->
-        <SolidColorBrush x:Key="BgCanvas" Color="#202020"/>
-        <SolidColorBrush x:Key="CardBg" Color="#2B2B2B"/>
-        <SolidColorBrush x:Key="CardSubtle" Color="#242424"/>
-        <SolidColorBrush x:Key="BorderSubtle" Color="#383838"/>
-        <SolidColorBrush x:Key="BorderStrong" Color="#4D4D4D"/>
+        <!-- WinUI 3 Light OOBE Palette -->
+        <SolidColorBrush x:Key="BgCanvas" Color="#F3F4F6"/>
+        <SolidColorBrush x:Key="CardBg" Color="#FFFFFF"/>
+        <SolidColorBrush x:Key="CardSubtle" Color="#F8FAFC"/>
+        <SolidColorBrush x:Key="BorderSubtle" Color="#E2E8F0"/>
+        <SolidColorBrush x:Key="BorderStrong" Color="#CBD5E1"/>
         <SolidColorBrush x:Key="AccentBlue" Color="#0067C0"/>
-        <SolidColorBrush x:Key="AccentHover" Color="#1975C5"/>
-        <SolidColorBrush x:Key="AccentPressed" Color="#0054A4"/>
-        <SolidColorBrush x:Key="TextPrimary" Color="#FFFFFF"/>
-        <SolidColorBrush x:Key="TextSecondary" Color="#D0D0D0"/>
-        <SolidColorBrush x:Key="TextMuted" Color="#8A8A8A"/>
+        <SolidColorBrush x:Key="AccentHover" Color="#106EBE"/>
+        <SolidColorBrush x:Key="AccentPressed" Color="#005A9E"/>
+        <SolidColorBrush x:Key="TextPrimary" Color="#1E293B"/>
+        <SolidColorBrush x:Key="TextSecondary" Color="#475569"/>
+        <SolidColorBrush x:Key="TextMuted" Color="#64748B"/>
 
         <!-- Standard Button Style (WinUI 3 Resting / Hover / Pressed) -->
         <Style TargetType="Button">
-            <Setter Property="Background" Value="#2D2D2D"/>
-            <Setter Property="Foreground" Value="#FFFFFF"/>
-            <Setter Property="BorderBrush" Value="#3E3E3E"/>
+            <Setter Property="Background" Value="#FFFFFF"/>
+            <Setter Property="Foreground" Value="#1E293B"/>
+            <Setter Property="BorderBrush" Value="#CBD5E1"/>
             <Setter Property="BorderThickness" Value="1"/>
             <Setter Property="Padding" Value="12,6"/>
             <Setter Property="FontSize" Value="12.5"/>
@@ -6001,12 +6304,12 @@ function Start-AutopilotHubGui {
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter Property="Background" TargetName="border" Value="#383838"/>
-                                <Setter Property="BorderBrush" TargetName="border" Value="#4D4D4D"/>
+                                <Setter Property="Background" TargetName="border" Value="#F1F5F9"/>
+                                <Setter Property="BorderBrush" TargetName="border" Value="#94A3B8"/>
                             </Trigger>
                             <Trigger Property="IsPressed" Value="True">
-                                <Setter Property="Background" TargetName="border" Value="#242424"/>
-                                <Setter Property="BorderBrush" TargetName="border" Value="#333333"/>
+                                <Setter Property="Background" TargetName="border" Value="#E2E8F0"/>
+                                <Setter Property="BorderBrush" TargetName="border" Value="#64748B"/>
                             </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
                                 <Setter Property="Opacity" Value="0.35"/>
@@ -6092,9 +6395,9 @@ function Start-AutopilotHubGui {
 
         <!-- Custom TextBox Style -->
         <Style TargetType="TextBox">
-            <Setter Property="Background" Value="#1F1F1F"/>
-            <Setter Property="Foreground" Value="#FFFFFF"/>
-            <Setter Property="BorderBrush" Value="#383838"/>
+            <Setter Property="Background" Value="#FFFFFF"/>
+            <Setter Property="Foreground" Value="#1E293B"/>
+            <Setter Property="BorderBrush" Value="#CBD5E1"/>
             <Setter Property="BorderThickness" Value="1"/>
             <Setter Property="Padding" Value="8,5"/>
             <Setter Property="FontSize" Value="12.5"/>
@@ -6116,7 +6419,7 @@ function Start-AutopilotHubGui {
                             </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
                                 <Setter Property="Opacity" Value="0.45"/>
-                                <Setter Property="Background" TargetName="border" Value="#252525"/>
+                                <Setter Property="Background" TargetName="border" Value="#F8FAFC"/>
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -6126,7 +6429,7 @@ function Start-AutopilotHubGui {
 
         <!-- Custom CheckBox Style -->
         <Style TargetType="CheckBox">
-            <Setter Property="Foreground" Value="#D0D0D0"/>
+            <Setter Property="Foreground" Value="#334155"/>
             <Setter Property="FontSize" Value="12.5"/>
             <Setter Property="Cursor" Value="Hand"/>
             <Setter Property="VerticalContentAlignment" Value="Center"/>
@@ -6196,8 +6499,8 @@ function Start-AutopilotHubGui {
 
         <!-- Dark GridViewColumnHeader Style -->
         <Style TargetType="{x:Type GridViewColumnHeader}">
-            <Setter Property="Background" Value="#242424"/>
-            <Setter Property="Foreground" Value="#D0D0D0"/>
+            <Setter Property="Background" Value="#F1F5F9"/>
+            <Setter Property="Foreground" Value="#475569"/>
             <Setter Property="BorderBrush" Value="#383838"/>
             <Setter Property="BorderThickness" Value="0,0,1,1"/>
             <Setter Property="Padding" Value="8,6"/>
@@ -6248,11 +6551,11 @@ function Start-AutopilotHubGui {
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="Bd" Property="Background" Value="#2A2A2A"/>
+                                <Setter TargetName="Bd" Property="Background" Value="#F8FAFC"/>
                             </Trigger>
                             <Trigger Property="IsSelected" Value="True">
-                                <Setter TargetName="Bd" Property="Background" Value="#005A9E"/>
-                                <Setter Property="Foreground" Value="#FFFFFF"/>
+                                <Setter TargetName="Bd" Property="Background" Value="#E0EDFB"/>
+                                <Setter Property="Foreground" Value="#004578"/>
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -6274,10 +6577,10 @@ function Start-AutopilotHubGui {
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="Bd" Property="Background" Value="#262626"/>
+                                <Setter TargetName="Bd" Property="Background" Value="#F8FAFC"/>
                             </Trigger>
                             <Trigger Property="IsSelected" Value="True">
-                                <Setter TargetName="Bd" Property="Background" Value="#1C3852"/>
+                                <Setter TargetName="Bd" Property="Background" Value="#E0EDFB"/>
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -6293,10 +6596,10 @@ function Start-AutopilotHubGui {
                     <ColumnDefinition Width="28" />
                 </Grid.ColumnDefinitions>
                 <Border x:Name="Border" Grid.ColumnSpan="2" CornerRadius="4"
-                        Background="#1F1F1F" BorderBrush="#383838" BorderThickness="1" />
+                        Background="#FFFFFF" BorderBrush="#E2E8F0" BorderThickness="1" />
                 <Border Grid.Column="0" Background="Transparent" Margin="1" />
                 <Path x:Name="Arrow" Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center"
-                      Data="M 0 0 L 4 4 L 8 0 Z" Fill="#A0A0A0" />
+                      Data="M 0 0 L 4 4 L 8 0 Z" Fill="#64748B" />
             </Grid>
             <ControlTemplate.Triggers>
                 <Trigger Property="IsMouseOver" Value="True">
@@ -6319,7 +6622,7 @@ function Start-AutopilotHubGui {
         <ControlTemplate x:Key="ComboBoxTextBoxToggleButton" TargetType="ToggleButton">
             <Border x:Name="Border" Width="28" Background="Transparent" BorderThickness="0" CornerRadius="0,4,4,0">
                 <Path x:Name="Arrow" HorizontalAlignment="Center" VerticalAlignment="Center"
-                      Data="M 0 0 L 4 4 L 8 0 Z" Fill="#A0A0A0" />
+                      Data="M 0 0 L 4 4 L 8 0 Z" Fill="#64748B" />
             </Border>
             <ControlTemplate.Triggers>
                 <Trigger Property="IsMouseOver" Value="True">
@@ -6335,8 +6638,8 @@ function Start-AutopilotHubGui {
 
         <!-- WinUI 3 ComboBoxItem Style -->
         <Style TargetType="ComboBoxItem">
-            <Setter Property="Background" Value="#2B2B2B"/>
-            <Setter Property="Foreground" Value="#FFFFFF"/>
+            <Setter Property="Background" Value="#FFFFFF"/>
+            <Setter Property="Foreground" Value="#1E293B"/>
             <Setter Property="Padding" Value="10,6"/>
             <Setter Property="FontSize" Value="12"/>
             <Setter Property="Template">
@@ -6362,9 +6665,9 @@ function Start-AutopilotHubGui {
 
         <!-- WinUI 3 ComboBox Style -->
         <Style TargetType="ComboBox">
-            <Setter Property="Foreground" Value="#FFFFFF"/>
-            <Setter Property="Background" Value="#1F1F1F"/>
-            <Setter Property="BorderBrush" Value="#383838"/>
+            <Setter Property="Foreground" Value="#1E293B"/>
+            <Setter Property="Background" Value="#FFFFFF"/>
+            <Setter Property="BorderBrush" Value="#CBD5E1"/>
             <Setter Property="BorderThickness" Value="1"/>
             <Setter Property="FontSize" Value="12"/>
             <Setter Property="Padding" Value="10,6"/>
@@ -6383,7 +6686,7 @@ function Start-AutopilotHubGui {
                                               Margin="10,0,28,0" VerticalAlignment="Center" HorizontalAlignment="Left" />
 
                             <!-- Visual for editable -->
-                            <Border x:Name="EditableBorder" Background="#1F1F1F" BorderBrush="#383838" BorderThickness="1"
+                            <Border x:Name="EditableBorder" Background="#FFFFFF" BorderBrush="#E2E8F0" BorderThickness="1"
                                     CornerRadius="4" Visibility="Collapsed">
                                 <Grid>
                                     <Grid.ColumnDefinitions>
@@ -6407,8 +6710,8 @@ function Start-AutopilotHubGui {
                                 <Grid x:Name="DropDown" SnapsToDevicePixels="True"
                                       MinWidth="{TemplateBinding ActualWidth}"
                                       MaxHeight="{TemplateBinding MaxDropDownHeight}">
-                                    <Border x:Name="DropDownBorder" Background="#2B2B2B" BorderThickness="1"
-                                            BorderBrush="#383838" CornerRadius="4" Margin="0,2,0,0">
+                                    <Border x:Name="DropDownBorder" Background="#FFFFFF" BorderThickness="1"
+                                            BorderBrush="#E2E8F0" CornerRadius="4" Margin="0,2,0,0">
                                         <ScrollViewer Margin="2,4" SnapsToDevicePixels="True">
                                             <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Contained" />
                                         </ScrollViewer>
@@ -6436,9 +6739,9 @@ function Start-AutopilotHubGui {
         </Style>
         <!-- WinUI 3 Dark ToolTip Style -->
         <Style TargetType="ToolTip">
-            <Setter Property="Background" Value="#2B2B2B"/>
-            <Setter Property="Foreground" Value="#FFFFFF"/>
-            <Setter Property="BorderBrush" Value="#444444"/>
+            <Setter Property="Background" Value="#FFFFFF"/>
+            <Setter Property="Foreground" Value="#1E293B"/>
+            <Setter Property="BorderBrush" Value="#CBD5E1"/>
             <Setter Property="BorderThickness" Value="1"/>
             <Setter Property="Padding" Value="8,5"/>
             <Setter Property="FontSize" Value="11.5"/>
@@ -6446,8 +6749,8 @@ function Start-AutopilotHubGui {
         </Style>
         <!-- WinUI 3 Dark ContextMenu Style -->
         <Style TargetType="ContextMenu">
-            <Setter Property="Background" Value="#242424"/>
-            <Setter Property="Foreground" Value="#FFFFFF"/>
+            <Setter Property="Background" Value="#FFFFFF"/>
+            <Setter Property="Foreground" Value="#1E293B"/>
             <Setter Property="BorderBrush" Value="#383838"/>
             <Setter Property="BorderThickness" Value="1"/>
             <Setter Property="Padding" Value="4,4"/>
@@ -6455,7 +6758,7 @@ function Start-AutopilotHubGui {
         </Style>
         <Style TargetType="MenuItem">
             <Setter Property="Background" Value="Transparent"/>
-            <Setter Property="Foreground" Value="#FFFFFF"/>
+            <Setter Property="Foreground" Value="#1E293B"/>
             <Setter Property="Padding" Value="10,6"/>
             <Setter Property="FontSize" Value="12"/>
             <Setter Property="Cursor" Value="Hand"/>
@@ -6466,17 +6769,17 @@ function Start-AutopilotHubGui {
         </Style>
     </Window.Resources>
 
-    <Grid Margin="18">
+    <Grid Margin="12,8,12,8">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/> <!-- Header -->
             <RowDefinition Height="Auto"/> <!-- Telemetry Row -->
             <RowDefinition Height="*"/>    <!-- TabControl -->
             <RowDefinition Height="Auto"/> <!-- Progress Bar -->
-            <RowDefinition Name="RowConsoleLog" Height="150"/>  <!-- Console Log (collapsible) -->
+            <RowDefinition Name="RowConsoleLog" Height="125"/>  <!-- Console Log (collapsible) -->
         </Grid.RowDefinitions>
 
-        <!-- HEADER BAR: row 0 = title + actions, row 1 = live status badges -->
-        <Grid Grid.Row="0" Margin="0,0,0,12">
+        <!-- HEADER BAR: compact layout with slim title and pill status badges -->
+        <Grid Grid.Row="0" Margin="0,0,0,6">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
@@ -6488,55 +6791,58 @@ function Start-AutopilotHubGui {
 
             <StackPanel Grid.Row="0" Grid.Column="0" Orientation="Vertical" VerticalAlignment="Center">
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                    <Border Name="BorderTenantLogo" CornerRadius="4" Background="#2B2B2B" BorderBrush="#383838" BorderThickness="1" Padding="4" Margin="0,0,10,0" Visibility="Collapsed">
-                        <Image Name="ImgTenantLogo" Width="28" Height="28" Stretch="Uniform"/>
+                    <Border Name="BorderTenantLogo" CornerRadius="4" Background="#FFFFFF" BorderBrush="#CBD5E1" BorderThickness="1" Padding="3" Margin="0,0,8,0" Visibility="Collapsed">
+                        <Image Name="ImgTenantLogo" Width="22" Height="22" Stretch="Uniform"/>
                     </Border>
                     <StackPanel Orientation="Vertical">
-                        <StackPanel Orientation="Horizontal">
-                            <TextBlock Name="TxtHubTitle" Text="Autopilot Provisioning Hub" FontSize="20" FontWeight="Bold" Foreground="#FFFFFF"/>
-                            <Border Name="BadgeTenantBrand" Background="#182A3A" BorderBrush="#234863" BorderThickness="1" CornerRadius="3" Padding="6,2" Margin="10,0,0,0" VerticalAlignment="Center" Visibility="Collapsed">
-                                <TextBlock Name="TxtTenantBrand" Text="TENANT" FontSize="10.5" FontWeight="Bold" Foreground="#60CDFF"/>
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                            <TextBlock Name="TxtHubTitle" Text="Autopilot Provisioning Hub" FontSize="15" FontWeight="SemiBold" Foreground="#1E293B"/>
+                            <Border Name="BadgeTenantBrand" Background="#E0F2FE" BorderBrush="#BAE6FD" BorderThickness="1" CornerRadius="3" Padding="5,1" Margin="8,0,0,0" VerticalAlignment="Center" Visibility="Collapsed">
+                                <TextBlock Name="TxtTenantBrand" Text="TENANT" FontSize="9.5" FontWeight="Bold" Foreground="#0284C7"/>
                             </Border>
                         </StackPanel>
-                        <TextBlock Text="Microsoft Intune &amp; Windows Autopilot Automated Deployment Engine" FontSize="11.5" Foreground="#8A8A8A" Margin="0,2,0,0"/>
+                        <TextBlock Text="Microsoft Intune &amp; Windows Autopilot Automated Deployment Engine" FontSize="10.5" Foreground="#64748B" Margin="0,1,0,0"/>
                     </StackPanel>
                 </StackPanel>
             </StackPanel>
 
-            <StackPanel Grid.Row="1" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,10,0,0">
+            <StackPanel Grid.Row="1" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,0">
                     <!-- Live privilege / session badge -->
-                    <Border Name="BadgePrivilege" Background="#2E2221" CornerRadius="3" Padding="8,3" Margin="0,0,0,0" VerticalAlignment="Center" BorderBrush="#542E2A" BorderThickness="1" Cursor="Hand"
+                    <Border Name="BadgePrivilege" Background="#F1F5F9" CornerRadius="3" Padding="6,2" Margin="0,0,0,0" VerticalAlignment="Center" BorderBrush="#CBD5E1" BorderThickness="1" Cursor="Hand"
                             ToolTip="The privilege level this window is running with. Click for details. Hash harvest, rename, app installs, clock sync and restart-resume all need elevation.">
                         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                            <Ellipse Name="DotPrivilege" Width="7" Height="7" Fill="#FFAA99" VerticalAlignment="Center" Margin="0,0,6,0"/>
-                            <TextBlock Name="TxtPrivilege" Text="PRIV: CHECKING" FontSize="10.5" FontWeight="SemiBold" Foreground="#D0D0D0" VerticalAlignment="Center"/>
+                            <Ellipse Name="DotPrivilege" Width="6" Height="6" Fill="#B91C1C" VerticalAlignment="Center" Margin="0,0,5,0"/>
+                            <TextBlock Name="TxtPrivilege" Text="PRIV: CHECKING" FontSize="9.5" FontWeight="SemiBold" Foreground="#475569" VerticalAlignment="Center"/>
                         </StackPanel>
                     </Border>
-                    <Button Name="BtnFixPrivilege" Content="Fix Privileges" Style="{StaticResource DestructiveBtn}" Margin="6,0,0,0" Padding="8,3" FontSize="11" Visibility="Collapsed"
+                    <Button Name="BtnFixPrivilege" Content="Fix Privileges" Style="{StaticResource DestructiveBtn}" Margin="5,0,0,0" Padding="6,2" FontSize="9.5" Visibility="Collapsed"
                             ToolTip="Walks you through relaunching the Hub with the privilege level it needs."/>
                     <!-- Power & Battery Posture Monitor Badge -->
-                    <Border Name="BadgePower" Background="#1F2822" CornerRadius="3" Padding="8,3" Margin="6,0,0,0" VerticalAlignment="Center" BorderBrush="#2A5435" BorderThickness="1"
+                    <Border Name="BadgePower" Background="#DCFCE7" CornerRadius="3" Padding="6,2" Margin="5,0,0,0" VerticalAlignment="Center" BorderBrush="#BBF7D0" BorderThickness="1"
                             ToolTip="Hardware power posture (AC line vs battery status). Red warning on low battery.">
-                        <TextBlock Name="TxtPowerStatus" Text="POWER: PROBING" FontSize="10.5" FontWeight="SemiBold" Foreground="#6CCB5F" VerticalAlignment="Center"/>
+                        <TextBlock Name="TxtPowerStatus" Text="POWER: PROBING" FontSize="9.5" FontWeight="SemiBold" Foreground="#15803D" VerticalAlignment="Center"/>
                     </Border>
                     <!-- Graph Authentication Session Badge -->
-                    <Border Name="BadgeGraphAuth" Background="#2E2221" CornerRadius="3" Padding="8,3" Margin="6,0,0,0" VerticalAlignment="Center" BorderBrush="#542E2A" BorderThickness="1">
+                    <Border Name="BadgeGraphAuth" Background="#F1F5F9" CornerRadius="3" Padding="6,2" Margin="5,0,0,0" VerticalAlignment="Center" BorderBrush="#CBD5E1" BorderThickness="1">
                         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                            <Ellipse Name="DotGraphStatus" Width="7" Height="7" Fill="#FFAA99" VerticalAlignment="Center" Margin="0,0,6,0"/>
-                            <TextBlock Name="TxtGraphStatus" Text="GRAPH: NOT SIGNED IN" FontSize="10.5" FontWeight="SemiBold" Foreground="#D0D0D0" VerticalAlignment="Center"/>
+                            <Ellipse Name="DotGraphStatus" Width="6" Height="6" Fill="#B91C1C" VerticalAlignment="Center" Margin="0,0,5,0"/>
+                            <TextBlock Name="TxtGraphStatus" Text="GRAPH: NOT SIGNED IN" FontSize="9.5" FontWeight="SemiBold" Foreground="#475569" VerticalAlignment="Center"/>
                         </StackPanel>
                     </Border>
-                    <Border Background="#1F2822" CornerRadius="3" Padding="6,3" Margin="6,0,0,0" VerticalAlignment="Center" BorderBrush="#2A5435" BorderThickness="1">
-                        <TextBlock Text="STANDALONE KERNEL" FontSize="10.5" FontWeight="SemiBold" Foreground="#6CCB5F"/>
+                    <Border Background="#E0F2FE" CornerRadius="3" Padding="5,2" Margin="5,0,0,0" VerticalAlignment="Center" BorderBrush="#BAE6FD" BorderThickness="1">
+                        <TextBlock Text="STANDALONE KERNEL" FontSize="9.5" FontWeight="SemiBold" Foreground="#0284C7"/>
                     </Border>
             </StackPanel>
 
             <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                <Button Name="BtnConnectGraph" Content="Sign In to Intune" Style="{StaticResource AccentBtn}" Margin="0,0,8,0" Padding="12,6" FontSize="11.5"/>
-                <Button Name="BtnToolsDropdown" Content="Actions [v]" Padding="12,6" FontSize="11.5" ToolTip="Quick Tools, Utilities, Shell &amp; Power Operations">
+                <Button Name="BtnConnectGraph" Content="Sign In to Intune" Style="{StaticResource AccentBtn}" Margin="0,0,6,0" Padding="10,4" FontSize="11" Height="28"/>
+                <Button Name="BtnToolsDropdown" Content="Actions [v]" Padding="10,4" FontSize="11" Height="28" ToolTip="Quick Tools, Utilities, Shell &amp; Power Operations">
                     <Button.ContextMenu>
                         <ContextMenu Name="MenuTools">
                             <MenuItem Name="MenuWindowsUpdate" Header="Windows Update &amp; Patch Cascade" FontWeight="SemiBold"/>
+                            <Separator/>
+                            <MenuItem Name="MenuCreateLocalUser" Header="Create Local User Account..."/>
+                            <MenuItem Name="MenuPersonalMsa" Header="Unlock Personal Microsoft Account (MSA)"/>
                             <Separator/>
                             <MenuItem Name="MenuLaunchEdge" Header="Edge Browser / Captive Portal"/>
                             <MenuItem Name="MenuScreenshotUsb" Header="Capture Staging Proof (USB Screenshot)"/>
@@ -6545,15 +6851,15 @@ function Start-AutopilotHubGui {
                             <MenuItem Name="MenuQuickCmd" Header="Command Prompt (Shift+F10)"/>
                             <MenuItem Name="MenuTimeSync" Header="Synchronize Clock (w32tm)"/>
                             <Separator/>
-                            <MenuItem Name="MenuReboot" Header="Restart System Now" Foreground="#FFAA99" FontWeight="SemiBold"/>
+                            <MenuItem Name="MenuReboot" Header="Restart System Now" Foreground="#B91C1C" FontWeight="SemiBold"/>
                         </ContextMenu>
                     </Button.ContextMenu>
                 </Button>
             </StackPanel>
         </Grid>
 
-        <!-- HARDWARE TELEMETRY CARDS -->
-        <Border Grid.Row="1" Background="#272727" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12,8" Margin="0,0,0,12">
+        <!-- HARDWARE TELEMETRY CARDS (COMPACT OOBE AESTHETIC) -->
+        <Border Grid.Row="1" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="8,5" Margin="0,0,0,6">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
@@ -6565,33 +6871,33 @@ function Start-AutopilotHubGui {
                 </Grid.ColumnDefinitions>
 
                 <StackPanel Grid.Column="0">
-                    <TextBlock Text="SERIAL NUMBER" FontSize="10" Foreground="#8A8A8A" FontWeight="SemiBold"/>
-                    <TextBlock Name="TxtSerial" Text="Detecting..." FontSize="12.5" Foreground="#FFFFFF" FontWeight="Bold" FontFamily="Consolas" Margin="0,2,0,0"/>
+                    <TextBlock Text="SERIAL NUMBER" FontSize="9" Foreground="#64748B" FontWeight="SemiBold"/>
+                    <TextBlock Name="TxtSerial" Text="Detecting..." FontSize="11.5" Foreground="#1E293B" FontWeight="Bold" FontFamily="Consolas" Margin="0,1,0,0"/>
                 </StackPanel>
 
                 <StackPanel Grid.Column="1">
-                    <TextBlock Text="MAKE &amp; MODEL" FontSize="10" Foreground="#8A8A8A" FontWeight="SemiBold"/>
-                    <TextBlock Name="TxtModel" Text="Detecting..." FontSize="12.5" Foreground="#FFFFFF" FontWeight="SemiBold" Margin="0,2,0,0"/>
+                    <TextBlock Text="MAKE &amp; MODEL" FontSize="9" Foreground="#64748B" FontWeight="SemiBold"/>
+                    <TextBlock Name="TxtModel" Text="Detecting..." FontSize="11.5" Foreground="#1E293B" FontWeight="SemiBold" Margin="0,1,0,0"/>
                 </StackPanel>
 
                 <StackPanel Grid.Column="2">
-                    <TextBlock Text="TPM 2.0 STATUS" FontSize="10" Foreground="#8A8A8A" FontWeight="SemiBold"/>
-                    <TextBlock Name="TxtTpm" Text="Probing..." FontSize="12.5" Foreground="#6CCB5F" FontWeight="Bold" Margin="0,2,0,0"/>
+                    <TextBlock Text="TPM 2.0 STATUS" FontSize="9" Foreground="#64748B" FontWeight="SemiBold"/>
+                    <TextBlock Name="TxtTpm" Text="Probing..." FontSize="11.5" Foreground="#15803D" FontWeight="Bold" Margin="0,1,0,0"/>
                 </StackPanel>
 
                 <StackPanel Grid.Column="3">
-                    <TextBlock Text="SECURE BOOT" FontSize="10" Foreground="#8A8A8A" FontWeight="SemiBold"/>
-                    <TextBlock Name="TxtSecureBoot" Text="Probing..." FontSize="12.5" Foreground="#EAA300" FontWeight="Bold" Margin="0,2,0,0"/>
+                    <TextBlock Text="SECURE BOOT" FontSize="9" Foreground="#64748B" FontWeight="SemiBold"/>
+                    <TextBlock Name="TxtSecureBoot" Text="Probing..." FontSize="11.5" Foreground="#B45309" FontWeight="Bold" Margin="0,1,0,0"/>
                 </StackPanel>
 
                 <StackPanel Grid.Column="4">
-                    <TextBlock Text="NETWORK STATUS" FontSize="10" Foreground="#8A8A8A" FontWeight="SemiBold"/>
-                    <TextBlock Name="TxtNetwork" Text="Checking..." FontSize="12.5" Foreground="#60CDFF" FontWeight="Bold" Margin="0,2,0,0"/>
+                    <TextBlock Text="NETWORK STATUS" FontSize="9" Foreground="#64748B" FontWeight="SemiBold"/>
+                    <TextBlock Name="TxtNetwork" Text="Checking..." FontSize="11.5" Foreground="#0284C7" FontWeight="Bold" Margin="0,1,0,0"/>
                 </StackPanel>
 
                 <StackPanel Grid.Column="5">
-                    <TextBlock Text="DEVICE STATE" FontSize="10" Foreground="#8A8A8A" FontWeight="SemiBold"/>
-                    <TextBlock Name="TxtDeviceState" Text="Inspecting..." FontSize="12.5" Foreground="#D0D0D0" FontWeight="Bold" Margin="0,2,0,0" TextTrimming="CharacterEllipsis"/>
+                    <TextBlock Text="DEVICE STATE" FontSize="9" Foreground="#64748B" FontWeight="SemiBold"/>
+                    <TextBlock Name="TxtDeviceState" Text="Inspecting..." FontSize="11.5" Foreground="#475569" FontWeight="Bold" Margin="0,1,0,0" TextTrimming="CharacterEllipsis"/>
                 </StackPanel>
             </Grid>
         </Border>
@@ -6603,22 +6909,22 @@ function Start-AutopilotHubGui {
                     <Setter Property="Template">
                         <Setter.Value>
                             <ControlTemplate TargetType="TabItem">
-                                <Border x:Name="border" Background="#242424" CornerRadius="4,4,0,0" Margin="0,0,4,0" Padding="14,8" BorderBrush="#333333" BorderThickness="1,1,1,0">
+                                <Border x:Name="border" Background="#E2E8F0" CornerRadius="4,4,0,0" Margin="0,0,4,0" Padding="14,8" BorderBrush="#CBD5E1" BorderThickness="1,1,1,0">
                                     <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" ContentSource="Header"/>
                                 </Border>
                                 <ControlTemplate.Triggers>
                                     <Trigger Property="IsSelected" Value="True">
-                                        <Setter TargetName="border" Property="Background" Value="#2B2B2B"/>
-                                        <Setter TargetName="border" Property="BorderBrush" Value="#383838"/>
-                                        <Setter Property="Foreground" Value="#FFFFFF"/>
+                                        <Setter TargetName="border" Property="Background" Value="#FFFFFF"/>
+                                        <Setter TargetName="border" Property="BorderBrush" Value="#CBD5E1"/>
+                                        <Setter Property="Foreground" Value="#0067C0"/>
                                         <Setter Property="FontWeight" Value="SemiBold"/>
                                     </Trigger>
                                     <Trigger Property="IsSelected" Value="False">
-                                        <Setter Property="Foreground" Value="#9E9E9E"/>
+                                        <Setter Property="Foreground" Value="#475569"/>
                                     </Trigger>
                                     <Trigger Property="IsMouseOver" Value="True">
-                                        <Setter TargetName="border" Property="Background" Value="#282828"/>
-                                        <Setter Property="Foreground" Value="#E0E0E0"/>
+                                        <Setter TargetName="border" Property="Background" Value="#F1F5F9"/>
+                                        <Setter Property="Foreground" Value="#1E293B"/>
                                     </Trigger>
                                 </ControlTemplate.Triggers>
                             </ControlTemplate>
@@ -6640,44 +6946,44 @@ function Start-AutopilotHubGui {
                     </Grid.ColumnDefinitions>
 
                     <!-- Tenant Mismatch Warning Banner -->
-                    <Border Name="BannerTenantMismatch" Grid.Row="0" Grid.ColumnSpan="2" Background="#442726" BorderBrush="#FF99A4" BorderThickness="1" CornerRadius="4" Padding="12,8" Margin="0,0,0,8" Visibility="Collapsed">
+                    <Border Name="BannerTenantMismatch" Grid.Row="0" Grid.ColumnSpan="2" Background="#FEE2E2" BorderBrush="#FF99A4" BorderThickness="1" CornerRadius="4" Padding="12,8" Margin="0,0,0,8" Visibility="Collapsed">
                         <Grid>
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
                             <StackPanel>
-                                <TextBlock Text="TENANT MISMATCH DETECTED" FontSize="11" FontWeight="Bold" Foreground="#FF99A4"/>
-                                <TextBlock Name="TxtTenantMismatch" Text="Device cached profile does not match signed-in operator tenant." FontSize="11.5" Foreground="#E0E0E0" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                                <TextBlock Text="TENANT MISMATCH DETECTED" FontSize="11" FontWeight="Bold" Foreground="#B91C1C"/>
+                                <TextBlock Name="TxtTenantMismatch" Text="Device cached profile does not match signed-in operator tenant." FontSize="11.5" Foreground="#334155" TextWrapping="Wrap" Margin="0,2,0,0"/>
                             </StackPanel>
                             <Button Name="BtnDismissMismatch" Grid.Column="1" Content="Dismiss" VerticalAlignment="Center" Padding="8,4" FontSize="11"/>
                         </Grid>
                     </Border>
 
                     <!-- Device Enrollment State Banner (drives what the operator is asked to do) -->
-                    <Border Name="BannerDeviceState" Grid.Row="0" Grid.ColumnSpan="2" Background="#262626" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12,8" Margin="0,0,0,12">
+                    <Border Name="BannerDeviceState" Grid.Row="0" Grid.ColumnSpan="2" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="12,8" Margin="0,0,0,12">
                         <Grid>
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
                             <StackPanel>
-                                <TextBlock Name="TxtDeviceStateTitle" Text="DEVICE STATE: INSPECTING..." FontSize="11" FontWeight="SemiBold" Foreground="#D0D0D0"/>
-                                <TextBlock Name="TxtDeviceStateDetail" Text="Looking for a cached Autopilot profile, MDM enrollment and Entra join state..." FontSize="11.5" Foreground="#8A8A8A" TextWrapping="Wrap" Margin="0,3,0,0"/>
+                                <TextBlock Name="TxtDeviceStateTitle" Text="DEVICE STATE: INSPECTING..." FontSize="11" FontWeight="SemiBold" Foreground="#475569"/>
+                                <TextBlock Name="TxtDeviceStateDetail" Text="Looking for a cached Autopilot profile, MDM enrollment and Entra join state..." FontSize="11.5" Foreground="#64748B" TextWrapping="Wrap" Margin="0,3,0,0"/>
                             </StackPanel>
                             <Button Name="BtnDeviceStateAction" Grid.Column="1" Content="Harvest Hash Now" Style="{StaticResource AccentBtn}" VerticalAlignment="Center" Margin="12,0,0,0" Padding="10,5" Visibility="Collapsed"/>
                         </Grid>
                     </Border>
 
                     <!-- Left: Configuration Controls -->
-                    <Border Grid.Row="1" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="16" Margin="0,0,12,0">
+                    <Border Grid.Row="1" Grid.Column="0" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="16" Margin="0,0,12,0">
                         <ScrollViewer VerticalScrollBarVisibility="Auto">
                             <StackPanel>
-                                <TextBlock Text="PROVISIONING CONFIGURATION" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,0,0,14"/>
+                                <TextBlock Text="PROVISIONING CONFIGURATION" FontSize="11" FontWeight="SemiBold" Foreground="#334155" Margin="0,0,0,14"/>
 
                                 <!-- Group Tag Selection -->
-                                <TextBlock Text="Autopilot Group Tag:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
-                                <ComboBox Name="CmbGroupTag" IsEditable="True" Height="32" Margin="0,0,0,12" Background="#1F1F1F" Foreground="#FFFFFF">
+                                <TextBlock Text="Autopilot Group Tag:" FontSize="12" FontWeight="SemiBold" Foreground="#475569" Margin="0,0,0,4"/>
+                                <ComboBox Name="CmbGroupTag" IsEditable="True" Height="32" Margin="0,0,0,12" Background="#FFFFFF" Foreground="#FFFFFF">
                                     <ComboBoxItem Content="Corporate-Laptops" IsSelected="True"/>
                                     <ComboBoxItem Content="Standard-Workstations"/>
                                     <ComboBoxItem Content="DevOps-Engineering"/>
@@ -6687,7 +6993,7 @@ function Start-AutopilotHubGui {
                                 </ComboBox>
 
                                 <!-- Assigned User -->
-                                <TextBlock Text="Assigned User UPN (Optional):" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
+                                <TextBlock Text="Assigned User UPN (Optional):" FontSize="12" FontWeight="SemiBold" Foreground="#475569" Margin="0,0,0,4"/>
                                 <TextBox Name="TxtAssignedUser" Height="32" Margin="0,0,0,12"/>
 
                                 <!-- Computer Rename -->
@@ -6696,8 +7002,8 @@ function Start-AutopilotHubGui {
                                         <ColumnDefinition Width="*"/>
                                         <ColumnDefinition Width="Auto"/>
                                     </Grid.ColumnDefinitions>
-                                    <TextBlock Text="Computer Name (Tokens: %SERIAL%, %RAND%):" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" VerticalAlignment="Center"/>
-                                    <CheckBox Name="ChkEnableRename" Grid.Column="1" Content="Enable" IsChecked="True" Foreground="#A0A0A0" FontSize="11" VerticalAlignment="Center"/>
+                                    <TextBlock Text="Computer Name (Tokens: %SERIAL%, %RAND%):" FontSize="12" FontWeight="SemiBold" Foreground="#475569" VerticalAlignment="Center"/>
+                                    <CheckBox Name="ChkEnableRename" Grid.Column="1" Content="Enable" IsChecked="True" Foreground="#64748B" FontSize="11" VerticalAlignment="Center"/>
                                 </Grid>
                                 <Grid Margin="0,0,0,14">
                                     <Grid.ColumnDefinitions>
@@ -6709,7 +7015,7 @@ function Start-AutopilotHubGui {
                                 </Grid>
 
                                 <!-- Options -->
-                                <TextBlock Text="PROVISIONING GATES" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,6,0,10"/>
+                                <TextBlock Text="PROVISIONING GATES" FontSize="11" FontWeight="SemiBold" Foreground="#334155" Margin="0,6,0,10"/>
                                 <CheckBox Name="ChkWaitForSync" Content="Wait for Profile Assignment (-WaitForSync)" IsChecked="True" Margin="0,0,0,8"/>
                                 <CheckBox Name="ChkAutoDetectUsb" Content="Auto-Detect USB for CSV Export Fallback" IsChecked="True" Margin="0,0,0,8"/>
                                 <CheckBox Name="ChkAutoReboot" Content="Reboot into ESP upon Successful Profile Assignment" IsChecked="False" Margin="0,0,0,16"/>
@@ -6718,20 +7024,38 @@ function Start-AutopilotHubGui {
                                 <Button Name="BtnHarvestHash" Content="Harvest Hardware Hash" Style="{StaticResource AccentBtn}" Height="36" Margin="0,0,0,8"/>
                                 <Button Name="BtnExportCsv" Content="Export Intune CSV (USB Priority)" Height="34" Margin="0,0,0,8"/>
                                 <Button Name="BtnRegisterIntune" Content="Register Device with Intune (Graph)" Style="{StaticResource AccentBtn}" Height="36" Margin="0,0,0,8"/>
-                                <!-- Skip Autopilot in OOBE -->
-                                <TextBlock Text="SKIP AUTOPILOT IN OOBE" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,6,0,6"/>
-                                <TextBlock Text="Finish OOBE as a normal Windows with a local account, no Autopilot and no forced enrollment. Run from Shift+F10 at the first OOBE screen, before connecting to a network." FontSize="11" Foreground="#8A8A8A" TextWrapping="Wrap" Margin="0,0,0,8"/>
-                                <CheckBox Name="ChkPersonalDisableNet" Content="Disable network adapters for the rest of OOBE" IsChecked="True" Margin="0,0,0,8"/>
-                                <Button Name="BtnPersonalInstall" Content="Skip Autopilot in OOBE" Style="{StaticResource AccentBtn}" Height="34" Margin="0,0,0,6"/>
-                                <Button Name="BtnReenableNet" Content="Re-enable Network Adapters" Height="28" Margin="0,0,0,14"/>
+                                <!-- Skip Autopilot & Local / Personal Setup -->
+                                <TextBlock Text="SKIP AUTOPILOT &amp; LOCAL / PERSONAL SETUP" FontSize="11" FontWeight="SemiBold" Foreground="#334155" Margin="0,6,0,4"/>
+                                <TextBlock Text="Bypass corporate Autopilot enrollment to setup Windows with a Personal Microsoft Account (MSA) or an offline local admin account." FontSize="11" Foreground="#64748B" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Button Name="BtnCreateLocalUser" Grid.Column="0" Content="Create Local User" Style="{StaticResource AccentBtn}" Height="30" Margin="0,0,4,0"
+                                            ToolTip="Instantly creates a local Administrator user account right now in OOBE"/>
+                                    <Button Name="BtnPersonalInstall" Grid.Column="1" Content="Unlock Personal MSA" Height="30" Margin="4,0,0,0"
+                                            ToolTip="Clears Autopilot corporate locks and keeps network active for Personal Microsoft Account setup"/>
+                                </Grid>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Button Name="BtnSkipAutopilot" Grid.Column="0" Content="Offline Bypass (NRO)" Height="30" Margin="0,0,4,0"
+                                            ToolTip="Purges Autopilot profile cache, writes BypassNRO=1 and optionally disables network for offline local setup"/>
+                                    <Button Name="BtnReenableNet" Grid.Column="1" Content="Re-enable Network" Height="30" Margin="4,0,0,0"
+                                            ToolTip="Re-enables any physical network adapters that were disabled during offline setup"/>
+                                </Grid>
+                                <CheckBox Name="ChkPersonalDisableNet" Content="Disable network adapters during offline bypass" IsChecked="False" Margin="0,0,0,10"/>
 
                                 <!-- Controlled Offline Staging & Adaptive Evaluation Profiles -->
-                                <TextBlock Text="CONTROLLED OFFLINE STAGING" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,4,0,6"/>
-                                <TextBlock Text="Stage devices offline with reversible profile quarantine, loopback policy fences, and adaptive evaluation profiles (Hardware Diagnostics, Workload Benchmarking, Software Sandbox)." FontSize="11" Foreground="#8A8A8A" TextWrapping="Wrap" Margin="0,0,0,8"/>
-                                <Border Name="BannerOfflineStaging" Background="#1F2822" BorderBrush="#2A5435" BorderThickness="1" CornerRadius="4" Padding="10,8" Margin="0,0,0,8" Visibility="Collapsed">
+                                <TextBlock Text="CONTROLLED OFFLINE STAGING" FontSize="11" FontWeight="SemiBold" Foreground="#334155" Margin="0,4,0,6"/>
+                                <TextBlock Text="Stage devices offline with reversible profile quarantine, loopback policy fences, and adaptive evaluation profiles (Hardware Diagnostics, Workload Benchmarking, Software Sandbox)." FontSize="11" Foreground="#64748B" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                                <Border Name="BannerOfflineStaging" Background="#DCFCE7" BorderBrush="#BBF7D0" BorderThickness="1" CornerRadius="4" Padding="10,8" Margin="0,0,0,8" Visibility="Collapsed">
                                     <StackPanel Orientation="Vertical">
-                                        <TextBlock Name="TxtOfflineStagingTitle" Text="OFFLINE STAGING ACTIVE: [PROFILE]" FontSize="11" FontWeight="Bold" Foreground="#6CCB5F" Margin="0,0,0,2"/>
-                                        <TextBlock Name="TxtOfflineStagingDetail" Text="Device is isolated with reversible profile quarantine. Click below to restore cloud link." FontSize="10.5" Foreground="#D0D0D0" TextWrapping="Wrap" Margin="0,0,0,6"/>
+                                        <TextBlock Name="TxtOfflineStagingTitle" Text="OFFLINE STAGING ACTIVE: [PROFILE]" FontSize="11" FontWeight="Bold" Foreground="#15803D" Margin="0,0,0,2"/>
+                                        <TextBlock Name="TxtOfflineStagingDetail" Text="Device is isolated with reversible profile quarantine. Click below to restore cloud link." FontSize="10.5" Foreground="#475569" TextWrapping="Wrap" Margin="0,0,0,6"/>
                                         <Button Name="BtnReDockStaging" Content="Reconnect to Enterprise Cloud &amp; Resume Autopilot" Style="{StaticResource AccentBtn}" Height="30"/>
                                     </StackPanel>
                                 </Border>
@@ -6749,7 +7073,7 @@ function Start-AutopilotHubGui {
                                 <Button Name="BtnSaveEnvDefaults" Content="Save Current Settings to .env" Height="30" Margin="0,0,0,14"/>
 
                                 <!-- Profile Policy & Offline Provisioning -->
-                                <TextBlock Text="PROFILE &amp; OFFLINE PROVISIONING" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,0,0,6"/>
+                                <TextBlock Text="PROFILE &amp; OFFLINE PROVISIONING" FontSize="11" FontWeight="SemiBold" Foreground="#334155" Margin="0,0,0,6"/>
                                 <Button Name="BtnInspectPolicy" Content="Inspect Decoded Autopilot Policy" Height="30" Margin="0,0,0,6"
                                         ToolTip="Decodes CloudAssignedOobeConfig bitmask (EULA, OEM registration, account type, privacy settings)"/>
                                 <Grid Margin="0,0,0,6">
@@ -6767,7 +7091,7 @@ function Start-AutopilotHubGui {
                     </Border>
 
                     <!-- Right: Hash Preview & Registration Status -->
-                    <Border Grid.Row="1" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="16">
+                    <Border Grid.Row="1" Grid.Column="1" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="16">
                         <Grid>
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="Auto"/>
@@ -6781,21 +7105,21 @@ function Start-AutopilotHubGui {
                                     <ColumnDefinition Width="Auto"/>
                                 </Grid.ColumnDefinitions>
                                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                                    <TextBlock Text="HARDWARE HASH BUFFER" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" VerticalAlignment="Center"/>
-                                    <Border Name="BadgeHashStatus" Background="#242424" BorderBrush="#383838" BorderThickness="1" CornerRadius="3" Padding="6,2" Margin="10,0,0,0">
-                                        <TextBlock Name="TxtHashStatus" Text="NOT HARVESTED" FontSize="10.5" FontWeight="SemiBold" Foreground="#8A8A8A"/>
+                                    <TextBlock Text="HARDWARE HASH BUFFER" FontSize="11" FontWeight="SemiBold" Foreground="#334155" VerticalAlignment="Center"/>
+                                    <Border Name="BadgeHashStatus" Background="#F8FAFC" BorderBrush="#E2E8F0" BorderThickness="1" CornerRadius="3" Padding="6,2" Margin="10,0,0,0">
+                                        <TextBlock Name="TxtHashStatus" Text="NOT HARVESTED" FontSize="10.5" FontWeight="SemiBold" Foreground="#64748B"/>
                                     </Border>
                                 </StackPanel>
                                 <Button Name="BtnCopyHash" Grid.Column="1" Content="Copy Hash" Padding="10,4" FontSize="12"/>
                             </Grid>
 
                             <TextBox Name="TxtHashBox" Grid.Row="1" TextWrapping="Wrap" AcceptsReturn="True" IsReadOnly="True"
-                                     Background="#1F1F1F" Foreground="#D0D0D0" FontFamily="Consolas" FontSize="11" Padding="10"
-                                     VerticalScrollBarVisibility="Auto" BorderBrush="#383838"/>
+                                     Background="#FFFFFF" Foreground="#475569" FontFamily="Consolas" FontSize="11" Padding="10"
+                                     VerticalScrollBarVisibility="Auto" BorderBrush="#E2E8F0"/>
 
-                            <Border Grid.Row="2" Background="#242424" BorderBrush="#383838" BorderThickness="1" CornerRadius="4" Padding="10" Margin="0,10,0,0">
+                            <Border Grid.Row="2" Background="#F8FAFC" BorderBrush="#E2E8F0" BorderThickness="1" CornerRadius="4" Padding="10" Margin="0,10,0,0">
                                 <TextBlock Name="TxtHashMeta" Text="Hardware hash buffer empty. Click 'Harvest Hardware Hash' to query local WMI provider."
-                                           FontSize="11.5" Foreground="#8A8A8A"/>
+                                           FontSize="11.5" Foreground="#64748B"/>
                             </Border>
                         </Grid>
                     </Border>
@@ -6806,8 +7130,8 @@ function Start-AutopilotHubGui {
             <TabItem Header="App Deployment">
                 <DockPanel Margin="0,12,0,0">
                     <!-- Managed-device advisory: app assignment is Intune's job once the device is enrolled -->
-                    <Border Name="BannerAppAdvisory" DockPanel.Dock="Top" Background="#262626" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12,8" Margin="0,0,0,10">
-                        <TextBlock Name="TxtAppAdvisory" Text="Checking whether this device is Intune-managed..." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap"/>
+                    <Border Name="BannerAppAdvisory" DockPanel.Dock="Top" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="12,8" Margin="0,0,0,10">
+                        <TextBlock Name="TxtAppAdvisory" Text="Checking whether this device is Intune-managed..." FontSize="11.5" Foreground="#334155" TextWrapping="Wrap"/>
                     </Border>
                 <Grid>
                     <Grid.RowDefinitions>
@@ -6817,14 +7141,14 @@ function Start-AutopilotHubGui {
                     </Grid.RowDefinitions>
 
                     <!-- Top Preset Bar -->
-                    <Border Grid.Row="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12,8" Margin="0,0,0,10">
+                    <Border Grid.Row="0" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="12,8" Margin="0,0,0,10">
                         <Grid>
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
                             <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                                <TextBlock Text="PRESETS:" FontSize="10.5" FontWeight="SemiBold" Foreground="#8A8A8A" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                <TextBlock Text="PRESETS:" FontSize="10.5" FontWeight="SemiBold" Foreground="#64748B" VerticalAlignment="Center" Margin="0,0,8,0"/>
                                 <Button Name="BtnPresetWorkstation" Content="Standard Workstation" Margin="0,0,6,0" Padding="8,4" FontSize="12"/>
                                 <Button Name="BtnPresetBrowsers" Content="Web Browsers" Margin="0,0,6,0" Padding="8,4" FontSize="12"/>
                                 <Button Name="BtnPresetDev" Content="Developer Suite" Margin="0,0,6,0" Padding="8,4" FontSize="12"/>
@@ -6849,9 +7173,9 @@ function Start-AutopilotHubGui {
                         </Grid.ColumnDefinitions>
 
                         <!-- Browsers -->
-                        <Border Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12" Margin="0,0,6,0">
+                        <Border Grid.Column="0" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="12" Margin="0,0,6,0">
                             <StackPanel>
-                                <TextBlock Text="BROWSERS" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,10"/>
+                                <TextBlock Text="BROWSERS" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,10"/>
                                 <CheckBox Name="AppChrome" Tag="Google.Chrome" Content="Google Chrome" IsChecked="True" Margin="0,0,0,8"/>
                                 <CheckBox Name="AppFirefox" Tag="Mozilla.Firefox" Content="Mozilla Firefox" Margin="0,0,0,8"/>
                                 <CheckBox Name="AppBrave" Tag="Brave.Brave" Content="Brave Browser" Margin="0,0,0,8"/>
@@ -6860,9 +7184,9 @@ function Start-AutopilotHubGui {
                         </Border>
 
                         <!-- Developer Tools -->
-                        <Border Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12" Margin="0,0,6,0">
+                        <Border Grid.Column="1" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="12" Margin="0,0,6,0">
                             <StackPanel>
-                                <TextBlock Text="DEVELOPER TOOLS" FontSize="11" FontWeight="SemiBold" Foreground="#6CCB5F" Margin="0,0,0,10"/>
+                                <TextBlock Text="DEVELOPER TOOLS" FontSize="11" FontWeight="SemiBold" Foreground="#15803D" Margin="0,0,0,10"/>
                                 <CheckBox Name="AppVSCode" Tag="Microsoft.VisualStudioCode" Content="VS Code" IsChecked="True" Margin="0,0,0,8"/>
                                 <CheckBox Name="AppGit" Tag="Git.Git" Content="Git for Windows" IsChecked="True" Margin="0,0,0,8"/>
                                 <CheckBox Name="AppTerminal" Tag="Microsoft.WindowsTerminal" Content="Windows Terminal" IsChecked="True" Margin="0,0,0,8"/>
@@ -6874,9 +7198,9 @@ function Start-AutopilotHubGui {
                         </Border>
 
                         <!-- Productivity -->
-                        <Border Grid.Column="2" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12" Margin="0,0,6,0">
+                        <Border Grid.Column="2" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="12" Margin="0,0,6,0">
                             <StackPanel>
-                                <TextBlock Text="PRODUCTIVITY" FontSize="11" FontWeight="SemiBold" Foreground="#EAA300" Margin="0,0,0,10"/>
+                                <TextBlock Text="PRODUCTIVITY" FontSize="11" FontWeight="SemiBold" Foreground="#B45309" Margin="0,0,0,10"/>
                                 <CheckBox Name="AppOffice" Tag="Microsoft.Office" Content="Microsoft 365" Margin="0,0,0,8"/>
                                 <CheckBox Name="AppSlack" Tag="SlackTechnologies.Slack" Content="Slack" Margin="0,0,0,8"/>
                                 <CheckBox Name="AppZoom" Tag="Zoom.Zoom" Content="Zoom Workplace" Margin="0,0,0,8"/>
@@ -6888,7 +7212,7 @@ function Start-AutopilotHubGui {
                         </Border>
 
                         <!-- Utilities -->
-                        <Border Grid.Column="3" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12">
+                        <Border Grid.Column="3" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="12">
                             <StackPanel>
                                 <TextBlock Text="SYSTEM UTILITIES" FontSize="11" FontWeight="SemiBold" Foreground="#A78BFA" Margin="0,0,0,10"/>
                                 <CheckBox Name="AppPowerToys" Tag="Microsoft.PowerToys" Content="PowerToys" IsChecked="True" Margin="0,0,0,8"/>
@@ -6903,14 +7227,14 @@ function Start-AutopilotHubGui {
                     </Grid>
 
                     <!-- Custom Winget ID & Action -->
-                    <Border Grid.Row="2" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12,8" Margin="0,10,0,0">
+                    <Border Grid.Row="2" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="12,8" Margin="0,10,0,0">
                         <Grid>
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="Auto"/>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
-                            <TextBlock Text="Custom Winget ID:" VerticalAlignment="Center" Margin="0,0,8,0" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0"/>
+                            <TextBlock Text="Custom Winget ID:" VerticalAlignment="Center" Margin="0,0,8,0" FontSize="12" FontWeight="SemiBold" Foreground="#475569"/>
                             <TextBox Name="TxtCustomPkg" Grid.Column="1" Height="30" Margin="0,0,8,0"/>
                             <Button Name="BtnInstallBatch" Grid.Column="2" Content="Install Selected Applications" Style="{StaticResource AccentBtn}" Height="32" Padding="14,4"/>
                         </Grid>
@@ -6928,7 +7252,7 @@ function Start-AutopilotHubGui {
                     </Grid.ColumnDefinitions>
 
                     <!-- Left: Package Builder (fields scroll if cramped; the action button stays pinned) -->
-                    <Border Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="16" Margin="0,0,6,0">
+                    <Border Grid.Column="0" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="16" Margin="0,0,6,0">
                         <Grid>
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="*"/>
@@ -6936,18 +7260,18 @@ function Start-AutopilotHubGui {
                             </Grid.RowDefinitions>
                             <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto">
                                 <StackPanel>
-                                    <TextBlock Text="WIN32 PACKAGE BUILDER (.INTUNEWIN)" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,0,0,14"/>
+                                    <TextBlock Text="WIN32 PACKAGE BUILDER (.INTUNEWIN)" FontSize="11" FontWeight="SemiBold" Foreground="#334155" Margin="0,0,0,14"/>
 
-                                    <TextBlock Text="Winget Package ID / Source:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Winget Package ID / Source:" FontSize="12" FontWeight="SemiBold" Foreground="#475569" Margin="0,0,0,4"/>
                                     <TextBox Name="TxtPkgId" Height="32" Text="Mozilla.Firefox" Margin="0,0,0,10"/>
 
-                                    <TextBlock Text="Display Name:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Display Name:" FontSize="12" FontWeight="SemiBold" Foreground="#475569" Margin="0,0,0,4"/>
                                     <TextBox Name="TxtPkgDisplayName" Height="32" Text="Mozilla Firefox Enterprise" Margin="0,0,0,10"/>
 
-                                    <TextBlock Text="Output Folder:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Output Folder:" FontSize="12" FontWeight="SemiBold" Foreground="#475569" Margin="0,0,0,4"/>
                                     <TextBox Name="TxtPkgOutputDir" Height="32" Text="C:\temp\WingetIntune\Output" Margin="0,0,0,10"/>
 
-                                    <TextBlock Text="Silent Install Arguments:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Silent Install Arguments:" FontSize="12" FontWeight="SemiBold" Foreground="#475569" Margin="0,0,0,4"/>
                                     <TextBox Name="TxtPkgInstallArgs" Height="32" Text="/S" Margin="0,0,0,16"/>
                                 </StackPanel>
                             </ScrollViewer>
@@ -6956,7 +7280,7 @@ function Start-AutopilotHubGui {
                     </Border>
 
                     <!-- Right: Cloud Publisher (fields scroll if cramped; the action button stays pinned) -->
-                    <Border Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="16" Margin="6,0,0,0">
+                    <Border Grid.Column="1" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="16" Margin="6,0,0,0">
                         <Grid>
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="*"/>
@@ -6964,21 +7288,21 @@ function Start-AutopilotHubGui {
                             </Grid.RowDefinitions>
                             <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto">
                                 <StackPanel>
-                                    <TextBlock Text="MICROSOFT GRAPH INTUNE CLOUD PUBLISHER" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" Margin="0,0,0,14"/>
+                                    <TextBlock Text="MICROSOFT GRAPH INTUNE CLOUD PUBLISHER" FontSize="11" FontWeight="SemiBold" Foreground="#334155" Margin="0,0,0,14"/>
 
-                                    <TextBlock Text="Target Assignment Intent:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
-                                    <ComboBox Name="CmbAssignmentIntent" Height="32" Margin="0,0,0,10" Background="#1F1F1F" Foreground="#FFFFFF">
+                                    <TextBlock Text="Target Assignment Intent:" FontSize="12" FontWeight="SemiBold" Foreground="#475569" Margin="0,0,0,4"/>
+                                    <ComboBox Name="CmbAssignmentIntent" Height="32" Margin="0,0,0,10" Background="#FFFFFF" Foreground="#FFFFFF">
                                         <ComboBoxItem Content="Available (Self-Service in Company Portal)" IsSelected="True"/>
                                         <ComboBoxItem Content="Required (Mandatory Push)"/>
                                         <ComboBoxItem Content="Uninstall"/>
                                     </ComboBox>
 
-                                    <TextBlock Text="Target Entra ID Group / Audience:" FontSize="12" FontWeight="SemiBold" Foreground="#D0D0D0" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Target Entra ID Group / Audience:" FontSize="12" FontWeight="SemiBold" Foreground="#475569" Margin="0,0,0,4"/>
                                     <TextBox Name="TxtAssignGroup" Height="32" Text="All Devices" Margin="0,0,0,16"/>
 
-                                    <Border Background="#242424" BorderBrush="#383838" BorderThickness="1" CornerRadius="4" Padding="12" Margin="0,0,0,16">
+                                    <Border Background="#F8FAFC" BorderBrush="#E2E8F0" BorderThickness="1" CornerRadius="4" Padding="12" Margin="0,0,0,16">
                                         <TextBlock Text="Direct Graph publishing utilizes chunked Azure SAS storage upload and generates automated Win32 detection rules."
-                                                   FontSize="11.5" Foreground="#8A8A8A" TextWrapping="Wrap"/>
+                                                   FontSize="11.5" Foreground="#64748B" TextWrapping="Wrap"/>
                                     </Border>
                                 </StackPanel>
                             </ScrollViewer>
@@ -6990,7 +7314,7 @@ function Start-AutopilotHubGui {
 
             <!-- TAB 4: PRE-FLIGHT DIAGNOSTICS (IntuneShared) -->
             <TabItem Header="Pre-Flight Diagnostics">
-                <Border Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="16" Margin="0,12,0,0">
+                <Border Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="16" Margin="0,12,0,0">
                     <Grid>
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto"/>
@@ -7002,7 +7326,7 @@ function Start-AutopilotHubGui {
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
-                            <TextBlock Text="7-STAGE ENTERPRISE PRE-FLIGHT DIAGNOSTIC LADDER" FontSize="11" FontWeight="SemiBold" Foreground="#B0B0B0" VerticalAlignment="Center"/>
+                            <TextBlock Text="7-STAGE ENTERPRISE PRE-FLIGHT DIAGNOSTIC LADDER" FontSize="11" FontWeight="SemiBold" Foreground="#334155" VerticalAlignment="Center"/>
                             <Button Name="BtnRunDiag" Grid.Column="1" Content="Run Diagnostics" Padding="12,5"/>
                         </Grid>
 
@@ -7011,7 +7335,7 @@ function Start-AutopilotHubGui {
                                 <RowDefinition Height="*"/>
                                 <RowDefinition Height="Auto"/>
                             </Grid.RowDefinitions>
-                            <ListBox Name="LstDiagStages" Grid.Row="0" Background="#1F1F1F" BorderBrush="#383838">
+                            <ListBox Name="LstDiagStages" Grid.Row="0" Background="#FFFFFF" BorderBrush="#E2E8F0">
                                 <ListBox.ItemTemplate>
                                     <DataTemplate>
                                         <Border Padding="10,6" BorderBrush="#2E2E2E" BorderThickness="0,0,0,1">
@@ -7021,9 +7345,9 @@ function Start-AutopilotHubGui {
                                                     <ColumnDefinition Width="180"/>
                                                     <ColumnDefinition Width="*"/>
                                                 </Grid.ColumnDefinitions>
-                                                <TextBlock Text="{Binding Stage}" FontWeight="Bold" Foreground="#60CDFF"/>
+                                                <TextBlock Text="{Binding Stage}" FontWeight="Bold" Foreground="#0284C7"/>
                                                 <TextBlock Grid.Column="1" Text="{Binding Name}" FontWeight="SemiBold" Foreground="#FFFFFF"/>
-                                                <TextBlock Grid.Column="2" Text="{Binding Details}" Foreground="#8A8A8A"/>
+                                                <TextBlock Grid.Column="2" Text="{Binding Details}" Foreground="#64748B"/>
                                             </Grid>
                                         </Border>
                                     </DataTemplate>
@@ -7038,7 +7362,7 @@ function Start-AutopilotHubGui {
                                     <ColumnDefinition Width="Auto"/>
                                     <ColumnDefinition Width="Auto"/>
                                 </Grid.ColumnDefinitions>
-                                <TextBlock Text="PRE-FLIGHT REMEDIATION &amp; DRIVERS" FontSize="11" FontWeight="SemiBold" Foreground="#8A8A8A" VerticalAlignment="Center"/>
+                                <TextBlock Text="PRE-FLIGHT REMEDIATION &amp; DRIVERS" FontSize="11" FontWeight="SemiBold" Foreground="#64748B" VerticalAlignment="Center"/>
                                 <Button Name="BtnFixClockSkew" Grid.Column="1" Content="Auto-Remediate Clock Skew" Margin="0,0,8,0" Padding="10,5"
                                         ToolTip="Queries Microsoft Online date header and forces local time + w32tm /resync"/>
                                 <Button Name="BtnTpmAttestation" Grid.Column="2" Content="TPM 2.0 &amp; EK Attestation Engine" Margin="0,0,8,0" Padding="10,5"
@@ -7063,7 +7387,7 @@ function Start-AutopilotHubGui {
                     </Grid.RowDefinitions>
 
                     <!-- Top Card: Autonomous Multi-Pass Patch Cascade Engine -->
-                    <Border Grid.Row="0" Background="#272727" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14,10" Margin="0,0,0,10">
+                    <Border Grid.Row="0" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14,10" Margin="0,0,0,10">
                         <Grid>
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="Auto"/>
@@ -7077,14 +7401,14 @@ function Start-AutopilotHubGui {
                             <!-- Left: Cascade Telemetry & Description -->
                             <StackPanel Grid.Row="0" Grid.Column="0">
                                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                                    <Border Name="BadgeCascadeStatus" Background="#1F2822" CornerRadius="3" Padding="8,2" Margin="0,0,10,0" BorderBrush="#2A5435" BorderThickness="1">
-                                        <TextBlock Name="TxtCascadeStatus" Text="CASCADE IDLE" FontSize="10.5" FontWeight="Bold" Foreground="#6CCB5F"/>
+                                    <Border Name="BadgeCascadeStatus" Background="#DCFCE7" CornerRadius="3" Padding="8,2" Margin="0,0,10,0" BorderBrush="#BBF7D0" BorderThickness="1">
+                                        <TextBlock Name="TxtCascadeStatus" Text="CASCADE IDLE" FontSize="10.5" FontWeight="Bold" Foreground="#15803D"/>
                                     </Border>
                                     <TextBlock Text="AUTONOMOUS MULTI-PASS PATCH CASCADE" FontSize="13" FontWeight="SemiBold" Foreground="#FFFFFF" VerticalAlignment="Center"/>
-                                    <TextBlock Name="TxtCascadePassInfo" Text=" (Pass 1 of 5)" FontSize="12" Foreground="#60CDFF" FontWeight="SemiBold" VerticalAlignment="Center"/>
-                                    <TextBlock Name="TxtCascadeInstalled" Text=" | 0 installed" FontSize="12" Foreground="#A0A0A0" VerticalAlignment="Center"/>
+                                    <TextBlock Name="TxtCascadePassInfo" Text=" (Pass 1 of 5)" FontSize="12" Foreground="#0284C7" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                    <TextBlock Name="TxtCascadeInstalled" Text=" | 0 installed" FontSize="12" Foreground="#64748B" VerticalAlignment="Center"/>
                                 </StackPanel>
-                                <TextBlock Name="TxtCascadeStateDetail" Text="Fully automated cycle: scans, downloads, installs updates/drivers, reboots with persistence, and resumes automatically until the system is 100% patched." FontSize="11" Foreground="#8A8A8A" Margin="0,4,0,0"/>
+                                <TextBlock Name="TxtCascadeStateDetail" Text="Fully automated cycle: scans, downloads, installs updates/drivers, reboots with persistence, and resumes automatically until the system is 100% patched." FontSize="11" Foreground="#64748B" Margin="0,4,0,0"/>
                             </StackPanel>
 
                             <!-- Right: Cascade Action Buttons & Abort Affordance -->
@@ -7109,15 +7433,15 @@ function Start-AutopilotHubGui {
                                     <CheckBox Name="ChkCascadeDrivers" Grid.Column="0" Content="Include Hardware &amp; Firmware Drivers" IsChecked="True" Foreground="#FFFFFF" VerticalAlignment="Center" Margin="0,0,16,0"/>
                                     <CheckBox Name="ChkCascadeAutoReboot" Grid.Column="1" Content="Auto-Restart with Persistence (Re-opens Hub on boot)" IsChecked="True" Foreground="#FFFFFF" VerticalAlignment="Center" Margin="0,0,16,0"/>
                                     <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
-                                        <TextBlock Text="Max Passes:" Foreground="#A0A0A0" FontSize="11" VerticalAlignment="Center" Margin="0,0,6,0"/>
-                                        <ComboBox Name="CmbCascadeMaxPasses" Width="60" Height="24" Background="#2B2B2B" Foreground="#FFFFFF" BorderBrush="#383838" SelectedIndex="1">
+                                        <TextBlock Text="Max Passes:" Foreground="#64748B" FontSize="11" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                                        <ComboBox Name="CmbCascadeMaxPasses" Width="60" Height="24" Background="#FFFFFF" Foreground="#FFFFFF" BorderBrush="#E2E8F0" SelectedIndex="1">
                                             <ComboBoxItem Content="3"/>
                                             <ComboBoxItem Content="5"/>
                                             <ComboBoxItem Content="8"/>
                                             <ComboBoxItem Content="10"/>
                                         </ComboBox>
                                     </StackPanel>
-                                    <TextBlock Name="TxtWuRebootNotice" Grid.Column="3" Text="" Foreground="#EAA300" FontWeight="SemiBold" FontSize="11" VerticalAlignment="Center" HorizontalAlignment="Right" Margin="0,0,12,0"/>
+                                    <TextBlock Name="TxtWuRebootNotice" Grid.Column="3" Text="" Foreground="#B45309" FontWeight="SemiBold" FontSize="11" VerticalAlignment="Center" HorizontalAlignment="Right" Margin="0,0,12,0"/>
                                     <Button Name="BtnWuRebootNow" Grid.Column="4" Content="Restart System Now" Style="{StaticResource DestructiveBtn}" Padding="10,3" FontSize="11" Visibility="Collapsed"
                                             ToolTip="Persists Hub and reboots immediately to apply installed updates"/>
                                 </Grid>
@@ -7126,7 +7450,7 @@ function Start-AutopilotHubGui {
                     </Border>
 
                     <!-- Manual Controls Bar & Progress Status -->
-                    <Border Grid.Row="1" Background="#242424" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="12,8" Margin="0,0,0,8">
+                    <Border Grid.Row="1" Background="#F8FAFC" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="12,8" Margin="0,0,0,8">
                         <Grid>
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="Auto"/>
@@ -7138,14 +7462,14 @@ function Start-AutopilotHubGui {
                                     <ColumnDefinition Width="Auto"/>
                                 </Grid.ColumnDefinitions>
                                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                                    <TextBlock Text="MANUAL CONTROLS:" FontSize="10.5" FontWeight="Bold" Foreground="#8A8A8A" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                                    <TextBlock Text="MANUAL CONTROLS:" FontSize="10.5" FontWeight="Bold" Foreground="#64748B" VerticalAlignment="Center" Margin="0,0,10,0"/>
                                     <Button Name="BtnWuScan" Content="Scan for Updates" Padding="10,4" Margin="0,0,6,0"/>
                                     <Button Name="BtnWuInstall" Content="Install Selected" Style="{StaticResource AccentBtn}" Padding="10,4" Margin="0,0,6,0" IsEnabled="False"/>
                                     <Button Name="BtnWuSelectAll" Content="Select All" Padding="8,4" Margin="0,0,4,0"/>
                                     <Button Name="BtnWuDeselectAll" Content="Deselect All" Padding="8,4" Margin="0,0,6,0"/>
                                     <Button Name="BtnWuTriggerUso" Content="Trigger USO Scan" Padding="8,4" ToolTip="Triggers background usoclient.exe StartInteractiveScan"/>
                                 </StackPanel>
-                                <TextBlock Name="TxtWuSummary" Grid.Column="1" Text="Ready to scan" FontSize="11" Foreground="#B0B0B0" VerticalAlignment="Center"/>
+                                <TextBlock Name="TxtWuSummary" Grid.Column="1" Text="Ready to scan" FontSize="11" Foreground="#334155" VerticalAlignment="Center"/>
                             </Grid>
                             <Grid Grid.Row="1">
                                 <Grid.RowDefinitions>
@@ -7157,17 +7481,17 @@ function Start-AutopilotHubGui {
                                         <ColumnDefinition Width="*"/>
                                         <ColumnDefinition Width="Auto"/>
                                     </Grid.ColumnDefinitions>
-                                    <TextBlock Name="TxtWuStatus" Text="Ready. Click 'Start Autonomous Patch Cascade' or 'Scan for Updates'." FontSize="11" Foreground="#D0D0D0"/>
-                                    <TextBlock Name="TxtWuProgress" Grid.Column="1" Text="" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF"/>
+                                    <TextBlock Name="TxtWuStatus" Text="Ready. Click 'Start Autonomous Patch Cascade' or 'Scan for Updates'." FontSize="11" Foreground="#475569"/>
+                                    <TextBlock Name="TxtWuProgress" Grid.Column="1" Text="" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7"/>
                                 </Grid>
-                                <ProgressBar Name="ProgWuBar" Grid.Row="1" Height="4" Background="#1A1A1A" Foreground="#0067C0" BorderThickness="0" Minimum="0" Maximum="100" Value="0"/>
+                                <ProgressBar Name="ProgWuBar" Grid.Row="1" Height="4" Background="#FFFFFF" Foreground="#0067C0" BorderThickness="0" Minimum="0" Maximum="100" Value="0"/>
                             </Grid>
                         </Grid>
                     </Border>
 
                     <!-- Updates List Grid View -->
-                    <Border Grid.Row="2" Background="#1A1A1A" CornerRadius="4" BorderBrush="#383838" BorderThickness="1">
-                        <ListView Name="LstIntegratedUpdates" Background="#1F1F1F" BorderThickness="0" Foreground="#FFFFFF">
+                    <Border Grid.Row="2" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1">
+                        <ListView Name="LstIntegratedUpdates" Background="#FFFFFF" BorderThickness="0" Foreground="#FFFFFF">
                             <ListView.View>
                                 <GridView>
                                     <GridViewColumn Header="Select" Width="50">
@@ -7191,7 +7515,7 @@ function Start-AutopilotHubGui {
                                             <DataTemplate>
                                                 <StackPanel VerticalAlignment="Center" Margin="2,2,8,2">
                                                     <TextBlock Text="{Binding Title}" FontSize="11.5" FontWeight="SemiBold" Foreground="#FFFFFF" TextWrapping="Wrap"/>
-                                                    <TextBlock Text="{Binding Subtitle}" FontSize="10" Foreground="#8A8A8A" Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                                    <TextBlock Text="{Binding Subtitle}" FontSize="10" Foreground="#64748B" Margin="0,2,0,0" TextWrapping="Wrap"/>
                                                 </StackPanel>
                                             </DataTemplate>
                                         </GridViewColumn.CellTemplate>
@@ -7199,7 +7523,7 @@ function Start-AutopilotHubGui {
                                     <GridViewColumn Header="Size" Width="85">
                                         <GridViewColumn.CellTemplate>
                                             <DataTemplate>
-                                                <TextBlock Text="{Binding SizeText}" FontSize="11" Foreground="#B0B0B0" VerticalAlignment="Center" HorizontalAlignment="Right" Margin="0,0,8,0"/>
+                                                <TextBlock Text="{Binding SizeText}" FontSize="11" Foreground="#334155" VerticalAlignment="Center" HorizontalAlignment="Right" Margin="0,0,8,0"/>
                                             </DataTemplate>
                                         </GridViewColumn.CellTemplate>
                                     </GridViewColumn>
@@ -7219,7 +7543,7 @@ function Start-AutopilotHubGui {
 
             <!-- TAB 6: DELL ASSET WARRANTY & REFRESH ASSESSMENT -->
             <TabItem Header="Dell Warranty &amp; Hardware Health">
-                <Border Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="16" Margin="0,12,0,0">
+                <Border Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="16" Margin="0,12,0,0">
                     <Grid>
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto"/>
@@ -7251,7 +7575,7 @@ function Start-AutopilotHubGui {
                         </Grid>
 
                         <!-- Row 1: Hero Refresh Verdict Banner -->
-                        <Border Name="BorderRefreshVerdict" Grid.Row="1" Background="#242424" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14,10" Margin="0,0,0,12">
+                        <Border Name="BorderRefreshVerdict" Grid.Row="1" Background="#F8FAFC" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14,10" Margin="0,0,0,12">
                             <Grid>
                                 <Grid.RowDefinitions>
                                     <RowDefinition Height="Auto"/>
@@ -7259,11 +7583,11 @@ function Start-AutopilotHubGui {
                                 </Grid.RowDefinitions>
                                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                                     <Border Name="BorderVerdictBadge" Background="#333333" CornerRadius="3" Padding="6,2" Margin="0,0,10,0">
-                                        <TextBlock Name="TxtVerdictBadge" Text="PENDING ASSESSMENT" FontSize="10.5" FontWeight="Bold" Foreground="#B0B0B0"/>
+                                        <TextBlock Name="TxtVerdictBadge" Text="PENDING ASSESSMENT" FontSize="10.5" FontWeight="Bold" Foreground="#334155"/>
                                     </Border>
                                     <TextBlock Name="TxtVerdictTitle" Text="DELL ASSET WARRANTY &amp; REFRESH ASSESSMENT" FontSize="13" FontWeight="SemiBold" Foreground="#FFFFFF" VerticalAlignment="Center"/>
                                 </StackPanel>
-                                <TextBlock Name="TxtVerdictDesc" Grid.Row="1" Text="Click 'Assess Lifecycle &amp; Warranty' to query vendor contract records and evaluate hardware refresh eligibility." FontSize="11.5" Foreground="#A0A0A0" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                                <TextBlock Name="TxtVerdictDesc" Grid.Row="1" Text="Click 'Assess Lifecycle &amp; Warranty' to query vendor contract records and evaluate hardware refresh eligibility." FontSize="11.5" Foreground="#64748B" TextWrapping="Wrap" Margin="0,6,0,0"/>
                             </Grid>
                         </Border>
 
@@ -7276,35 +7600,35 @@ function Start-AutopilotHubGui {
                                 <ColumnDefinition Width="*"/>
                             </Grid.ColumnDefinitions>
 
-                            <Border Grid.Column="0" Background="#242424" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="10,8" Margin="0,0,6,0">
+                            <Border Grid.Column="0" Background="#F8FAFC" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="10,8" Margin="0,0,6,0">
                                 <StackPanel>
-                                    <TextBlock Text="SYSTEM MODEL" FontSize="10" FontWeight="SemiBold" Foreground="#8A8A8A"/>
+                                    <TextBlock Text="SYSTEM MODEL" FontSize="10" FontWeight="SemiBold" Foreground="#64748B"/>
                                     <TextBlock Name="TxtDellModel" Text="Unknown" FontSize="12" FontWeight="SemiBold" Foreground="#FFFFFF" TextTrimming="CharacterEllipsis" Margin="0,2,0,0"/>
-                                    <TextBlock Name="TxtDellProductLine" Text="Line: -" FontSize="10" Foreground="#8A8A8A" TextTrimming="CharacterEllipsis"/>
+                                    <TextBlock Name="TxtDellProductLine" Text="Line: -" FontSize="10" Foreground="#64748B" TextTrimming="CharacterEllipsis"/>
                                 </StackPanel>
                             </Border>
 
-                            <Border Grid.Column="1" Background="#242424" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="10,8" Margin="0,0,6,0">
+                            <Border Grid.Column="1" Background="#F8FAFC" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="10,8" Margin="0,0,6,0">
                                 <StackPanel>
-                                    <TextBlock Text="FACTORY SHIP DATE / AGE" FontSize="10" FontWeight="SemiBold" Foreground="#8A8A8A"/>
+                                    <TextBlock Text="FACTORY SHIP DATE / AGE" FontSize="10" FontWeight="SemiBold" Foreground="#64748B"/>
                                     <TextBlock Name="TxtDellShipDate" Text="-" FontSize="12" FontWeight="SemiBold" Foreground="#FFFFFF" Margin="0,2,0,0"/>
-                                    <TextBlock Name="TxtDellAge" Text="Age: -" FontSize="10" Foreground="#8A8A8A"/>
+                                    <TextBlock Name="TxtDellAge" Text="Age: -" FontSize="10" Foreground="#64748B"/>
                                 </StackPanel>
                             </Border>
 
-                            <Border Grid.Column="2" Background="#242424" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="10,8" Margin="0,0,6,0">
+                            <Border Grid.Column="2" Background="#F8FAFC" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="10,8" Margin="0,0,6,0">
                                 <StackPanel>
-                                    <TextBlock Text="PRIMARY SERVICE CONTRACT" FontSize="10" FontWeight="SemiBold" Foreground="#8A8A8A"/>
+                                    <TextBlock Text="PRIMARY SERVICE CONTRACT" FontSize="10" FontWeight="SemiBold" Foreground="#64748B"/>
                                     <TextBlock Name="TxtDellContract" Text="-" FontSize="12" FontWeight="SemiBold" Foreground="#FFFFFF" TextTrimming="CharacterEllipsis" Margin="0,2,0,0"/>
-                                    <TextBlock Name="TxtDellRegion" Text="Region: -" FontSize="10" Foreground="#8A8A8A"/>
+                                    <TextBlock Name="TxtDellRegion" Text="Region: -" FontSize="10" Foreground="#64748B"/>
                                 </StackPanel>
                             </Border>
 
-                            <Border Grid.Column="3" Background="#242424" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="10,8">
+                            <Border Grid.Column="3" Background="#F8FAFC" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="10,8">
                                 <StackPanel>
-                                    <TextBlock Text="EXPIRATION &amp; STATUS" FontSize="10" FontWeight="SemiBold" Foreground="#8A8A8A"/>
+                                    <TextBlock Text="EXPIRATION &amp; STATUS" FontSize="10" FontWeight="SemiBold" Foreground="#64748B"/>
                                     <TextBlock Name="TxtDellEndDate" Text="-" FontSize="12" FontWeight="SemiBold" Foreground="#FFFFFF" Margin="0,2,0,0"/>
-                                    <TextBlock Name="TxtDellDaysRemaining" Text="Status: -" FontSize="10" FontWeight="SemiBold" Foreground="#8A8A8A"/>
+                                    <TextBlock Name="TxtDellDaysRemaining" Text="Status: -" FontSize="10" FontWeight="SemiBold" Foreground="#64748B"/>
                                 </StackPanel>
                             </Border>
                         </Grid>
@@ -7317,7 +7641,7 @@ function Start-AutopilotHubGui {
                             </Grid.ColumnDefinitions>
 
                             <!-- Battery Wear Card -->
-                            <Border Grid.Column="0" Background="#242424" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="10,8" Margin="0,0,6,0">
+                            <Border Grid.Column="0" Background="#F8FAFC" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="10,8" Margin="0,0,6,0">
                                 <Grid>
                                     <Grid.RowDefinitions>
                                         <RowDefinition Height="Auto"/>
@@ -7328,18 +7652,18 @@ function Start-AutopilotHubGui {
                                         <ColumnDefinition Width="*"/>
                                         <ColumnDefinition Width="Auto"/>
                                     </Grid.ColumnDefinitions>
-                                    <TextBlock Text="BATTERY WEAR &amp; HEALTH" FontSize="10" FontWeight="SemiBold" Foreground="#8A8A8A"/>
+                                    <TextBlock Text="BATTERY WEAR &amp; HEALTH" FontSize="10" FontWeight="SemiBold" Foreground="#64748B"/>
                                     <Button Name="BtnRefreshBattery" Grid.Column="1" Content="Refresh Battery" Padding="6,2" FontSize="10"/>
                                     <StackPanel Grid.Row="1" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,2">
-                                        <TextBlock Name="TxtBatteryWear" Text="Wear: Probing..." FontSize="12.5" FontWeight="Bold" Foreground="#60CDFF" Margin="0,0,12,0"/>
-                                        <TextBlock Name="TxtBatteryVerdict" Text="Status: Normal" FontSize="12" Foreground="#D0D0D0" VerticalAlignment="Center"/>
+                                        <TextBlock Name="TxtBatteryWear" Text="Wear: Probing..." FontSize="12.5" FontWeight="Bold" Foreground="#0284C7" Margin="0,0,12,0"/>
+                                        <TextBlock Name="TxtBatteryVerdict" Text="Status: Normal" FontSize="12" Foreground="#475569" VerticalAlignment="Center"/>
                                     </StackPanel>
-                                    <TextBlock Name="TxtBatteryCapacity" Grid.Row="2" Grid.ColumnSpan="2" Text="Design: - | Full: -" FontSize="10.5" Foreground="#8A8A8A"/>
+                                    <TextBlock Name="TxtBatteryCapacity" Grid.Row="2" Grid.ColumnSpan="2" Text="Design: - | Full: -" FontSize="10.5" Foreground="#64748B"/>
                                 </Grid>
                             </Border>
 
                             <!-- NVMe SSD SMART Reliability Card -->
-                            <Border Grid.Column="1" Background="#242424" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="10,8" Margin="6,0,0,0">
+                            <Border Grid.Column="1" Background="#F8FAFC" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="10,8" Margin="6,0,0,0">
                                 <Grid>
                                     <Grid.RowDefinitions>
                                         <RowDefinition Height="Auto"/>
@@ -7350,13 +7674,13 @@ function Start-AutopilotHubGui {
                                         <ColumnDefinition Width="*"/>
                                         <ColumnDefinition Width="Auto"/>
                                     </Grid.ColumnDefinitions>
-                                    <TextBlock Text="NVME SSD SMART RELIABILITY COUNTER" FontSize="10" FontWeight="SemiBold" Foreground="#8A8A8A"/>
+                                    <TextBlock Text="NVME SSD SMART RELIABILITY COUNTER" FontSize="10" FontWeight="SemiBold" Foreground="#64748B"/>
                                     <Button Name="BtnRefreshStorage" Grid.Column="1" Content="Inspect SMART" Padding="6,2" FontSize="10"/>
                                     <StackPanel Grid.Row="1" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,2">
-                                        <TextBlock Name="TxtStorageWear" Text="SSD Wear: Probing..." FontSize="12.5" FontWeight="Bold" Foreground="#6CCB5F" Margin="0,0,12,0"/>
-                                        <TextBlock Name="TxtStorageTemp" Text="Temp: -" FontSize="12" Foreground="#D0D0D0" VerticalAlignment="Center"/>
+                                        <TextBlock Name="TxtStorageWear" Text="SSD Wear: Probing..." FontSize="12.5" FontWeight="Bold" Foreground="#15803D" Margin="0,0,12,0"/>
+                                        <TextBlock Name="TxtStorageTemp" Text="Temp: -" FontSize="12" Foreground="#475569" VerticalAlignment="Center"/>
                                     </StackPanel>
-                                    <TextBlock Name="TxtStorageMeta" Grid.Row="2" Grid.ColumnSpan="2" Text="Read Errors: 0 | Write Errors: 0 | Power-On Hours: -" FontSize="10.5" Foreground="#8A8A8A"/>
+                                    <TextBlock Name="TxtStorageMeta" Grid.Row="2" Grid.ColumnSpan="2" Text="Read Errors: 0 | Write Errors: 0 | Power-On Hours: -" FontSize="10.5" Foreground="#64748B"/>
                                 </Grid>
                             </Border>
                         </Grid>
@@ -7367,8 +7691,8 @@ function Start-AutopilotHubGui {
                                 <RowDefinition Height="Auto"/>
                                 <RowDefinition Height="*"/>
                             </Grid.RowDefinitions>
-                            <TextBlock Text="CONTRACT ENTITLEMENTS &amp; SERVICE HISTORY" FontSize="10.5" FontWeight="SemiBold" Foreground="#8A8A8A" Margin="0,0,0,6"/>
-                            <ListView Name="LstDellEntitlements" Grid.Row="1" Background="#1F1F1F" BorderBrush="#383838" Foreground="#FFFFFF">
+                            <TextBlock Text="CONTRACT ENTITLEMENTS &amp; SERVICE HISTORY" FontSize="10.5" FontWeight="SemiBold" Foreground="#64748B" Margin="0,0,0,6"/>
+                            <ListView Name="LstDellEntitlements" Grid.Row="1" Background="#FFFFFF" BorderBrush="#E2E8F0" Foreground="#FFFFFF">
                                 <ListView.View>
                                     <GridView>
                                         <GridViewColumn Header="Service Level Description" Width="260" DisplayMemberBinding="{Binding ServiceLevelDescription}"/>
@@ -7408,10 +7732,10 @@ function Start-AutopilotHubGui {
                             </Grid.RowDefinitions>
 
                             <!-- Card: Join & Identity -->
-                            <Border Grid.Row="0" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                            <Border Grid.Row="0" Grid.Column="0" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="0,0,6,10">
                                 <StackPanel>
-                                    <TextBlock Text="JOIN &amp; IDENTITY" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
-                                    <TextBlock Name="TxtHybJoin" Text="Click Refresh to read dsregcmd join state, PRT and tenant." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <TextBlock Text="JOIN &amp; IDENTITY" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,6"/>
+                                    <TextBlock Name="TxtHybJoin" Text="Click Refresh to read dsregcmd join state, PRT and tenant." FontSize="11.5" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <WrapPanel>
                                         <Button Name="BtnHybRefresh" Content="Refresh State" Margin="0,0,6,6" Padding="10,5"/>
                                         <Button Name="BtnHybRetryJoin" Content="Retry Hybrid Join" Margin="0,0,6,6" Padding="10,5"/>
@@ -7421,10 +7745,10 @@ function Start-AutopilotHubGui {
                             </Border>
 
                             <!-- Card: MDM / Intune -->
-                            <Border Grid.Row="0" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                            <Border Grid.Row="0" Grid.Column="1" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="6,0,0,10">
                                 <StackPanel>
-                                    <TextBlock Text="MDM / INTUNE" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
-                                    <TextBlock Name="TxtHybMdm" Text="Enrollment + Intune Management Extension health." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <TextBlock Text="MDM / INTUNE" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,6"/>
+                                    <TextBlock Name="TxtHybMdm" Text="Enrollment + Intune Management Extension health." FontSize="11.5" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <WrapPanel>
                                         <Button Name="BtnHybSync" Content="Force Intune Sync" Style="{StaticResource AccentBtn}" Margin="0,0,6,6" Padding="10,5"/>
                                         <Button Name="BtnHybRestartIme" Content="Restart IME" Margin="0,0,6,6" Padding="10,5"/>
@@ -7434,11 +7758,11 @@ function Start-AutopilotHubGui {
                             </Border>
 
                             <!-- Card: Co-Management & Authority Overrides -->
-                            <Border Grid.Row="1" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                            <Border Grid.Row="1" Grid.Column="0" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="0,0,6,10">
                                 <StackPanel>
-                                    <TextBlock Text="CO-MANAGEMENT (WHO OWNS EACH WORKLOAD)" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
-                                    <TextBlock Name="TxtHybComgmt" Text="Decode the ConfigMgr/Intune workload authority bitmask." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,8"/>
-                                    <ListBox Name="LstHybWorkloads" Height="110" Background="#1F1F1F" BorderBrush="#383838" Margin="0,0,0,8">
+                                    <TextBlock Text="CO-MANAGEMENT (WHO OWNS EACH WORKLOAD)" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,6"/>
+                                    <TextBlock Name="TxtHybComgmt" Text="Decode the ConfigMgr/Intune workload authority bitmask." FontSize="11.5" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                                    <ListBox Name="LstHybWorkloads" Height="110" Background="#FFFFFF" BorderBrush="#E2E8F0" Margin="0,0,0,8">
                                         <ListBox.ItemTemplate>
                                             <DataTemplate>
                                                 <Grid>
@@ -7446,8 +7770,8 @@ function Start-AutopilotHubGui {
                                                         <ColumnDefinition Width="*"/>
                                                         <ColumnDefinition Width="120"/>
                                                     </Grid.ColumnDefinitions>
-                                                    <TextBlock Text="{Binding Workload}" Foreground="#D0D0D0" FontSize="11"/>
-                                                    <TextBlock Grid.Column="1" Text="{Binding Authority}" Foreground="#6CCB5F" FontSize="11" FontWeight="SemiBold"/>
+                                                    <TextBlock Text="{Binding Workload}" Foreground="#475569" FontSize="11"/>
+                                                    <TextBlock Grid.Column="1" Text="{Binding Authority}" Foreground="#15803D" FontSize="11" FontWeight="SemiBold"/>
                                                 </Grid>
                                             </DataTemplate>
                                         </ListBox.ItemTemplate>
@@ -7465,10 +7789,10 @@ function Start-AutopilotHubGui {
                             </Border>
 
                             <!-- Card: Policy & Connectivity -->
-                            <Border Grid.Row="1" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                            <Border Grid.Row="1" Grid.Column="1" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="6,0,0,10">
                                 <StackPanel>
-                                    <TextBlock Text="POLICY &amp; CONNECTIVITY" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
-                                    <TextBlock Name="TxtHybNet" Text="DC line-of-sight, Group Policy and domain time." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <TextBlock Text="POLICY &amp; CONNECTIVITY" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,6"/>
+                                    <TextBlock Name="TxtHybNet" Text="DC line-of-sight, Group Policy and domain time." FontSize="11.5" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <WrapPanel>
                                         <Button Name="BtnHybDc" Content="Test DC Line-of-Sight" Margin="0,0,6,6" Padding="10,5"/>
                                         <Button Name="BtnHybDcLadder" Content="DC Port Ladder" Style="{StaticResource AccentBtn}" Margin="0,0,6,6" Padding="10,5"/>
@@ -7480,10 +7804,10 @@ function Start-AutopilotHubGui {
                             </Border>
 
                             <!-- Card: Kerberos & Cloud AP PRT -->
-                            <Border Grid.Row="2" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                            <Border Grid.Row="2" Grid.Column="0" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="0,0,6,10">
                                 <StackPanel>
-                                    <TextBlock Text="KERBEROS &amp; CLOUD AP PRT DIAGNOSTICS" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
-                                    <TextBlock Name="TxtHybKerb" Text="Inspect cached Kerberos TGT/TGS tickets, Cloud Kerberos PRT, and WAM broker health." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <TextBlock Text="KERBEROS &amp; CLOUD AP PRT DIAGNOSTICS" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,6"/>
+                                    <TextBlock Name="TxtHybKerb" Text="Inspect cached Kerberos TGT/TGS tickets, Cloud Kerberos PRT, and WAM broker health." FontSize="11.5" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <WrapPanel>
                                         <Button Name="BtnHybKerbDiag" Content="Inspect Kerberos Tickets" Margin="0,0,6,6" Padding="10,5"/>
                                         <Button Name="BtnHybKerbPurge" Content="Purge Kerberos Tickets" Margin="0,0,6,6" Padding="10,5"/>
@@ -7496,10 +7820,10 @@ function Start-AutopilotHubGui {
                             </Border>
 
                             <!-- Card: Certificate Auto-Enrollment & SCEP Health -->
-                            <Border Grid.Row="2" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                            <Border Grid.Row="2" Grid.Column="1" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="6,0,0,10">
                                 <StackPanel>
-                                    <TextBlock Text="CERTIFICATE AUTO-ENROLLMENT &amp; SCEP HEALTH" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
-                                    <TextBlock Name="TxtHybCertPulse" Text="Force immediate certificate auto-enrollment pulse and audit SCEP/NDES Intune client certificates." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <TextBlock Text="CERTIFICATE AUTO-ENROLLMENT &amp; SCEP HEALTH" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,6"/>
+                                    <TextBlock Name="TxtHybCertPulse" Text="Force immediate certificate auto-enrollment pulse and audit SCEP/NDES Intune client certificates." FontSize="11.5" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <WrapPanel>
                                         <Button Name="BtnHybCertPulse" Content="Force Cert Pulse" Style="{StaticResource AccentBtn}" Margin="0,0,6,6" Padding="10,5"/>
                                         <Button Name="BtnHybScepHealth" Content="Audit SCEP Health" Margin="0,0,6,6" Padding="10,5"/>
@@ -7508,10 +7832,10 @@ function Start-AutopilotHubGui {
                             </Border>
 
                             <!-- Card: Compliance, BitLocker, Legacy & Certs -->
-                            <Border Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,0,10">
+                            <Border Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="0,0,0,10">
                                 <StackPanel>
-                                    <TextBlock Text="COMPLIANCE / SECURITY / DIAGNOSTICS" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
-                                    <TextBlock Name="TxtHybCompliance" Text="Conditional Access readiness, BitLocker escrow, legacy-dependency scan, certificate expiry, and a helpdesk log bundle." FontSize="11.5" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <TextBlock Text="COMPLIANCE / SECURITY / DIAGNOSTICS" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,6"/>
+                                    <TextBlock Name="TxtHybCompliance" Text="Conditional Access readiness, BitLocker escrow, legacy-dependency scan, certificate expiry, and a helpdesk log bundle." FontSize="11.5" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <WrapPanel>
                                         <Button Name="BtnHybCa" Content="Check CA Readiness" Style="{StaticResource AccentBtn}" Margin="0,0,6,6" Padding="10,5"/>
                                         <Button Name="BtnHybBitlocker" Content="Escrow BitLocker Keys" Margin="0,0,6,6" Padding="10,5"/>
@@ -7525,15 +7849,15 @@ function Start-AutopilotHubGui {
                     </ScrollViewer>
 
                     <!-- Tab-local status bar -->
-                    <Border Grid.Row="1" Background="#1C1C1C" CornerRadius="3" BorderBrush="#2D2D2D" BorderThickness="1" Padding="8,4" Margin="0,6,0,0">
+                    <Border Grid.Row="1" Background="#F8FAFC" CornerRadius="3" BorderBrush="#2D2D2D" BorderThickness="1" Padding="8,4" Margin="0,6,0,0">
                         <Grid>
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="Auto"/>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
-                            <TextBlock Text="HYBRID STATUS:" FontSize="10" FontWeight="Bold" Foreground="#60CDFF" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                            <TextBox Name="TxtHybOut" Grid.Column="1" Background="Transparent" Foreground="#D0D0D0" BorderThickness="0" FontFamily="Consolas" FontSize="11" IsReadOnly="True" TextWrapping="NoWrap" VerticalAlignment="Center" Text="Ready. Hybrid &amp; co-management tools initialized."/>
+                            <TextBlock Text="HYBRID STATUS:" FontSize="10" FontWeight="Bold" Foreground="#0284C7" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                            <TextBox Name="TxtHybOut" Grid.Column="1" Background="Transparent" Foreground="#475569" BorderThickness="0" FontFamily="Consolas" FontSize="11" IsReadOnly="True" TextWrapping="NoWrap" VerticalAlignment="Center" Text="Ready. Hybrid &amp; co-management tools initialized."/>
                             <Button Name="BtnClearHybOut" Grid.Column="2" Content="Clear" FontSize="9.5" Padding="6,2" Margin="6,0,0,0"/>
                         </Grid>
                     </Border>
@@ -7559,7 +7883,7 @@ function Start-AutopilotHubGui {
                             </Grid.RowDefinitions>
 
                             <!-- Card 1: Win32App Registry Status & Diagnostics -->
-                            <Border Grid.Row="0" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                            <Border Grid.Row="0" Grid.Column="0" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="0,0,6,10">
                                 <StackPanel>
                                     <Grid Margin="0,0,0,6">
                                         <Grid.ColumnDefinitions>
@@ -7567,11 +7891,11 @@ function Start-AutopilotHubGui {
                                             <ColumnDefinition Width="Auto"/>
                                             <ColumnDefinition Width="Auto"/>
                                         </Grid.ColumnDefinitions>
-                                        <TextBlock Text="WIN32APP ESP REGISTRY STATUS" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" VerticalAlignment="Center"/>
+                                        <TextBlock Text="WIN32APP ESP REGISTRY STATUS" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" VerticalAlignment="Center"/>
                                         <Button Name="BtnRefreshWin32Apps" Grid.Column="1" Content="Refresh Apps" Margin="0,0,6,0" Padding="8,3" FontSize="11"/>
                                         <Button Name="BtnExportMdmCab" Grid.Column="2" Content="Export CAB" Padding="8,3" FontSize="11" ToolTip="Runs mdmdiagnosticstool.exe -area Autopilot;DeviceEnrollment;TPM -cab"/>
                                     </Grid>
-                                    <ListBox Name="LstWin32Apps" Height="140" Background="#1F1F1F" BorderBrush="#383838">
+                                    <ListBox Name="LstWin32Apps" Height="140" Background="#FFFFFF" BorderBrush="#E2E8F0">
                                         <ListBox.ItemTemplate>
                                             <DataTemplate>
                                                 <Grid Margin="2">
@@ -7581,8 +7905,8 @@ function Start-AutopilotHubGui {
                                                         <ColumnDefinition Width="65"/>
                                                     </Grid.ColumnDefinitions>
                                                     <TextBlock Text="{Binding Name}" Foreground="#FFFFFF" FontWeight="SemiBold" FontSize="11" TextTrimming="CharacterEllipsis"/>
-                                                    <TextBlock Grid.Column="1" Text="{Binding InstallState}" Foreground="#6CCB5F" FontSize="10.5"/>
-                                                    <TextBlock Grid.Column="2" Text="{Binding ExitCode}" Foreground="#8A8A8A" FontSize="10.5"/>
+                                                    <TextBlock Grid.Column="1" Text="{Binding InstallState}" Foreground="#15803D" FontSize="10.5"/>
+                                                    <TextBlock Grid.Column="2" Text="{Binding ExitCode}" Foreground="#64748B" FontSize="10.5"/>
                                                 </Grid>
                                             </DataTemplate>
                                         </ListBox.ItemTemplate>
@@ -7591,15 +7915,15 @@ function Start-AutopilotHubGui {
                             </Border>
 
                             <!-- Card 2: Autopilot Cloud Device Lifecycle -->
-                            <Border Grid.Row="0" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                            <Border Grid.Row="0" Grid.Column="1" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="6,0,0,10">
                                 <StackPanel>
-                                    <TextBlock Text="AUTOPILOT CLOUD LIFECYCLE &amp; DECOMMISSION" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
+                                    <TextBlock Text="AUTOPILOT CLOUD LIFECYCLE &amp; DECOMMISSION" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,6"/>
                                     <Grid Margin="0,0,0,6">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="90"/>
                                             <ColumnDefinition Width="*"/>
                                         </Grid.ColumnDefinitions>
-                                        <TextBlock Text="New Group Tag:" Foreground="#D0D0D0" VerticalAlignment="Center" FontSize="11"/>
+                                        <TextBlock Text="New Group Tag:" Foreground="#475569" VerticalAlignment="Center" FontSize="11"/>
                                         <TextBox Name="TxtLifecycleGroupTag" Grid.Column="1" Height="26" FontSize="11"/>
                                     </Grid>
                                     <Grid Margin="0,0,0,8">
@@ -7607,7 +7931,7 @@ function Start-AutopilotHubGui {
                                             <ColumnDefinition Width="90"/>
                                             <ColumnDefinition Width="*"/>
                                         </Grid.ColumnDefinitions>
-                                        <TextBlock Text="New User UPN:" Foreground="#D0D0D0" VerticalAlignment="Center" FontSize="11"/>
+                                        <TextBlock Text="New User UPN:" Foreground="#475569" VerticalAlignment="Center" FontSize="11"/>
                                         <TextBox Name="TxtLifecycleUser" Grid.Column="1" Height="26" FontSize="11"/>
                                     </Grid>
                                     <WrapPanel>
@@ -7622,9 +7946,9 @@ function Start-AutopilotHubGui {
                             </Border>
 
                             <!-- Card 3: OOBE Wi-Fi Manager & 802.1X XML Profile Import -->
-                            <Border Grid.Row="1" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                            <Border Grid.Row="1" Grid.Column="0" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="0,0,6,10">
                                 <StackPanel>
-                                    <TextBlock Text="OOBE WI-FI MANAGER &amp; 802.1X PROFILES" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
+                                    <TextBlock Text="OOBE WI-FI MANAGER &amp; 802.1X PROFILES" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,6"/>
                                     <Grid Margin="0,0,0,6">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*"/>
@@ -7639,7 +7963,7 @@ function Start-AutopilotHubGui {
                                             <ColumnDefinition Width="*"/>
                                             <ColumnDefinition Width="Auto"/>
                                         </Grid.ColumnDefinitions>
-                                        <TextBlock Text="Password:" Foreground="#D0D0D0" VerticalAlignment="Center" FontSize="11"/>
+                                        <TextBlock Text="Password:" Foreground="#475569" VerticalAlignment="Center" FontSize="11"/>
                                         <TextBox Name="TxtWifiPassword" Grid.Column="1" Height="26" FontSize="11"/>
                                         <Button Name="BtnConnectWifi" Grid.Column="2" Content="Connect" Style="{StaticResource AccentBtn}" Margin="6,0,0,0" Padding="8,3" FontSize="11"/>
                                     </Grid>
@@ -7651,12 +7975,12 @@ function Start-AutopilotHubGui {
                             </Border>
 
                             <!-- Card 4: Windows Edition & 1-Click KMS Upgrade -->
-                            <Border Grid.Row="1" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                            <Border Grid.Row="1" Grid.Column="1" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="6,0,0,10">
                                 <StackPanel>
-                                    <TextBlock Text="WINDOWS EDITION &amp; OEM LICENSE" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,6"/>
+                                    <TextBlock Text="WINDOWS EDITION &amp; OEM LICENSE" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,6"/>
                                     <StackPanel Margin="0,0,0,8">
                                         <TextBlock Name="TxtOsCaption" Text="Edition: Detecting..." FontSize="11.5" Foreground="#FFFFFF" FontWeight="SemiBold"/>
-                                        <TextBlock Name="TxtOemKey" Text="OEM Key: Reading ACPI MSDM..." FontSize="11" Foreground="#8A8A8A" FontFamily="Consolas" Margin="0,2,0,0"/>
+                                        <TextBlock Name="TxtOemKey" Text="OEM Key: Reading ACPI MSDM..." FontSize="11" Foreground="#64748B" FontFamily="Consolas" Margin="0,2,0,0"/>
                                     </StackPanel>
                                     <WrapPanel>
                                         <Button Name="BtnUpgradeEnterprise" Content="1-Click Upgrade to Enterprise (KMS)" Style="{StaticResource AccentBtn}" Margin="0,0,6,0" Padding="8,4" FontSize="11"
@@ -7669,15 +7993,15 @@ function Start-AutopilotHubGui {
                     </ScrollViewer>
 
                     <!-- Tab-local status bar -->
-                    <Border Grid.Row="1" Background="#1C1C1C" CornerRadius="3" BorderBrush="#2D2D2D" BorderThickness="1" Padding="8,4" Margin="0,6,0,0">
+                    <Border Grid.Row="1" Background="#F8FAFC" CornerRadius="3" BorderBrush="#2D2D2D" BorderThickness="1" Padding="8,4" Margin="0,6,0,0">
                         <Grid>
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="Auto"/>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
-                            <TextBlock Text="IME LOG STREAM:" FontSize="10" FontWeight="Bold" Foreground="#60CDFF" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                            <TextBox Name="TxtImeLog" Grid.Column="1" Background="Transparent" Foreground="#D0D0D0" BorderThickness="0" FontFamily="Consolas" FontSize="10.5" IsReadOnly="True" TextWrapping="NoWrap" VerticalAlignment="Center" Text="Click 'Tail IME Log' to read the real-time Intune Management Extension agent log..."/>
+                            <TextBlock Text="IME LOG STREAM:" FontSize="10" FontWeight="Bold" Foreground="#0284C7" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                            <TextBox Name="TxtImeLog" Grid.Column="1" Background="Transparent" Foreground="#475569" BorderThickness="0" FontFamily="Consolas" FontSize="10.5" IsReadOnly="True" TextWrapping="NoWrap" VerticalAlignment="Center" Text="Click 'Tail IME Log' to read the real-time Intune Management Extension agent log..."/>
                             <Button Name="BtnTailImeLog" Grid.Column="2" Content="Tail IME Log" FontSize="9.5" Padding="8,2" Margin="6,0,0,0"/>
                         </Grid>
                     </Border>
@@ -7694,15 +8018,15 @@ function Start-AutopilotHubGui {
                     </Grid.RowDefinitions>
 
                     <!-- Header Banner -->
-                    <Border Grid.Row="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14,10" Margin="0,0,0,10">
+                    <Border Grid.Row="0" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14,10" Margin="0,0,0,10">
                         <Grid>
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
                             <StackPanel>
-                                <TextBlock Text="PRECISION ENTERPRISE REMEDIATION ARSENAL" FontSize="12" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
-                                <TextBlock Text="Curated surgical one-click fixes for elusive enterprise corruption, broken cryptographic catalogs, deadlocked pipelines, and hybrid edge cases." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap"/>
+                                <TextBlock Text="PRECISION ENTERPRISE REMEDIATION ARSENAL" FontSize="12" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,4"/>
+                                <TextBlock Text="Curated surgical one-click fixes for elusive enterprise corruption, broken cryptographic catalogs, deadlocked pipelines, and hybrid edge cases." FontSize="11" Foreground="#334155" TextWrapping="Wrap"/>
                             </StackPanel>
                             <WrapPanel Grid.Column="1" VerticalAlignment="Center">
                                 <Button Name="BtnFixHealthReadout" Content="Audit System Health" Style="{StaticResource AccentBtn}" Padding="12,6" Margin="0,0,6,0"/>
@@ -7728,100 +8052,100 @@ function Start-AutopilotHubGui {
                             </Grid.RowDefinitions>
 
                             <!-- Card 1: WMI Repository Salvage & Self-Heal -->
-                            <Border Grid.Row="0" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                            <Border Grid.Row="0" Grid.Column="0" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="0,0,6,10">
                                 <StackPanel>
-                                    <TextBlock Text="WMI REPOSITORY SALVAGE &amp; SELF-HEAL" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
-                                    <TextBlock Text="Runs winmgmt /salvagerepository and recompiles core MOF/MFL catalogs without wiping OEM (Dell/HP/Lenovo) WMI namespaces." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <TextBlock Text="WMI REPOSITORY SALVAGE &amp; SELF-HEAL" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Runs winmgmt /salvagerepository and recompiles core MOF/MFL catalogs without wiping OEM (Dell/HP/Lenovo) WMI namespaces." FontSize="11" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <Button Name="BtnFixWmi" Content="Salvage WMI Repository" HorizontalAlignment="Left" Padding="12,5"/>
                                 </StackPanel>
                             </Border>
 
                             <!-- Card 2: Windows Update Agent & SoftDistribution -->
-                            <Border Grid.Row="0" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                            <Border Grid.Row="0" Grid.Column="1" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="6,0,0,10">
                                 <StackPanel>
-                                    <TextBlock Text="WINDOWS UPDATE AGENT &amp; SOFTDISTRIBUTION RESET" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
-                                    <TextBlock Text="Full service teardown (wuauserv, bits, cryptsvc, dosvc), archives SoftwareDistribution &amp; Catroot2, re-registers 28 core DLLs, and resets permissions." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <TextBlock Text="WINDOWS UPDATE AGENT &amp; SOFTDISTRIBUTION RESET" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Full service teardown (wuauserv, bits, cryptsvc, dosvc), archives SoftwareDistribution &amp; Catroot2, re-registers 28 core DLLs, and resets permissions." FontSize="11" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <Button Name="BtnFixWu" Content="Deep Reset WU Agent" HorizontalAlignment="Left" Padding="12,5"/>
                                 </StackPanel>
                             </Border>
 
                             <!-- Card 3: Cryptographic Services / Catroot2 ESENT Repair -->
-                            <Border Grid.Row="1" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                            <Border Grid.Row="1" Grid.Column="0" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="0,0,6,10">
                                 <StackPanel>
-                                    <TextBlock Text="CATROOT2 CRYPTO ESENT DATABASE REPAIR" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
-                                    <TextBlock Text="Repairs corrupted catdb ESENT database via esentutl /g and /p, fixes CryptSvc catalog locks, and resolves 0x800b0109 signature errors." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <TextBlock Text="CATROOT2 CRYPTO ESENT DATABASE REPAIR" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Repairs corrupted catdb ESENT database via esentutl /g and /p, fixes CryptSvc catalog locks, and resolves 0x800b0109 signature errors." FontSize="11" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <Button Name="BtnFixCatroot" Content="Repair Catroot2 Database" HorizontalAlignment="Left" Padding="12,5"/>
                                 </StackPanel>
                             </Border>
 
                             <!-- Card 4: BITS Transfer Deadlock Purge -->
-                            <Border Grid.Row="1" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                            <Border Grid.Row="1" Grid.Column="1" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="6,0,0,10">
                                 <StackPanel>
-                                    <TextBlock Text="BITS TRANSFER DEADLOCK PURGE" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
-                                    <TextBlock Text="Clears stuck Qmgr jobs, purges corrupted qmgr0.dat/qmgr1.dat databases, resets BITS service state, and re-validates the transfer pipeline." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <TextBlock Text="BITS TRANSFER DEADLOCK PURGE" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Clears stuck Qmgr jobs, purges corrupted qmgr0.dat/qmgr1.dat databases, resets BITS service state, and re-validates the transfer pipeline." FontSize="11" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <Button Name="BtnFixBits" Content="Purge BITS Deadlock" HorizontalAlignment="Left" Padding="12,5"/>
                                 </StackPanel>
                             </Border>
 
                             <!-- Card 5: DCOM / RPC 0x800706BA Remediation -->
-                            <Border Grid.Row="2" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                            <Border Grid.Row="2" Grid.Column="0" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="0,0,6,10">
                                 <StackPanel>
-                                    <TextBlock Text="DCOM / RPC 0x800706BA &amp; SECURITY LIMITS" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
-                                    <TextBlock Text="Repairs Component Services DCOM authentication/impersonation levels, fixes machine launch permissions, and verifies RPC Endpoint Mapper." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <TextBlock Text="DCOM / RPC 0x800706BA &amp; SECURITY LIMITS" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Repairs Component Services DCOM authentication/impersonation levels, fixes machine launch permissions, and verifies RPC Endpoint Mapper." FontSize="11" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <Button Name="BtnFixDcom" Content="Repair DCOM &amp; RPC Limits" HorizontalAlignment="Left" Padding="12,5"/>
                                 </StackPanel>
                             </Border>
 
                             <!-- Card 6: Print Spooler Queue Purge -->
-                            <Border Grid.Row="2" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                            <Border Grid.Row="2" Grid.Column="1" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="6,0,0,10">
                                 <StackPanel>
-                                    <TextBlock Text="PRINT SPOOLER HUNG QUEUE PURGE" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
-                                    <TextBlock Text="Gracefully halts hung spoolsv.exe, clears locked .spl and .shd print job files in spool\PRINTERS, cleans registry job keys, and restarts Spooler." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <TextBlock Text="PRINT SPOOLER HUNG QUEUE PURGE" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Gracefully halts hung spoolsv.exe, clears locked .spl and .shd print job files in spool\PRINTERS, cleans registry job keys, and restarts Spooler." FontSize="11" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <Button Name="BtnFixSpooler" Content="Purge Spooler Queue" HorizontalAlignment="Left" Padding="12,5"/>
                                 </StackPanel>
                             </Border>
 
                             <!-- Card 7: Network Stack, Winsock & IPsec Reset -->
-                            <Border Grid.Row="3" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                            <Border Grid.Row="3" Grid.Column="0" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="0,0,6,10">
                                 <StackPanel>
-                                    <TextBlock Text="NETWORK STACK, WINSOCK &amp; IPSEC RESET" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
-                                    <TextBlock Text="Resets TCP/IP stack (netsh int ip reset), resets Winsock catalog, flushes DNS &amp; ARP, clears IPsec security associations, and renews DHCP." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <TextBlock Text="NETWORK STACK, WINSOCK &amp; IPSEC RESET" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Resets TCP/IP stack (netsh int ip reset), resets Winsock catalog, flushes DNS &amp; ARP, clears IPsec security associations, and renews DHCP." FontSize="11" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <Button Name="BtnFixNetStack" Content="Flush Network &amp; Winsock" HorizontalAlignment="Left" Padding="12,5"/>
                                 </StackPanel>
                             </Border>
 
                             <!-- Card 8: WinRM & WS-Man Listener Rebuild -->
-                            <Border Grid.Row="3" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                            <Border Grid.Row="3" Grid.Column="1" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="6,0,0,10">
                                 <StackPanel>
-                                    <TextBlock Text="WINRM &amp; WS-MAN LISTENER REBUILD" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
-                                    <TextBlock Text="Tears down corrupted WinRM listeners, recreates default HTTP port 5985 listener, re-binds firewall rules, and validates WS-Man loopback." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <TextBlock Text="WINRM &amp; WS-MAN LISTENER REBUILD" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Tears down corrupted WinRM listeners, recreates default HTTP port 5985 listener, re-binds firewall rules, and validates WS-Man loopback." FontSize="11" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <Button Name="BtnFixWinRm" Content="Rebuild WinRM Listener" HorizontalAlignment="Left" Padding="12,5"/>
                                 </StackPanel>
                             </Border>
 
                             <!-- Card 9: User Profile Registry Lock Un-hooker -->
-                            <Border Grid.Row="4" Grid.Column="0" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,6,10">
+                            <Border Grid.Row="4" Grid.Column="0" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="0,0,6,10">
                                 <StackPanel>
-                                    <TextBlock Text="USER PROFILE REGISTRY LOCK UN-HOOKER" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
-                                    <TextBlock Text="Detects orphaned .bak ProfileList subkeys, resolves temporary profile collisions (TEMP profiles), and clears RefCount hive locks." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <TextBlock Text="USER PROFILE REGISTRY LOCK UN-HOOKER" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Detects orphaned .bak ProfileList subkeys, resolves temporary profile collisions (TEMP profiles), and clears RefCount hive locks." FontSize="11" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <Button Name="BtnFixProfiles" Content="Un-hook Profile .bak Locks" HorizontalAlignment="Left" Padding="12,5"/>
                                 </StackPanel>
                             </Border>
 
                             <!-- Card 10: TPM Crypto Provider & Attestation Healer -->
-                            <Border Grid.Row="4" Grid.Column="1" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="6,0,0,10">
+                            <Border Grid.Row="4" Grid.Column="1" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="6,0,0,10">
                                 <StackPanel>
-                                    <TextBlock Text="TPM PLATFORM CRYPTO &amp; ATTESTATION HEALER" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
-                                    <TextBlock Text="Clears hung attestation state flags in registry, restarts TPM Base Services (tbds), validates Endorsement Key (EK) certs without wiping BitLocker." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <TextBlock Text="TPM PLATFORM CRYPTO &amp; ATTESTATION HEALER" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Clears hung attestation state flags in registry, restarts TPM Base Services (tbds), validates Endorsement Key (EK) certs without wiping BitLocker." FontSize="11" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <Button Name="BtnFixTpm" Content="Heal TPM Attestation" HorizontalAlignment="Left" Padding="12,5"/>
                                 </StackPanel>
                             </Border>
 
                             <!-- Card 11: AppX Manifest Staging & Sysprep Unbricker -->
-                            <Border Grid.Row="5" Grid.Column="0" Grid.ColumnSpan="2" Background="#2B2B2B" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Padding="14" Margin="0,0,0,10">
+                            <Border Grid.Row="5" Grid.Column="0" Grid.ColumnSpan="2" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="14" Margin="0,0,0,10">
                                 <StackPanel>
-                                    <TextBlock Text="APPX MANIFEST STAGING &amp; SYSPREP UNBRICKER" FontSize="11" FontWeight="SemiBold" Foreground="#60CDFF" Margin="0,0,0,4"/>
-                                    <TextBlock Text="Scans for broken/abnormal AppX packages, cleans orphaned staged packages, and re-registers core Windows inbox manifests (Shell, Start, SecHealthUI)." FontSize="11" Foreground="#B0B0B0" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                    <TextBlock Text="APPX MANIFEST STAGING &amp; SYSPREP UNBRICKER" FontSize="11" FontWeight="SemiBold" Foreground="#0284C7" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Scans for broken/abnormal AppX packages, cleans orphaned staged packages, and re-registers core Windows inbox manifests (Shell, Start, SecHealthUI)." FontSize="11" Foreground="#334155" TextWrapping="Wrap" Margin="0,0,0,10"/>
                                     <Button Name="BtnFixAppX" Content="Unbrick AppX Staging" HorizontalAlignment="Left" Padding="12,5"/>
                                 </StackPanel>
                             </Border>
@@ -7830,15 +8154,15 @@ function Start-AutopilotHubGui {
                     </ScrollViewer>
 
                     <!-- Tab-local status bar -->
-                    <Border Grid.Row="2" Background="#1C1C1C" CornerRadius="3" BorderBrush="#2D2D2D" BorderThickness="1" Padding="8,4" Margin="0,6,0,0">
+                    <Border Grid.Row="2" Background="#F8FAFC" CornerRadius="3" BorderBrush="#2D2D2D" BorderThickness="1" Padding="8,4" Margin="0,6,0,0">
                         <Grid>
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="Auto"/>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
-                            <TextBlock Text="REMEDIATION STATUS:" FontSize="10" FontWeight="Bold" Foreground="#FFAA99" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                            <TextBox Name="TxtRemOut" Grid.Column="1" Background="Transparent" Foreground="#D0D0D0" BorderThickness="0" FontFamily="Consolas" FontSize="11" IsReadOnly="True" TextWrapping="NoWrap" VerticalAlignment="Center" Text="Enterprise Remediation Arsenal ready. Select a precision tool above to execute surgical OS recovery."/>
+                            <TextBlock Text="REMEDIATION STATUS:" FontSize="10" FontWeight="Bold" Foreground="#B91C1C" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                            <TextBox Name="TxtRemOut" Grid.Column="1" Background="Transparent" Foreground="#475569" BorderThickness="0" FontFamily="Consolas" FontSize="11" IsReadOnly="True" TextWrapping="NoWrap" VerticalAlignment="Center" Text="Enterprise Remediation Arsenal ready. Select a precision tool above to execute surgical OS recovery."/>
                             <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="6,0,0,0">
                                 <Button Name="BtnClearRemOut" Content="Clear" FontSize="9.5" Padding="6,2" Margin="0,0,4,0"/>
                                 <Button Name="BtnCopyFixLog" Content="Copy" FontSize="9.5" Padding="6,2"/>
@@ -7857,12 +8181,12 @@ function Start-AutopilotHubGui {
                 <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
             <ProgressBar Name="HubProgressBar" Height="4" Minimum="0" Maximum="100" Value="0"
-                         Background="#242424" Foreground="#0067C0" BorderThickness="0"/>
-            <TextBlock Name="TxtProgressStatus" Grid.Column="1" Text="Ready" FontSize="10.5" Foreground="#8A8A8A" Margin="8,0,0,0"/>
+                         Background="#F8FAFC" Foreground="#0067C0" BorderThickness="0"/>
+            <TextBlock Name="TxtProgressStatus" Grid.Column="1" Text="Ready" FontSize="10.5" Foreground="#64748B" Margin="8,0,0,0"/>
         </Grid>
 
         <!-- LIVE LOG OUTPUT CONSOLE (COLLAPSIBLE) -->
-        <Border Grid.Row="4" Background="#181818" CornerRadius="4" BorderBrush="#2B2B2B" BorderThickness="1" Padding="8">
+        <Border Grid.Row="4" Background="#FFFFFF" CornerRadius="4" BorderBrush="#CBD5E1" BorderThickness="1" Padding="8">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
@@ -7876,7 +8200,7 @@ function Start-AutopilotHubGui {
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                        <TextBlock Text="SYSTEM AUDIT LOG" FontSize="10" FontWeight="SemiBold" Foreground="#777777" VerticalAlignment="Center"/>
+                        <TextBlock Text="SYSTEM AUDIT LOG" FontSize="10" FontWeight="SemiBold" Foreground="#64748B" VerticalAlignment="Center"/>
                         <Button Name="BtnToggleConsole" Content="[-] Hide Log" FontSize="9.5" Padding="6,2" Margin="10,0,0,0" ToolTip="Collapse or expand the system audit log console"/>
                     </StackPanel>
                     <StackPanel Grid.Column="2" Orientation="Horizontal">
@@ -7886,7 +8210,7 @@ function Start-AutopilotHubGui {
                     </StackPanel>
                 </Grid>
 
-                <TextBox Name="TxtHubLog" Grid.Row="1" Background="Transparent" Foreground="#D0D0D0"
+                <TextBox Name="TxtHubLog" Grid.Row="1" Background="Transparent" Foreground="#1E293B"
                          BorderThickness="0" FontFamily="Cascadia Code, Consolas" FontSize="11"
                          IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap"
                          VerticalScrollBarVisibility="Auto"/>
@@ -7956,6 +8280,7 @@ function Start-AutopilotHubGui {
     $btnRegisterIntune  = $window.FindName('BtnRegisterIntune')
     $btnSaveEnvDefaults = $window.FindName('BtnSaveEnvDefaults')
     $chkPersonalDisableNet = $window.FindName('ChkPersonalDisableNet')
+    $btnCreateLocalUser   = $window.FindName('BtnCreateLocalUser')
     $btnPersonalInstall    = $window.FindName('BtnPersonalInstall')
     $btnReenableNet        = $window.FindName('BtnReenableNet')
     $txtHashBox        = $window.FindName('TxtHashBox')
@@ -7998,6 +8323,8 @@ function Start-AutopilotHubGui {
     $txtPowerStatus        = $window.FindName('TxtPowerStatus')
     $btnToolsDropdown      = $window.FindName('BtnToolsDropdown')
     $menuWindowsUpdate     = $window.FindName('MenuWindowsUpdate')
+    $menuCreateLocalUser   = $window.FindName('MenuCreateLocalUser')
+    $menuPersonalMsa       = $window.FindName('MenuPersonalMsa')
     $menuLaunchEdge        = $window.FindName('MenuLaunchEdge')
     $menuScreenshotUsb     = $window.FindName('MenuScreenshotUsb')
     $menuToggleDpi         = $window.FindName('MenuToggleDpi')
@@ -8080,8 +8407,8 @@ function Start-AutopilotHubGui {
 
     function Update-GraphAuthHeader {
         if ($script:GraphAuthContext -and $script:GraphAuthContext.AccessToken -and $script:GraphAuthContext.ExpiresOn -gt [datetime]::UtcNow.AddMinutes(2)) {
-            $dotGraphStatus.Fill = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#6CCB5F")
-            $badgeGraphAuth.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#1F2822")
+            $dotGraphStatus.Fill = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#15803D")
+            $badgeGraphAuth.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#DCFCE7")
             $badgeGraphAuth.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#2A5435")
             $tDisplay = if ($script:GraphAuthContext.TenantId -and $script:GraphAuthContext.TenantId -ne 'organizations') {
                 if ($script:GraphAuthContext.TenantId.Length -gt 18) {
@@ -8093,7 +8420,7 @@ function Start-AutopilotHubGui {
                 'Connected'
             }
             $txtGraphStatus.Text = "GRAPH: CONNECTED ($tDisplay)"
-            $txtGraphStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#6CCB5F")
+            $txtGraphStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#15803D")
             $btnConnectGraph.Content = "Disconnect"
             $btnConnectGraph.Style = [System.Windows.Style]$window.Resources['DestructiveBtn']
 
@@ -8118,8 +8445,8 @@ function Start-AutopilotHubGui {
 
             Invoke-TenantAutopilotLookup
         } else {
-            $dotGraphStatus.Fill = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FFAA99")
-            $badgeGraphAuth.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#2E2221")
+            $dotGraphStatus.Fill = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#B91C1C")
+            $badgeGraphAuth.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#F1F5F9")
             $badgeGraphAuth.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#542E2A")
             $txtGraphStatus.Text = "GRAPH: NOT SIGNED IN"
             $txtGraphStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#D0D0D0")
@@ -8501,17 +8828,17 @@ function Start-AutopilotHubGui {
     # Privilege badge - always visible; the Fix button only appears when we are below the preferred level
     $brushConv = [System.Windows.Media.BrushConverter]::new()
     if ($ctx.MeetsPreferred) {
-        $dotPrivilege.Fill = $brushConv.ConvertFromString("#6CCB5F")
-        $badgePrivilege.Background = $brushConv.ConvertFromString("#1F2822")
+        $dotPrivilege.Fill = $brushConv.ConvertFromString("#15803D")
+        $badgePrivilege.Background = $brushConv.ConvertFromString("#DCFCE7")
         $badgePrivilege.BorderBrush = $brushConv.ConvertFromString("#2A5435")
         $txtPrivilege.Text = "PRIV: $($ctx.PrivilegeLevel) | $($ctx.Mode)"
-        $txtPrivilege.Foreground = $brushConv.ConvertFromString("#6CCB5F")
+        $txtPrivilege.Foreground = $brushConv.ConvertFromString("#15803D")
     } else {
-        $dotPrivilege.Fill = $brushConv.ConvertFromString("#FF99A4")
+        $dotPrivilege.Fill = $brushConv.ConvertFromString("#B91C1C")
         $badgePrivilege.Background = $brushConv.ConvertFromString("#5C2B29")
         $badgePrivilege.BorderBrush = $brushConv.ConvertFromString("#8A3E3A")
         $txtPrivilege.Text = "PRIV: $($ctx.PrivilegeLevel) | $($ctx.Mode)"
-        $txtPrivilege.Foreground = $brushConv.ConvertFromString("#FF99A4")
+        $txtPrivilege.Foreground = $brushConv.ConvertFromString("#B91C1C")
         $btnFixPrivilege.Visibility = [System.Windows.Visibility]::Visible
         Write-HubLog "Running WITHOUT elevation. Hash harvest, rename, app installs, clock sync and restart-resume will fail. Click 'Fix Privileges' in the header - preferred level is $($ctx.PreferredLevel)." "WARN"
     }
@@ -8555,14 +8882,14 @@ function Start-AutopilotHubGui {
             'Bypassed' {
                 $title = "DEVICE STATE: AUTOPILOT BYPASSED (LOCAL INSTALL)"
                 $detail = "$($ds.Summary). Autopilot has been skipped on this install. OOBE will finish as a normal Windows with a local account.$cloudNote"
-                $bg = '#252B35'; $border = '#355070'; $fg = '#60CDFF'; $showAction = $false
+                $bg = '#E0F2FE'; $border = '#BAE6FD'; $fg = '#0284C7'; $showAction = $false
                 $txtDeviceState.Text = "AUTOPILOT BYPASSED"; $txtDeviceState.Foreground = $bc.ConvertFromString('#60CDFF')
             }
             'AutopilotRegistered' {
                 $title = "DEVICE STATE: AUTOPILOT REGISTERED"
                 $detail = "$($ds.Summary). This PC already received its deployment profile from the Autopilot Deployment Service - that is why it boots into the branded OOBE. Registration is NOT required; use this tab only to export a CSV or change the group tag.$cloudNote"
                 if ($ds.CloudChecked -and -not $ds.CloudRegistered) { $detail += " You are probably signed in to a different tenant than the one this device belongs to ($tenant)." }
-                $bg = '#1F2822'; $border = '#2A5435'; $fg = '#6CCB5F'; $showAction = $false
+                $bg = '#DCFCE7'; $border = '#BBF7D0'; $fg = '#15803D'; $showAction = $false
                 $txtDeviceState.Text = "AUTOPILOT: $tenant"; $txtDeviceState.Foreground = $bc.ConvertFromString('#6CCB5F')
             }
             'IntuneEnrolled' {
@@ -8586,14 +8913,14 @@ function Start-AutopilotHubGui {
             default {
                 $title = "DEVICE STATE: NOT REGISTERED"
                 $detail = "$($ds.Summary). Harvest the hardware hash, then register it with Intune (Graph) or export the CSV for a bulk import.$cloudNote"
-                $bg = '#2E2221'; $border = '#542E2A'; $fg = '#FFAA99'
+                $bg = '#FEE2E2'; $border = '#FCA5A5'; $fg = '#B91C1C'
                 $txtDeviceState.Text = "NOT REGISTERED"; $txtDeviceState.Foreground = $bc.ConvertFromString('#FFAA99')
             }
         }
         if ($ds.CloudChecked -and $ds.CloudRegistered -and $ds.Verdict -ne 'AutopilotRegistered') {
             $title = "DEVICE STATE: REGISTERED IN SIGNED-IN TENANT"
             $detail = "The signed-in tenant already holds an Autopilot identity for this serial number.$cloudNote Registering again is unnecessary; the local machine simply has not been through Autopilot OOBE yet."
-            $bg = '#1F2822'; $border = '#2A5435'; $fg = '#6CCB5F'; $showAction = $false
+            $bg = '#DCFCE7'; $border = '#BBF7D0'; $fg = '#15803D'; $showAction = $false
             $txtDeviceState.Text = "AUTOPILOT (TENANT)"; $txtDeviceState.Foreground = $bc.ConvertFromString('#6CCB5F')
         }
         $bannerDeviceState.Background = $bc.ConvertFromString($bg)
@@ -8810,7 +9137,38 @@ function Start-AutopilotHubGui {
     $btnHarvestHash.Add_Click({ Invoke-HubHarvest })
     $btnDeviceStateAction.Add_Click({ Invoke-HubHarvest })
 
-    # --- ACTION: Skip Autopilot in OOBE ---
+    # --- ACTION: Skip Autopilot, Personal MSA & Local User Handlers ---
+    if ($btnCreateLocalUser) {
+        $btnCreateLocalUser.Add_Click({
+            Show-CreateLocalUserDialog -Owner $window
+        })
+    }
+    if ($menuCreateLocalUser) {
+        $menuCreateLocalUser.Add_Click({
+            Show-CreateLocalUserDialog -Owner $window
+        })
+    }
+
+    $personalMsaAction = {
+        $ctx = $script:RuntimeContext
+        if (-not $ctx.MeetsPreferred) {
+            [System.Windows.MessageBox]::Show("Configuring Personal Account mode requires elevation. Use 'Fix Privileges' first.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+            return
+        }
+        $ans = [System.Windows.MessageBox]::Show("Configure this device for Personal Microsoft Account (MSA) setup?`n`nThis will:`n- Clear Autopilot corporate locks & tenant policy cache`n- Re-enable network adapters for online sign-in`n- Unlock the personal Microsoft Account path in OOBE`n`nContinue?", "Personal Microsoft Account Setup", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+        if ($ans -ne [System.Windows.MessageBoxResult]::Yes) { return }
+
+        Write-HubLog "Unlocking Personal Microsoft Account (MSA) setup mode..." "WARN"
+        $res = Invoke-HubSetupPersonalAccount
+        foreach ($a in $res) { Write-HubLog "  $a" $(if ($a -like 'FAILED*') { 'ERROR' } else { 'INFO' }) }
+
+        $script:DeviceState = Get-DeviceEnrollmentState
+        Update-DeviceStateUi
+        Write-HubLog "Device state updated: $($script:DeviceState.Summary)" "INFO"
+        Write-HubLog "Personal MSA setup ready. In OOBE, choose 'Set up for personal use' and sign in with your Microsoft Account." "SUCCESS"
+        [System.Windows.MessageBox]::Show("Personal Microsoft Account mode configured!`n`nCorporate enrollment has been cleared and network is active.`nIn OOBE, select 'Set up for personal use' to sign in with your personal Microsoft Account.", "Personal MSA Unlocked", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+    }
+
     $skipAutopilotAction = {
         $ctx = $script:RuntimeContext
         if (-not $ctx.MeetsPreferred) {
@@ -8818,33 +9176,37 @@ function Start-AutopilotHubGui {
             return
         }
         $disableNet = [bool]$chkPersonalDisableNet.IsChecked -and $ctx.IsOobe
-        $plan = "- remove any cached Autopilot profile`n- flag Autopilot as disabled (IsAutopilotDisabled=1)`n- let OOBE continue without internet / with a local account (BypassNRO)`n" + $(if ($disableNet) { "- disable physical network adapters until you re-enable them`n" } else { '' })
+        $plan = "- remove cached Autopilot profiles & tenant policy cache`n- flag Autopilot as disabled (IsAutopilotDisabled=1)`n- unlock offline & personal account paths in OOBE (BypassNRO=1, HidePersonalAccountOption=0)`n" + $(if ($disableNet) { "- disable physical network adapters for offline local setup`n" } else { "- keep network active for Personal Microsoft Account (MSA)`n" })
         $msg = if ($ctx.IsOobe) {
-            "Finish this OOBE as a normal Windows - no Autopilot, no forced enrollment:`n`n$plan`nDo not connect to a network until you are past the account page.`n`nContinue?"
+            "Setup Windows without corporate Autopilot / work or school enrollment:`n`n$plan`nContinue?"
         } else {
-            "Autopilot only acts during OOBE, so there is nothing to skip on an installed system.`n`nTo use this on a fresh install: at the first OOBE screen press Shift+F10, run   irm $($script:BootstrapUrl) | iex   and click this button there, BEFORE connecting to a network.`n`nApply the (harmless) flags to this install anyway?`n`n$plan"
+            "Autopilot only acts during OOBE, so there is nothing to skip on an installed system.`n`nApply the flags anyway?`n`n$plan"
         }
-        $ans = [System.Windows.MessageBox]::Show($msg, "Skip Autopilot in OOBE", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+        $ans = [System.Windows.MessageBox]::Show($msg, "Skip Autopilot / Setup Mode", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
         if ($ans -ne [System.Windows.MessageBoxResult]::Yes) { return }
 
-        Write-HubLog "Applying Autopilot bypass so OOBE finishes as a normal Windows..." "WARN"
+        Write-HubLog "Applying Autopilot bypass so OOBE finishes without corporate enrollment..." "WARN"
         $res = Invoke-AutopilotBypass -DisableNetwork:$disableNet
         foreach ($a in $res.Actions) { Write-HubLog "  $a" $(if ($a -like 'FAILED*') { 'ERROR' } else { 'INFO' }) }
 
-        # Immediately refresh device state and update banner/header
         $script:DeviceState = Get-DeviceEnrollmentState
         Update-DeviceStateUi
         Write-HubLog "Device state updated: $($script:DeviceState.Summary)" "INFO"
 
         if ($ctx.IsOobe) {
-            Write-HubLog "Done. Close this window, continue OOBE and pick 'I don't have internet' / local account. If the build offers no offline option, run  start ms-cxh:localonly  from Shift+F10." "SUCCESS"
-            try { Start-Process 'ms-cxh:localonly' -ErrorAction Stop; Write-HubLog "Launched the local-account OOBE page (ms-cxh:localonly)." "INFO" } catch { }
+            if ($disableNet) {
+                Write-HubLog "Offline mode active. Close this window, continue OOBE and click 'I don't have internet' to create a local account." "SUCCESS"
+            } else {
+                Write-HubLog "Personal MSA mode active. Close this window and continue OOBE to sign in with your personal Microsoft Account." "SUCCESS"
+            }
         } else {
             Write-HubLog "Flags applied. Remember: this only matters during OOBE of a fresh install." "SUCCESS"
         }
     }
-    if ($btnPersonalInstall) { $btnPersonalInstall.Add_Click($skipAutopilotAction) }
-    if ($btnSkipAutopilot -and $btnSkipAutopilot -ne $btnPersonalInstall) { $btnSkipAutopilot.Add_Click($skipAutopilotAction) }
+
+    if ($btnPersonalInstall) { $btnPersonalInstall.Add_Click($personalMsaAction) }
+    if ($menuPersonalMsa)     { $menuPersonalMsa.Add_Click($personalMsaAction) }
+    if ($btnSkipAutopilot)    { $btnSkipAutopilot.Add_Click($skipAutopilotAction) }
 
     $btnReenableNet.Add_Click({
         if (-not $script:RuntimeContext.MeetsPreferred) {
@@ -9936,7 +10298,7 @@ function Start-AutopilotHubGui {
             Write-HubLog "Resume registration notice: $($_.Exception.Message)" "WARN"
         }
         Write-HubLog "Initiating system restart..." "WARN"
-        Restart-Computer -Force
+        Invoke-HubSystemReboot -Reason 'Autonomous System Restart'
     })
 
     $btnCopyLog.Add_Click({
@@ -10216,10 +10578,10 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
             } else {
                 if ($txtPowerStatus) { $txtPowerStatus.Text = "POWER: AC MAINS" }
                 if ($badgePower) {
-                    $badgePower.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#1F2822")
+                    $badgePower.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#DCFCE7")
                     $badgePower.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#2A5435")
                 }
-                if ($txtPowerStatus) { $txtPowerStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#6CCB5F") }
+                if ($txtPowerStatus) { $txtPowerStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#15803D") }
             }
         } catch {
             if ($txtPowerStatus) { $txtPowerStatus.Text = "POWER: ONLINE" }
@@ -10446,10 +10808,10 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
 
         if ($txtCascadeStatus) { $txtCascadeStatus.Text = "CASCADE ACTIVE" }
         if ($badgeCascadeStatus) {
-            $badgeCascadeStatus.Background = $brushConv.ConvertFromString("#182A3A")
-            $badgeCascadeStatus.BorderBrush = $brushConv.ConvertFromString("#234863")
+            $badgeCascadeStatus.Background = $brushConv.ConvertFromString("#E0F2FE")
+            $badgeCascadeStatus.BorderBrush = $brushConv.ConvertFromString("#BAE6FD")
         }
-        if ($txtCascadeStatus) { $txtCascadeStatus.Foreground = $brushConv.ConvertFromString("#60CDFF") }
+        if ($txtCascadeStatus) { $txtCascadeStatus.Foreground = $brushConv.ConvertFromString("#0284C7") }
         if ($txtCascadePassInfo) { $txtCascadePassInfo.Text = " (Pass $currPass of $maxPasses)" }
         if ($txtCascadeInstalled) { $txtCascadeInstalled.Text = " | $totalInstalled installed" }
         if ($txtWuStatus) { $txtWuStatus.Text = "Pass $($currPass): Scanning for Windows updates and drivers (async worker)..." }
@@ -10484,10 +10846,10 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                 if ($btnWuScan) { $btnWuScan.IsEnabled = $true }
                 if ($txtCascadeStatus) { $txtCascadeStatus.Text = "100% PATCHED" }
                 if ($badgeCascadeStatus) {
-                    $badgeCascadeStatus.Background = $brushConv.ConvertFromString("#1F2822")
-                    $badgeCascadeStatus.BorderBrush = $brushConv.ConvertFromString("#2A5435")
+                    $badgeCascadeStatus.Background = $brushConv.ConvertFromString("#DCFCE7")
+                    $badgeCascadeStatus.BorderBrush = $brushConv.ConvertFromString("#BBF7D0")
                 }
-                if ($txtCascadeStatus) { $txtCascadeStatus.Foreground = $brushConv.ConvertFromString("#6CCB5F") }
+                if ($txtCascadeStatus) { $txtCascadeStatus.Foreground = $brushConv.ConvertFromString("#15803D") }
                 if ($txtCascadeStateDetail) { $txtCascadeStateDetail.Text = "Zero updates pending. All security patches, quality updates, and hardware drivers are fully applied." }
                 if ($txtWuStatus) { $txtWuStatus.Text = "Cascade complete! System is 100% up to date. Total installed: $totalInstalled" }
                 if ($progWuBar) { $progWuBar.Value = 100 }
@@ -10619,7 +10981,7 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                         $found = $integratedWuItems | Where-Object { $_.Title -eq $res.Title -or ($_.RawItem -and $_.RawItem.UpdateID -eq $res.UpdateID) } | Select-Object -First 1
                         if ($found) {
                             $found.StatusText = $res.Status
-                            $found.StatusColor = if ($res.Code -eq 2 -or $res.Code -eq 3) { "#6CCB5F" } else { "#FF99A4" }
+                            $found.StatusColor = if ($res.Code -eq 2 -or $res.Code -eq 3) { "#15803D" } else { "#B91C1C" }
                         }
                     }
                     if ($lstIntegratedUpdates) { $lstIntegratedUpdates.Items.Refresh() }
@@ -10642,7 +11004,7 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
 
                         # Autonomous 5-second countdown to reboot - ZERO extra clicks!
                         Start-RebootCountdown -Seconds 5 -OnComplete {
-                            Restart-Computer -Force
+                            Invoke-HubSystemReboot -Reason 'Autonomous System Restart'
                         }
                     } else {
                         Clear-HubPatchCascadeState
@@ -10655,7 +11017,7 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                         if ($txtCascadeStatus) { $txtCascadeStatus.Text = "CASCADE COMPLETE" }
                         # Automatically reboot final time so updates commit without requiring user clicks
                         Start-RebootCountdown -Seconds 5 -OnComplete {
-                            Restart-Computer -Force
+                            Invoke-HubSystemReboot -Reason 'Autonomous System Restart'
                         }
                     }
                 } else {
@@ -10666,10 +11028,10 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                     if ($btnWuScan) { $btnWuScan.IsEnabled = $true }
                     if ($txtCascadeStatus) { $txtCascadeStatus.Text = "100% PATCHED" }
                     if ($badgeCascadeStatus) {
-                        $badgeCascadeStatus.Background = $brushConv.ConvertFromString("#1F2822")
-                        $badgeCascadeStatus.BorderBrush = $brushConv.ConvertFromString("#2A5435")
+                        $badgeCascadeStatus.Background = $brushConv.ConvertFromString("#DCFCE7")
+                        $badgeCascadeStatus.BorderBrush = $brushConv.ConvertFromString("#BBF7D0")
                     }
-                    if ($txtCascadeStatus) { $txtCascadeStatus.Foreground = $brushConv.ConvertFromString("#6CCB5F") }
+                    if ($txtCascadeStatus) { $txtCascadeStatus.Foreground = $brushConv.ConvertFromString("#15803D") }
                     if ($txtCascadeStateDetail) { $txtCascadeStateDetail.Text = "Zero updates pending. All security patches, quality updates, and hardware drivers are fully applied." }
                     if ($txtWuStatus) { $txtWuStatus.Text = "Cascade complete! System is 100% up to date. Total installed: $totalInstalled" }
                     Write-HubLog "Patch Cascade complete: Zero updates pending reboot. System is 100% up to date! Total installed: $totalInstalled" "SUCCESS"
@@ -10695,10 +11057,10 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
             if ($btnWuScan) { $btnWuScan.IsEnabled = $true }
             if ($txtCascadeStatus) { $txtCascadeStatus.Text = "CASCADE STOPPED" }
             if ($badgeCascadeStatus) {
-                $badgeCascadeStatus.Background = $brushConv.ConvertFromString("#2E2221")
-                $badgeCascadeStatus.BorderBrush = $brushConv.ConvertFromString("#542E2A")
+                $badgeCascadeStatus.Background = $brushConv.ConvertFromString("#FEE2E2")
+                $badgeCascadeStatus.BorderBrush = $brushConv.ConvertFromString("#FCA5A5")
             }
-            if ($txtCascadeStatus) { $txtCascadeStatus.Foreground = $brushConv.ConvertFromString("#FF99A4") }
+            if ($txtCascadeStatus) { $txtCascadeStatus.Foreground = $brushConv.ConvertFromString("#B91C1C") }
             if ($txtWuStatus) { $txtWuStatus.Text = "Cascade stopped. Saved cascade state cleared." }
             Write-HubLog "Autonomous Patch Cascade stopped and state cleared by operator." "INFO"
         })
@@ -10713,10 +11075,10 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
             if ($btnWuScan) { $btnWuScan.IsEnabled = $true }
             if ($txtCascadeStatus) { $txtCascadeStatus.Text = "CASCADE PAUSED" }
             if ($badgeCascadeStatus) {
-                $badgeCascadeStatus.Background = $brushConv.ConvertFromString("#332A15")
-                $badgeCascadeStatus.BorderBrush = $brushConv.ConvertFromString("#5C4B25")
+                $badgeCascadeStatus.Background = $brushConv.ConvertFromString("#FEF3C7")
+                $badgeCascadeStatus.BorderBrush = $brushConv.ConvertFromString("#FDE68A")
             }
-            if ($txtCascadeStatus) { $txtCascadeStatus.Foreground = $brushConv.ConvertFromString("#EAA300") }
+            if ($txtCascadeStatus) { $txtCascadeStatus.Foreground = $brushConv.ConvertFromString("#B45309") }
             if ($txtWuStatus) { $txtWuStatus.Text = "Restart cancelled. Autonomous cascade is paused." }
         })
     }
@@ -10799,7 +11161,7 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                 Write-HubLog "Resume registration notice: $($_.Exception.Message)" "WARN"
             }
             Start-RebootCountdown -Seconds 3 -OnComplete {
-                Restart-Computer -Force
+                Invoke-HubSystemReboot -Reason 'Autonomous System Restart'
             }
         })
     }
@@ -10920,7 +11282,7 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                         $found = $integratedWuItems | Where-Object { $_.Title -eq $res.Title -or ($_.RawItem -and $_.RawItem.UpdateID -eq $res.UpdateID) } | Select-Object -First 1
                         if ($found) {
                             $found.StatusText = $res.Status
-                            $found.StatusColor = if ($res.Code -eq 2 -or $res.Code -eq 3) { "#6CCB5F" } else { "#FF99A4" }
+                            $found.StatusColor = if ($res.Code -eq 2 -or $res.Code -eq 3) { "#15803D" } else { "#B91C1C" }
                         }
                     }
                     if ($lstIntegratedUpdates) { $lstIntegratedUpdates.Items.Refresh() }
@@ -10937,7 +11299,7 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                         if ($chkCascadeAutoReboot -and $chkCascadeAutoReboot.IsChecked) {
                             Start-RebootCountdown -Seconds 5 -OnComplete {
                                 Register-HubResumeAfterRestart
-                                Restart-Computer -Force
+                                Invoke-HubSystemReboot -Reason 'Autonomous System Restart'
                             }
                         }
                     }
