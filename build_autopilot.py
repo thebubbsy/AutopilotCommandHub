@@ -629,28 +629,54 @@ public class HubWinUtil {
 function Register-HubResumeAfterRestart {
     $ctx = $script:RuntimeContext
     $path = Save-HubSelfCopy
-    $argLine = Get-HubRelaunchArguments -ScriptPath $path -Resume
+    $argLine = Get-HubRelaunchArguments -ScriptPath $path -Resume -AllowBypass
     $hostExe = $ctx.HostPath
+    $targetDir = Split-Path $path -Parent
 
-    if ($ctx.IsOobe) {
-        # Strategy C: Native Windows Setup Hook (SetupComplete.cmd) for OOBE.
-        # Windows Setup executes SetupComplete.cmd natively under NT AUTHORITY\SYSTEM
-        # immediately after Windows Setup / OOBE finishes, before the user logon screen appears.
-        # EDRs explicitly whitelist C:\Windows\Setup\Scripts\ because it is a legitimate OEM/Microsoft setup mechanism.
+    # Generate standalone resume.cmd launcher in the persistence directory
+    # This guarantees execution policy bypass is invoked cleanly without process execution traps
+    $resumeCmdPath = Join-Path $targetDir 'resume.cmd'
+    $envCandidate = Join-Path $targetDir '.env'
+    $envArg = if (Test-Path $envCandidate) { " -EnvFile `"`"$envCandidate`"`"" } else { "" }
+    $cmdLine = "`"$hostExe`" -NoProfile -ExecutionPolicy Bypass -STA -File `"`"$path`"`"$envArg -ResumeFromRestart"
+    $cmdContent = "@echo off`r`nstart `"`" $cmdLine`r`n"
+    try {
+        [System.IO.File]::WriteAllText($resumeCmdPath, $cmdContent, [System.Text.UTF8Encoding]::new($false))
+    } catch { }
+
+    # Tier 1: HKLM RunOnce (Processed by Winlogon on interactive logon in BOTH OOBE and Desktop)
+    try {
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name $script:ResumeRunOnceName -Value "`"$resumeCmdPath`"" -Type String -Force -ErrorAction SilentlyContinue
+    } catch { }
+
+    # Tier 2: Interactive Scheduled Task
+    # Note: Setting a scheduled task to 'run whether user logged on or not' puts it in Session 0 (hidden desktop).
+    # GroupId 'BUILTIN\Administrators' ensures the interactive session triggers at logon with Highest privileges for
+    # defaultuser0 in OOBE and any administrator on the desktop.
+    try {
+        if (Get-Command New-ScheduledTaskAction -ErrorAction SilentlyContinue) {
+            $action    = New-ScheduledTaskAction -Execute $hostExe -Argument $argLine
+            $trigger   = New-ScheduledTaskTrigger -AtLogOn
+            $principal = New-ScheduledTaskPrincipal -GroupId "BUILTIN\Administrators" -RunLevel Highest
+            $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+            Register-ScheduledTask -TaskName $script:ResumeTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction SilentlyContinue | Out-Null
+        } elseif (Get-Command schtasks.exe -ErrorAction SilentlyContinue) {
+            $schCmd = "schtasks.exe /Create /TN `"$($script:ResumeTaskName)`" /TR `"`"$resumeCmdPath`"`" /SC ONLOGON /RL HIGHEST /F"
+            cmd.exe /c $schCmd 2>&1 | Out-Null
+        }
+    } catch { }
+
+    # Tier 3: Native Windows Setup Hook (SetupComplete.cmd)
+    # Serves as post-OOBE desktop transition fallback when Windows Setup completes
+    try {
         $setupDir = Join-Path $env:SystemRoot 'Setup\Scripts'
         if (-not (Test-Path $setupDir)) { New-Item -ItemType Directory -Path $setupDir -Force | Out-Null }
         $setupCompletePath = Join-Path $setupDir 'SetupComplete.cmd'
-
-        $envCandidate = Join-Path (Split-Path $path -Parent) '.env'
-        $envParam = if (Test-Path $envCandidate) { " -EnvFile `"`"$envCandidate`"`"" } else { "" }
-        $cmdLine = "`"$hostExe`" -NoProfile -STA -File `"`"$path`"`"$envParam -ResumeFromRestart"
-
         $hookBlock = "REM --- AutopilotCommandHub SetupComplete Hook ---`r`nstart `"`" $cmdLine`r`nREM --- End AutopilotCommandHub Hook ---"
 
         if (Test-Path $setupCompletePath) {
             $existing = Get-Content -Path $setupCompletePath -Raw -ErrorAction SilentlyContinue
             if ($existing -notlike '*AutopilotCommandHub*') {
-                # Prepend hook so OEM exit statements (e.g. exit /b 0) cannot bypass execution
                 $hasEchoOff = ($existing -match '(?i)^\s*@echo\s+off')
                 if ($hasEchoOff) {
                     $cleaned = $existing -replace '(?i)^\s*@echo\s+off\s*(\r?\n)?', ''
@@ -664,14 +690,7 @@ function Register-HubResumeAfterRestart {
             $newContent = "@echo off`r`n$hookBlock`r`n"
             [System.IO.File]::WriteAllText($setupCompletePath, $newContent, [System.Text.UTF8Encoding]::new($false))
         }
-    } else {
-        # Desktop interactive session: Scheduled Task executing from %ProgramFiles% without -ExecutionPolicy Bypass
-        $action  = New-ScheduledTaskAction -Execute $hostExe -Argument $argLine
-        $trigger = New-ScheduledTaskTrigger -AtLogOn
-        $principal = New-ScheduledTaskPrincipal -UserId $ctx.UserName -LogonType Interactive -RunLevel Highest
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
-        Register-ScheduledTask -TaskName $script:ResumeTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
-    }
+    } catch { }
 
     return $path
 }
@@ -679,7 +698,29 @@ function Register-HubResumeAfterRestart {
 function Unregister-HubResumeAfterRestart {
     $removed = $false
 
-    # 1. Clean up SetupComplete.cmd hook if present
+    # 1. Clean up HKLM RunOnce entry
+    try {
+        $ro = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name $script:ResumeRunOnceName -ErrorAction SilentlyContinue
+        if ($ro) {
+            Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name $script:ResumeRunOnceName -Force -ErrorAction SilentlyContinue
+            $removed = $true
+        }
+    } catch { }
+
+    # 2. Clean up Scheduled Task if present
+    try {
+        if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+            if (Get-ScheduledTask -TaskName $script:ResumeTaskName -ErrorAction SilentlyContinue) {
+                Unregister-ScheduledTask -TaskName $script:ResumeTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+                $removed = $true
+            }
+        } elseif (Get-Command schtasks.exe -ErrorAction SilentlyContinue) {
+            cmd.exe /c "schtasks.exe /Delete /TN `"$($script:ResumeTaskName)`" /F" 2>&1 | Out-Null
+            $removed = $true
+        }
+    } catch { }
+
+    # 3. Clean up SetupComplete.cmd hook if present
     try {
         $setupCompletePath = Join-Path $env:SystemRoot 'Setup\Scripts\SetupComplete.cmd'
         if (Test-Path $setupCompletePath) {
@@ -700,22 +741,13 @@ function Unregister-HubResumeAfterRestart {
         }
     } catch { }
 
-    # 2. Clean up Scheduled Task if present
+    # 4. Clean up resume.cmd launchers if present
     try {
-        if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
-            if (Get-ScheduledTask -TaskName $script:ResumeTaskName -ErrorAction SilentlyContinue) {
-                Unregister-ScheduledTask -TaskName $script:ResumeTaskName -Confirm:$false -ErrorAction Stop
-                $removed = $true
-            }
-        }
-    } catch { }
-
-    # 3. Clean up legacy RunOnce entry if present
-    try {
-        $ro = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name $script:ResumeRunOnceName -ErrorAction SilentlyContinue
-        if ($ro) {
-            Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name $script:ResumeRunOnceName -ErrorAction Stop
-            $removed = $true
+        foreach ($d in @($script:PersistRoot, $env:ProgramData, ([System.IO.Path]::GetTempPath()))) {
+            $cmdFile = Join-Path $d 'AutopilotCommandHub\resume.cmd'
+            if (Test-Path $cmdFile) { Remove-Item -Path $cmdFile -Force -ErrorAction SilentlyContinue }
+            $directCmd = Join-Path $d 'resume.cmd'
+            if (Test-Path $directCmd) { Remove-Item -Path $directCmd -Force -ErrorAction SilentlyContinue }
         }
     } catch { }
 
@@ -6418,6 +6450,26 @@ function Start-AutopilotHubGui {
             <Setter Property="FontSize" Value="11.5"/>
             <Setter Property="HasDropShadow" Value="True"/>
         </Style>
+        <!-- WinUI 3 Dark ContextMenu Style -->
+        <Style TargetType="ContextMenu">
+            <Setter Property="Background" Value="#242424"/>
+            <Setter Property="Foreground" Value="#FFFFFF"/>
+            <Setter Property="BorderBrush" Value="#383838"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="4,4"/>
+            <Setter Property="HasDropShadow" Value="True"/>
+        </Style>
+        <Style TargetType="MenuItem">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="#FFFFFF"/>
+            <Setter Property="Padding" Value="10,6"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Cursor" Value="Hand"/>
+        </Style>
+        <Style TargetType="Separator">
+            <Setter Property="Background" Value="#383838"/>
+            <Setter Property="Margin" Value="4,2"/>
+        </Style>
     </Window.Resources>
 
     <Grid Margin="18">
@@ -6426,7 +6478,7 @@ function Start-AutopilotHubGui {
             <RowDefinition Height="Auto"/> <!-- Telemetry Row -->
             <RowDefinition Height="*"/>    <!-- TabControl -->
             <RowDefinition Height="Auto"/> <!-- Progress Bar -->
-            <RowDefinition Height="170"/>  <!-- Console Log -->
+            <RowDefinition Name="RowConsoleLog" Height="150"/>  <!-- Console Log (collapsible) -->
         </Grid.RowDefinitions>
 
         <!-- HEADER BAR: row 0 = title + actions, row 1 = live status badges -->
@@ -6486,16 +6538,23 @@ function Start-AutopilotHubGui {
             </StackPanel>
 
             <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                <Button Name="BtnConnectGraph" Content="Sign In to Intune" Style="{StaticResource AccentBtn}" Margin="0,0,6,0"/>
-                <Button Name="BtnWindowsUpdate" Content="Windows Update" Margin="0,0,6,0" Style="{StaticResource AccentBtn}" ToolTip="Scan, download and install Windows Updates &amp; hardware drivers directly during OOBE Setup"/>
-                <Button Name="BtnLaunchEdge" Content="Edge / Portal" Margin="0,0,6,0" ToolTip="Launch Microsoft Edge to authenticate against staging dock captive portals"/>
-                <Button Name="BtnScreenshotUsb" Content="Capture Proof" Margin="0,0,6,0" ToolTip="Export a high-res staging proof screenshot directly to USB flash drive"/>
-                <Button Name="BtnToggleDpi" Content="Scale: 100%" Margin="0,0,6,0" ToolTip="Toggle High-DPI UI scaling between 100% and 125%"/>
-                <Button Name="BtnInstallPwsh" Content="Install PS7" Margin="0,0,6,0"
-                        ToolTip="Cause fuck Microsoft for still shipping Windows with the outta date garbage that is PowerShell 5.1."/>
-                <Button Name="BtnQuickCmd" Content="Cmd (Shift+F10)" ToolTip="Open a command prompt (same as Shift+F10 in OOBE)" Margin="0,0,6,0"/>
-                <Button Name="BtnTimeSync" Content="Sync Clock" Margin="0,0,6,0"/>
-                <Button Name="BtnReboot" Content="Restart System" Style="{StaticResource DestructiveBtn}"/>
+                <Button Name="BtnConnectGraph" Content="Sign In to Intune" Style="{StaticResource AccentBtn}" Margin="0,0,8,0" Padding="12,6" FontSize="11.5"/>
+                <Button Name="BtnToolsDropdown" Content="Actions [v]" Padding="12,6" FontSize="11.5" ToolTip="Quick Tools, Utilities, Shell &amp; Power Operations">
+                    <Button.ContextMenu>
+                        <ContextMenu Name="MenuTools">
+                            <MenuItem Name="MenuWindowsUpdate" Header="Windows Update &amp; Patch Cascade" FontWeight="SemiBold"/>
+                            <Separator/>
+                            <MenuItem Name="MenuLaunchEdge" Header="Edge Browser / Captive Portal"/>
+                            <MenuItem Name="MenuScreenshotUsb" Header="Capture Staging Proof (USB Screenshot)"/>
+                            <MenuItem Name="MenuToggleDpi" Header="Toggle UI Scaling (100% / 125%)"/>
+                            <MenuItem Name="MenuInstallPwsh" Header="Install PowerShell 7"/>
+                            <MenuItem Name="MenuQuickCmd" Header="Command Prompt (Shift+F10)"/>
+                            <MenuItem Name="MenuTimeSync" Header="Synchronize Clock (w32tm)"/>
+                            <Separator/>
+                            <MenuItem Name="MenuReboot" Header="Restart System Now" Foreground="#FFAA99" FontWeight="SemiBold"/>
+                        </ContextMenu>
+                    </Button.ContextMenu>
+                </Button>
             </StackPanel>
         </Grid>
 
@@ -7338,7 +7397,7 @@ function Start-AutopilotHubGui {
                 <Grid Margin="0,12,0,0">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="*"/>
-                        <RowDefinition Height="150"/>
+                        <RowDefinition Height="Auto"/>
                     </Grid.RowDefinitions>
 
                     <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto">
@@ -7471,11 +7530,18 @@ function Start-AutopilotHubGui {
                         </Grid>
                     </ScrollViewer>
 
-                    <!-- Tab-local output pane -->
-                    <Border Grid.Row="1" Background="#161616" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Margin="0,4,0,0">
-                        <ScrollViewer VerticalScrollBarVisibility="Auto">
-                            <TextBox Name="TxtHybOut" Background="Transparent" Foreground="#D0D0D0" BorderThickness="0" FontFamily="Consolas" FontSize="11.5" IsReadOnly="True" TextWrapping="Wrap" Padding="10" Text="Hybrid &amp; co-management tools. Elevated (SYSTEM/Administrator) is required for most actions - use Fix Privileges in the header."/>
-                        </ScrollViewer>
+                    <!-- Tab-local status bar -->
+                    <Border Grid.Row="1" Background="#1C1C1C" CornerRadius="3" BorderBrush="#2D2D2D" BorderThickness="1" Padding="8,4" Margin="0,6,0,0">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="HYBRID STATUS:" FontSize="10" FontWeight="Bold" Foreground="#60CDFF" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                            <TextBox Name="TxtHybOut" Grid.Column="1" Background="Transparent" Foreground="#D0D0D0" BorderThickness="0" FontFamily="Consolas" FontSize="11" IsReadOnly="True" TextWrapping="NoWrap" VerticalAlignment="Center" Text="Ready. Hybrid &amp; co-management tools initialized."/>
+                            <Button Name="BtnClearHybOut" Grid.Column="2" Content="Clear" FontSize="9.5" Padding="6,2" Margin="6,0,0,0"/>
+                        </Grid>
                     </Border>
                 </Grid>
             </TabItem>
@@ -7485,7 +7551,7 @@ function Start-AutopilotHubGui {
                 <Grid Margin="0,12,0,0">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="*"/>
-                        <RowDefinition Height="130"/>
+                        <RowDefinition Height="Auto"/>
                     </Grid.RowDefinitions>
                     <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto">
                         <Grid>
@@ -7608,26 +7674,17 @@ function Start-AutopilotHubGui {
                         </Grid>
                     </ScrollViewer>
 
-                    <!-- Tab-local log / tail pane -->
-                    <Border Grid.Row="1" Background="#161616" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Margin="0,4,0,0">
+                    <!-- Tab-local status bar -->
+                    <Border Grid.Row="1" Background="#1C1C1C" CornerRadius="3" BorderBrush="#2D2D2D" BorderThickness="1" Padding="8,4" Margin="0,6,0,0">
                         <Grid>
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto"/>
-                                <RowDefinition Height="*"/>
-                            </Grid.RowDefinitions>
-                            <Border Grid.Row="0" Background="#202020" Padding="6,3">
-                                <Grid>
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*"/>
-                                        <ColumnDefinition Width="Auto"/>
-                                    </Grid.ColumnDefinitions>
-                                    <TextBlock Text="INTUNEMANAGEMENTEXTENSION.LOG STREAM (LAST 100 LINES)" FontSize="10" FontWeight="SemiBold" Foreground="#8A8A8A" VerticalAlignment="Center"/>
-                                    <Button Name="BtnTailImeLog" Grid.Column="1" Content="Tail IME Log" Padding="6,2" FontSize="10"/>
-                                </Grid>
-                            </Border>
-                            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
-                                <TextBox Name="TxtImeLog" Background="Transparent" Foreground="#D0D0D0" BorderThickness="0" FontFamily="Consolas" FontSize="10.5" IsReadOnly="True" TextWrapping="Wrap" Padding="6" Text="Click 'Tail IME Log' to read the real-time Intune Management Extension agent log..."/>
-                            </ScrollViewer>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="IME LOG STREAM:" FontSize="10" FontWeight="Bold" Foreground="#60CDFF" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                            <TextBox Name="TxtImeLog" Grid.Column="1" Background="Transparent" Foreground="#D0D0D0" BorderThickness="0" FontFamily="Consolas" FontSize="10.5" IsReadOnly="True" TextWrapping="NoWrap" VerticalAlignment="Center" Text="Click 'Tail IME Log' to read the real-time Intune Management Extension agent log..."/>
+                            <Button Name="BtnTailImeLog" Grid.Column="2" Content="Tail IME Log" FontSize="9.5" Padding="8,2" Margin="6,0,0,0"/>
                         </Grid>
                     </Border>
                 </Grid>
@@ -7639,7 +7696,7 @@ function Start-AutopilotHubGui {
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="*"/>
-                        <RowDefinition Height="160"/>
+                        <RowDefinition Height="Auto"/>
                     </Grid.RowDefinitions>
 
                     <!-- Header Banner -->
@@ -7778,26 +7835,20 @@ function Start-AutopilotHubGui {
                         </Grid>
                     </ScrollViewer>
 
-                    <!-- Tab-local output console -->
-                    <Border Grid.Row="2" Background="#161616" CornerRadius="4" BorderBrush="#383838" BorderThickness="1" Margin="0,6,0,0">
+                    <!-- Tab-local status bar -->
+                    <Border Grid.Row="2" Background="#1C1C1C" CornerRadius="3" BorderBrush="#2D2D2D" BorderThickness="1" Padding="8,4" Margin="0,6,0,0">
                         <Grid>
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto"/>
-                                <RowDefinition Height="*"/>
-                            </Grid.RowDefinitions>
-                            <Border Grid.Row="0" Background="#202020" Padding="8,4">
-                                <Grid>
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*"/>
-                                        <ColumnDefinition Width="Auto"/>
-                                    </Grid.ColumnDefinitions>
-                                    <TextBlock Text="REMEDIATION EXECUTION CONSOLE" FontSize="10" FontWeight="SemiBold" Foreground="#8A8A8A" VerticalAlignment="Center"/>
-                                    <Button Name="BtnCopyFixLog" Grid.Column="1" Content="Copy Log" FontSize="10" Padding="6,2"/>
-                                </Grid>
-                            </Border>
-                            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
-                                <TextBox Name="TxtRemOut" Background="Transparent" Foreground="#D0D0D0" BorderThickness="0" FontFamily="Consolas" FontSize="11" IsReadOnly="True" TextWrapping="Wrap" Padding="8" Text="Enterprise Remediation Arsenal ready. Select a precision tool above to execute surgical OS recovery."/>
-                            </ScrollViewer>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="REMEDIATION STATUS:" FontSize="10" FontWeight="Bold" Foreground="#FFAA99" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                            <TextBox Name="TxtRemOut" Grid.Column="1" Background="Transparent" Foreground="#D0D0D0" BorderThickness="0" FontFamily="Consolas" FontSize="11" IsReadOnly="True" TextWrapping="NoWrap" VerticalAlignment="Center" Text="Enterprise Remediation Arsenal ready. Select a precision tool above to execute surgical OS recovery."/>
+                            <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="6,0,0,0">
+                                <Button Name="BtnClearRemOut" Content="Clear" FontSize="9.5" Padding="6,2" Margin="0,0,4,0"/>
+                                <Button Name="BtnCopyFixLog" Content="Copy" FontSize="9.5" Padding="6,2"/>
+                            </StackPanel>
                         </Grid>
                     </Border>
                 </Grid>
@@ -7816,7 +7867,7 @@ function Start-AutopilotHubGui {
             <TextBlock Name="TxtProgressStatus" Grid.Column="1" Text="Ready" FontSize="10.5" Foreground="#8A8A8A" Margin="8,0,0,0"/>
         </Grid>
 
-        <!-- LIVE LOG OUTPUT CONSOLE -->
+        <!-- LIVE LOG OUTPUT CONSOLE (COLLAPSIBLE) -->
         <Border Grid.Row="4" Background="#181818" CornerRadius="4" BorderBrush="#2B2B2B" BorderThickness="1" Padding="8">
             <Grid>
                 <Grid.RowDefinitions>
@@ -7826,13 +7877,15 @@ function Start-AutopilotHubGui {
 
                 <Grid Grid.Row="0" Margin="0,0,0,4">
                     <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
-                    <StackPanel Orientation="Horizontal">
-                        <TextBlock Text="SYSTEM AUDIT LOG" FontSize="10" FontWeight="SemiBold" Foreground="#777777"/>
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <TextBlock Text="SYSTEM AUDIT LOG" FontSize="10" FontWeight="SemiBold" Foreground="#777777" VerticalAlignment="Center"/>
+                        <Button Name="BtnToggleConsole" Content="[-] Hide Log" FontSize="9.5" Padding="6,2" Margin="10,0,0,0" ToolTip="Collapse or expand the system audit log console"/>
                     </StackPanel>
-                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                    <StackPanel Grid.Column="2" Orientation="Horizontal">
                         <Button Name="BtnCopyLog" Content="Copy Log" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnClearLog" Content="Clear" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnSaveLog" Content="Save Log..." FontSize="10" Padding="6,2"/>
@@ -7949,10 +8002,22 @@ function Start-AutopilotHubGui {
     $txtTenantBrand        = $window.FindName('TxtTenantBrand')
     $badgePower            = $window.FindName('BadgePower')
     $txtPowerStatus        = $window.FindName('TxtPowerStatus')
-    $btnLaunchEdge         = $window.FindName('BtnLaunchEdge')
-    $btnScreenshotUsb      = $window.FindName('BtnScreenshotUsb')
-    $btnToggleDpi          = $window.FindName('BtnToggleDpi')
-    $btnWindowsUpdate      = $window.FindName('BtnWindowsUpdate')
+    $btnToolsDropdown      = $window.FindName('BtnToolsDropdown')
+    $menuWindowsUpdate     = $window.FindName('MenuWindowsUpdate')
+    $menuLaunchEdge        = $window.FindName('MenuLaunchEdge')
+    $menuScreenshotUsb     = $window.FindName('MenuScreenshotUsb')
+    $menuToggleDpi         = $window.FindName('MenuToggleDpi')
+    $menuInstallPwsh       = $window.FindName('MenuInstallPwsh')
+    $menuQuickCmd          = $window.FindName('MenuQuickCmd')
+    $menuTimeSync          = $window.FindName('MenuTimeSync')
+    $menuReboot            = $window.FindName('MenuReboot')
+
+    # Aliases so existing event handlers and scripts work without modification
+    $btnWindowsUpdate      = if ($window.FindName('BtnWindowsUpdate')) { $window.FindName('BtnWindowsUpdate') } else { $menuWindowsUpdate }
+    $btnLaunchEdge         = if ($window.FindName('BtnLaunchEdge')) { $window.FindName('BtnLaunchEdge') } else { $menuLaunchEdge }
+    $btnScreenshotUsb      = if ($window.FindName('BtnScreenshotUsb')) { $window.FindName('BtnScreenshotUsb') } else { $menuScreenshotUsb }
+    $btnToggleDpi          = if ($window.FindName('BtnToggleDpi')) { $window.FindName('BtnToggleDpi') } else { $menuToggleDpi }
+    $btnInstallPwsh        = if ($window.FindName('BtnInstallPwsh')) { $window.FindName('BtnInstallPwsh') } else { $menuInstallPwsh }
     $mainTabControl        = $window.FindName('MainTabControl')
 
     # Additional Controls: Tab 4 Pre-Flight
@@ -8177,6 +8242,7 @@ function Start-AutopilotHubGui {
     # Tab 9: Precision Enterprise Remediation Arsenal Controls
     $btnFixHealthReadout = $window.FindName('BtnFixHealthReadout')
     $btnClearFixOut      = $window.FindName('BtnClearFixOut')
+    $btnClearRemOut      = $window.FindName('BtnClearRemOut')
     $btnCopyFixLog       = $window.FindName('BtnCopyFixLog')
     $txtRemOut           = $window.FindName('TxtRemOut')
     $btnFixWmi           = $window.FindName('BtnFixWmi')
@@ -8192,15 +8258,18 @@ function Start-AutopilotHubGui {
     $btnFixAppX          = $window.FindName('BtnFixAppX')
     $lstDiagStages     = $window.FindName('LstDiagStages')
 
+    $rowConsoleLog     = $window.FindName('RowConsoleLog')
+    $btnToggleConsole  = $window.FindName('BtnToggleConsole')
+    $btnClearHybOut    = $window.FindName('BtnClearHybOut')
     $hubProgressBar    = $window.FindName('HubProgressBar')
     $txtProgressStatus = $window.FindName('TxtProgressStatus')
     $txtHubLog         = $window.FindName('TxtHubLog')
     $btnCopyLog        = $window.FindName('BtnCopyLog')
     $btnClearLog       = $window.FindName('BtnClearLog')
     $btnSaveLog        = $window.FindName('BtnSaveLog')
-    $btnQuickCmd       = $window.FindName('BtnQuickCmd')
-    $btnTimeSync       = $window.FindName('BtnTimeSync')
-    $btnReboot         = $window.FindName('BtnReboot')
+    $btnQuickCmd       = if ($window.FindName('BtnQuickCmd')) { $window.FindName('BtnQuickCmd') } else { $menuQuickCmd }
+    $btnTimeSync       = if ($window.FindName('BtnTimeSync')) { $window.FindName('BtnTimeSync') } else { $menuTimeSync }
+    $btnReboot         = if ($window.FindName('BtnReboot')) { $window.FindName('BtnReboot') } else { $menuReboot }
 
     $txtDellServiceTag     = $window.FindName('TxtDellServiceTag')
     $btnDetectDellTag      = $window.FindName('BtnDetectDellTag')
@@ -9399,6 +9468,11 @@ function Start-AutopilotHubGui {
     $btnClearFixOut.Add_Click({
         $txtRemOut.Text = "Remediation console cleared. Ready for next diagnostic or surgical repair."
     })
+    if ($btnClearRemOut) {
+        $btnClearRemOut.Add_Click({
+            $txtRemOut.Text = "Remediation console cleared. Ready for next diagnostic or surgical repair."
+        })
+    }
 
     $btnCopyFixLog.Add_Click({
         try {
@@ -9712,8 +9786,12 @@ function Start-AutopilotHubGui {
             if (Test-Path $p) { $pwshPath = $p; break }
         }
     }
-    if ($pwshPath) {
-        $btnInstallPwsh.Content = "Launch PS7"
+    if ($pwshPath -and $btnInstallPwsh) {
+        if ($btnInstallPwsh -is [System.Windows.Controls.MenuItem]) {
+            $btnInstallPwsh.Header = "Launch PowerShell 7"
+        } else {
+            $btnInstallPwsh.Content = "Launch PS7"
+        }
     }
 
     $btnInstallPwsh.Add_Click({
@@ -9790,7 +9868,11 @@ function Start-AutopilotHubGui {
         if (Test-Path $targetPwsh) {
             Write-HubLog "PowerShell 7 installed successfully! Launching modern console..." "SUCCESS"
             Set-HubProgress -Percent 100 -Status "PS7 Ready"
-            $btnInstallPwsh.Content = "Launch PS7"
+            if ($btnInstallPwsh -is [System.Windows.Controls.MenuItem]) {
+                $btnInstallPwsh.Header = "Launch PowerShell 7"
+            } else {
+                $btnInstallPwsh.Content = "Launch PS7"
+            }
             Start-Process $targetPwsh
             [System.Windows.MessageBox]::Show("PowerShell 7 (pwsh) has been installed and launched.`n`nExecutable: $targetPwsh", "PowerShell 7 Ready", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
         } else {
@@ -9800,6 +9882,41 @@ function Start-AutopilotHubGui {
     })
 
     # Quick Utility Handlers
+    if ($btnToolsDropdown) {
+        $btnToolsDropdown.Add_Click({
+            if ($btnToolsDropdown.ContextMenu) {
+                $btnToolsDropdown.ContextMenu.PlacementTarget = $btnToolsDropdown
+                $btnToolsDropdown.ContextMenu.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
+                $btnToolsDropdown.ContextMenu.IsOpen = $true
+            }
+        })
+    }
+
+    $script:ConsoleExpanded = $true
+    if ($btnToggleConsole) {
+        $btnToggleConsole.Add_Click({
+            if ($script:ConsoleExpanded) {
+                $script:ConsoleExpanded = $false
+                if ($txtHubLog) { $txtHubLog.Visibility = [System.Windows.Visibility]::Collapsed }
+                if ($rowConsoleLog) { $rowConsoleLog.Height = [System.Windows.GridLength]::Auto }
+                $btnToggleConsole.Content = "[+] Show Log"
+                Write-HubLog "System audit log console collapsed." "INFO"
+            } else {
+                $script:ConsoleExpanded = $true
+                if ($txtHubLog) { $txtHubLog.Visibility = [System.Windows.Visibility]::Visible }
+                if ($rowConsoleLog) { $rowConsoleLog.Height = [System.Windows.GridLength]::new(150) }
+                $btnToggleConsole.Content = "[-] Hide Log"
+                Write-HubLog "System audit log console expanded." "INFO"
+            }
+        })
+    }
+
+    if ($btnClearHybOut) {
+        $btnClearHybOut.Add_Click({
+            if ($txtHybOut) { $txtHybOut.Text = "Ready." }
+        })
+    }
+
     $btnQuickCmd.Add_Click({
         Write-HubLog "Launching Shift+F10 Administrative Command Prompt..."
         Start-Process cmd.exe
@@ -10075,13 +10192,20 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
         $btnToggleDpi.Add_Click({
             if ($script:HubScale -eq 1.0) {
                 $script:HubScale = 1.25
-                $btnToggleDpi.Content = "Scale: 125%"
+                $lbl = "Toggle UI Scaling (125%)"
+                $btnContent = "Scale: 125%"
             } else {
                 $script:HubScale = 1.0
-                $btnToggleDpi.Content = "Scale: 100%"
+                $lbl = "Toggle UI Scaling (100%)"
+                $btnContent = "Scale: 100%"
+            }
+            if ($btnToggleDpi -is [System.Windows.Controls.MenuItem]) {
+                $btnToggleDpi.Header = $lbl
+            } else {
+                $btnToggleDpi.Content = $btnContent
             }
             $window.LayoutTransform = [System.Windows.Media.ScaleTransform]::new($script:HubScale, $script:HubScale)
-            Write-HubLog "UI Scaling set to $($btnToggleDpi.Content)" "INFO"
+            Write-HubLog "UI Scaling set to $($script:HubScale * 100)%" "INFO"
         })
     }
 
