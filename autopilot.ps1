@@ -863,8 +863,21 @@ function Invoke-HubSystemReboot {
             $argList = "/r /t $DelaySeconds /f /c `"$Reason`""
             $p = Start-Process -FilePath $shutdownExe -ArgumentList $argList -NoNewWindow -PassThru -ErrorAction SilentlyContinue
             if ($p) {
-                Write-HubLog "Initiated reboot via shutdown.exe /r /t $DelaySeconds /f" "SUCCESS"
-                return
+                $p.WaitForExit(2000)
+                if ($p.HasExited -and $p.ExitCode -ne 0 -and $p.ExitCode -ne 1190) {
+                    Write-HubLog "shutdown.exe with comment exited with code $($p.ExitCode), trying without comment..." "WARN"
+                    $p2 = Start-Process -FilePath $shutdownExe -ArgumentList "/r /t $DelaySeconds /f" -NoNewWindow -PassThru -ErrorAction SilentlyContinue
+                    if ($p2) {
+                        $p2.WaitForExit(2000)
+                        if (-not $p2.HasExited -or $p2.ExitCode -eq 0 -or $p2.ExitCode -eq 1190) {
+                            Write-HubLog "Initiated reboot via shutdown.exe /r /t $DelaySeconds /f" "SUCCESS"
+                            return
+                        }
+                    }
+                } else {
+                    Write-HubLog "Initiated reboot via shutdown.exe /r /t $DelaySeconds /f" "SUCCESS"
+                    return
+                }
             }
         }
     } catch {
@@ -899,10 +912,10 @@ public class Win32NativeShutdown {
         }
     } catch { }
 
-    # Tier 3: Invoke-HubSystemReboot -Reason 'Autonomous System Restart' fallback
+    # Tier 3: Restart-Computer -Force fallback
     try {
-        Invoke-HubSystemReboot -Reason 'Autonomous System Restart' -ErrorAction Stop
-        Write-HubLog "Initiated reboot via Invoke-HubSystemReboot -Reason 'Autonomous System Restart'" "SUCCESS"
+        Restart-Computer -Force -ErrorAction Stop
+        Write-HubLog "Initiated reboot via Restart-Computer -Force" "SUCCESS"
     } catch {
         Write-HubLog "Restart-Computer failed: $($_.Exception.Message)" "ERROR"
     }
@@ -9661,6 +9674,8 @@ function Start-AutopilotHubGui {
     $btnHybCoMgmtAllIntune.Add_Click({
         if (-not (Assert-HybElevated)) { return }
         Write-HybOut "Shifting ALL Co-Management workloads to Intune (Flags: 255)..." "WARN"
+                $__cm = [System.Windows.MessageBox]::Show("This writes the co-management workload flags to HKLM\SOFTWARE\Microsoft\CCM on THIS device only.`n`nCo-management authority is owned by the ConfigMgr co-management policy in your tenant. A local registry change is not the supported way to move a workload and will be overwritten by the client on its next policy cycle - in the meantime a workload can end up mis-applied. Use this for lab/diagnostic purposes, and set the real sliders in the Intune admin center.`n`nContinue anyway?", "Local Co-Management Override", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+        if ($__cm -ne [System.Windows.MessageBoxResult]::Yes) { Write-HybOut "Co-management change cancelled." "INFO"; return }
         $res = Set-CoManagementWorkloads -Preset AllIntune
         Write-HybOut "Workload authority updated: Preset $($res.Preset), Flags=$($res.FlagsValue). $($res.ConfigMgrMsg)" "SUCCESS"
         $c = Get-CoManagementState
@@ -9670,6 +9685,8 @@ function Start-AutopilotHubGui {
     $btnHybCoMgmtAllCcm.Add_Click({
         if (-not (Assert-HybElevated)) { return }
         Write-HybOut "Shifting ALL Co-Management workloads to ConfigMgr / SCCM (Flags: 1)..." "WARN"
+                $__cm = [System.Windows.MessageBox]::Show("This writes the co-management workload flags to HKLM\SOFTWARE\Microsoft\CCM on THIS device only.`n`nCo-management authority is owned by the ConfigMgr co-management policy in your tenant. A local registry change is not the supported way to move a workload and will be overwritten by the client on its next policy cycle - in the meantime a workload can end up mis-applied. Use this for lab/diagnostic purposes, and set the real sliders in the Intune admin center.`n`nContinue anyway?", "Local Co-Management Override", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+        if ($__cm -ne [System.Windows.MessageBoxResult]::Yes) { Write-HybOut "Co-management change cancelled." "INFO"; return }
         $res = Set-CoManagementWorkloads -Preset AllConfigMgr
         Write-HybOut "Workload authority updated: Preset $($res.Preset), Flags=$($res.FlagsValue). $($res.ConfigMgrMsg)" "SUCCESS"
         $c = Get-CoManagementState
@@ -9679,6 +9696,8 @@ function Start-AutopilotHubGui {
     $btnHybCoMgmtPilot.Add_Click({
         if (-not (Assert-HybElevated)) { return }
         Write-HybOut "Setting Co-Management Pilot workloads: Compliance + Client Apps (Flags: 67)..." "WARN"
+                $__cm = [System.Windows.MessageBox]::Show("This writes the co-management workload flags to HKLM\SOFTWARE\Microsoft\CCM on THIS device only.`n`nCo-management authority is owned by the ConfigMgr co-management policy in your tenant. A local registry change is not the supported way to move a workload and will be overwritten by the client on its next policy cycle - in the meantime a workload can end up mis-applied. Use this for lab/diagnostic purposes, and set the real sliders in the Intune admin center.`n`nContinue anyway?", "Local Co-Management Override", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+        if ($__cm -ne [System.Windows.MessageBoxResult]::Yes) { Write-HybOut "Co-management change cancelled." "INFO"; return }
         $res = Set-CoManagementWorkloads -Preset Pilot
         Write-HybOut "Workload authority updated: Preset $($res.Preset), Flags=$($res.FlagsValue). $($res.ConfigMgrMsg)" "SUCCESS"
         $c = Get-CoManagementState

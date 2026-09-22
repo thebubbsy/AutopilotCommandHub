@@ -869,8 +869,21 @@ function Invoke-HubSystemReboot {
             $argList = "/r /t $DelaySeconds /f /c `"$Reason`""
             $p = Start-Process -FilePath $shutdownExe -ArgumentList $argList -NoNewWindow -PassThru -ErrorAction SilentlyContinue
             if ($p) {
-                Write-HubLog "Initiated reboot via shutdown.exe /r /t $DelaySeconds /f" "SUCCESS"
-                return
+                $p.WaitForExit(2000)
+                if ($p.HasExited -and $p.ExitCode -ne 0 -and $p.ExitCode -ne 1190) {
+                    Write-HubLog "shutdown.exe with comment exited with code $($p.ExitCode), trying without comment..." "WARN"
+                    $p2 = Start-Process -FilePath $shutdownExe -ArgumentList "/r /t $DelaySeconds /f" -NoNewWindow -PassThru -ErrorAction SilentlyContinue
+                    if ($p2) {
+                        $p2.WaitForExit(2000)
+                        if (-not $p2.HasExited -or $p2.ExitCode -eq 0 -or $p2.ExitCode -eq 1190) {
+                            Write-HubLog "Initiated reboot via shutdown.exe /r /t $DelaySeconds /f" "SUCCESS"
+                            return
+                        }
+                    }
+                } else {
+                    Write-HubLog "Initiated reboot via shutdown.exe /r /t $DelaySeconds /f" "SUCCESS"
+                    return
+                }
             }
         }
     } catch {
@@ -905,10 +918,10 @@ public class Win32NativeShutdown {
         }
     } catch { }
 
-    # Tier 3: Invoke-HubSystemReboot -Reason 'Autonomous System Restart' fallback
+    # Tier 3: Restart-Computer -Force fallback
     try {
-        Invoke-HubSystemReboot -Reason 'Autonomous System Restart' -ErrorAction Stop
-        Write-HubLog "Initiated reboot via Invoke-HubSystemReboot -Reason 'Autonomous System Restart'" "SUCCESS"
+        Restart-Computer -Force -ErrorAction Stop
+        Write-HubLog "Initiated reboot via Restart-Computer -Force" "SUCCESS"
     } catch {
         Write-HubLog "Restart-Computer failed: $($_.Exception.Message)" "ERROR"
     }
@@ -934,9 +947,12 @@ function Invoke-HubCreateLocalUser {
 
     $created = $false
     try {
-        $passVal = if ($Password) { $Password } else { '' }
-        $secPass = ConvertTo-SecureString $passVal -AsPlainText -Force
-        New-LocalUser -Name $cleanName -Password $secPass -FullName $FullName -Description "Created via Autopilot Command Hub" -PasswordNeverExpires:$PasswordNeverExpires -ErrorAction Stop | Out-Null
+        if (-not [string]::IsNullOrEmpty($Password)) {
+            $secPass = ConvertTo-SecureString $Password -AsPlainText -Force
+            New-LocalUser -Name $cleanName -Password $secPass -FullName $FullName -Description "Created via Autopilot Command Hub" -PasswordNeverExpires:$PasswordNeverExpires -ErrorAction Stop | Out-Null
+        } else {
+            New-LocalUser -Name $cleanName -NoPassword -FullName $FullName -Description "Created via Autopilot Command Hub" -PasswordNeverExpires:$PasswordNeverExpires -ErrorAction Stop | Out-Null
+        }
         $created = $true
         $actions.Add("Created local user account '$cleanName' via New-LocalUser")
     } catch {
@@ -990,7 +1006,19 @@ function Invoke-HubCreateLocalUser {
         $actions.Add("Set UnattendCreatedUser=1 in OOBE setup registry")
         if ($SkipRemainingOobe) {
             Set-ItemProperty -Path $setupKey -Name 'OOBEInProgress' -Value 0 -Type DWord -ErrorAction SilentlyContinue
-            $actions.Add("Set OOBEInProgress=0 to bypass remaining setup screens")
+            $actions.Add("Set OOBE\OOBEInProgress=0 to bypass remaining setup screens")
+        }
+    } catch { }
+
+    try {
+        $sysSetupKey = 'HKLM:\SYSTEM\Setup'
+        if (Test-Path $sysSetupKey) {
+            if ($SkipRemainingOobe) {
+                Set-ItemProperty -Path $sysSetupKey -Name 'OOBEInProgress' -Value 0 -Type DWord -ErrorAction SilentlyContinue
+                Set-ItemProperty -Path $sysSetupKey -Name 'SetupPhase' -Value 0 -Type DWord -ErrorAction SilentlyContinue
+                Set-ItemProperty -Path $sysSetupKey -Name 'SystemSetupInProgress' -Value 0 -Type DWord -ErrorAction SilentlyContinue
+                $actions.Add("Configured SYSTEM\Setup (OOBEInProgress=0, SetupPhase=0) to complete setup")
+            }
         }
     } catch { }
 
@@ -1119,8 +1147,14 @@ function Show-CreateLocalUserDialog {
             $res = Invoke-HubCreateLocalUser -UserName $uName -Password $pass -FullName $txtFull.Text.Trim() -MakeAdmin:([bool]$chkAdm.IsChecked) -PasswordNeverExpires:([bool]$chkExp.IsChecked) -SkipRemainingOobe:([bool]$chkOobe.IsChecked)
             foreach ($act in $res.Actions) { Write-HubLog "  $act" "INFO" }
             Write-HubLog "Local user '$uName' successfully created (Admin: $([bool]$chkAdm.IsChecked))." "SUCCESS"
-            [System.Windows.MessageBox]::Show("Local user account '$uName' created successfully!`n`nRole: $(if ($chkAdm.IsChecked) { 'Administrator' } else { 'Standard User' })`nPassword: $(if ($pass) { 'Configured' } else { 'None (blank)' })`n`nYou can now log in with this account or continue Windows Setup.", "User Created", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+            $roleStr = if ($chkAdm.IsChecked) { 'Administrator' } else { 'Standard User' }
+            $passStr = if ($pass) { 'Configured' } else { 'None (blank)' }
+            $promptRestart = [System.Windows.MessageBox]::Show("Local user account '$uName' created successfully!`n`nRole: $roleStr`nPassword: $passStr`n`nWould you like to restart the system now to log in immediately?", "User Created - Restart Now?", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
             $dlg.Close()
+            if ($promptRestart -eq [System.Windows.MessageBoxResult]::Yes) {
+                Write-HubLog "Operator opted to reboot into new user account '$uName'..." "WARN"
+                Invoke-HubSystemReboot -Reason "First logon for local user $uName" -DelaySeconds 0
+            }
         } catch {
             Write-HubLog "Failed to create local user '$uName': $($_.Exception.Message)" "ERROR"
             [System.Windows.MessageBox]::Show("Failed to create user account '$uName':`n$($_.Exception.Message)", "Creation Failed", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
@@ -9667,6 +9701,8 @@ function Start-AutopilotHubGui {
     $btnHybCoMgmtAllIntune.Add_Click({
         if (-not (Assert-HybElevated)) { return }
         Write-HybOut "Shifting ALL Co-Management workloads to Intune (Flags: 255)..." "WARN"
+                $__cm = [System.Windows.MessageBox]::Show("This writes the co-management workload flags to HKLM\SOFTWARE\Microsoft\CCM on THIS device only.`n`nCo-management authority is owned by the ConfigMgr co-management policy in your tenant. A local registry change is not the supported way to move a workload and will be overwritten by the client on its next policy cycle - in the meantime a workload can end up mis-applied. Use this for lab/diagnostic purposes, and set the real sliders in the Intune admin center.`n`nContinue anyway?", "Local Co-Management Override", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+        if ($__cm -ne [System.Windows.MessageBoxResult]::Yes) { Write-HybOut "Co-management change cancelled." "INFO"; return }
         $res = Set-CoManagementWorkloads -Preset AllIntune
         Write-HybOut "Workload authority updated: Preset $($res.Preset), Flags=$($res.FlagsValue). $($res.ConfigMgrMsg)" "SUCCESS"
         $c = Get-CoManagementState
@@ -9676,6 +9712,8 @@ function Start-AutopilotHubGui {
     $btnHybCoMgmtAllCcm.Add_Click({
         if (-not (Assert-HybElevated)) { return }
         Write-HybOut "Shifting ALL Co-Management workloads to ConfigMgr / SCCM (Flags: 1)..." "WARN"
+                $__cm = [System.Windows.MessageBox]::Show("This writes the co-management workload flags to HKLM\SOFTWARE\Microsoft\CCM on THIS device only.`n`nCo-management authority is owned by the ConfigMgr co-management policy in your tenant. A local registry change is not the supported way to move a workload and will be overwritten by the client on its next policy cycle - in the meantime a workload can end up mis-applied. Use this for lab/diagnostic purposes, and set the real sliders in the Intune admin center.`n`nContinue anyway?", "Local Co-Management Override", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+        if ($__cm -ne [System.Windows.MessageBoxResult]::Yes) { Write-HybOut "Co-management change cancelled." "INFO"; return }
         $res = Set-CoManagementWorkloads -Preset AllConfigMgr
         Write-HybOut "Workload authority updated: Preset $($res.Preset), Flags=$($res.FlagsValue). $($res.ConfigMgrMsg)" "SUCCESS"
         $c = Get-CoManagementState
@@ -9685,6 +9723,8 @@ function Start-AutopilotHubGui {
     $btnHybCoMgmtPilot.Add_Click({
         if (-not (Assert-HybElevated)) { return }
         Write-HybOut "Setting Co-Management Pilot workloads: Compliance + Client Apps (Flags: 67)..." "WARN"
+                $__cm = [System.Windows.MessageBox]::Show("This writes the co-management workload flags to HKLM\SOFTWARE\Microsoft\CCM on THIS device only.`n`nCo-management authority is owned by the ConfigMgr co-management policy in your tenant. A local registry change is not the supported way to move a workload and will be overwritten by the client on its next policy cycle - in the meantime a workload can end up mis-applied. Use this for lab/diagnostic purposes, and set the real sliders in the Intune admin center.`n`nContinue anyway?", "Local Co-Management Override", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+        if ($__cm -ne [System.Windows.MessageBoxResult]::Yes) { Write-HybOut "Co-management change cancelled." "INFO"; return }
         $res = Set-CoManagementWorkloads -Preset Pilot
         Write-HybOut "Workload authority updated: Preset $($res.Preset), Flags=$($res.FlagsValue). $($res.ConfigMgrMsg)" "SUCCESS"
         $c = Get-CoManagementState
