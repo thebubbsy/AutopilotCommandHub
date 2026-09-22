@@ -41,7 +41,7 @@ def test_xaml_playbook_hud():
 
     # Check buttons
     buttons = [elem.attrib.get('Name', '') for elem in tree.iter() if elem.tag.endswith('Button')]
-    expected_playbook_buttons = ['BtnPlaybookRun', 'BtnPlaybookPause', 'BtnPlaybookStop']
+    expected_playbook_buttons = ['BtnPlaybookRun', 'BtnPlaybookPause', 'BtnPlaybookStop', 'BtnPlaybookDownloadCsv']
     for b in expected_playbook_buttons:
         assert b in buttons, f"Playbook button {b} missing from XAML!"
 
@@ -57,7 +57,7 @@ def test_xaml_playbook_hud():
     print(f"  Discovered Tabs ({len(tab_headers)}): {tab_headers}")
     assert len(tab_headers) == 9, f"Expected 9 tabs, got {len(tab_headers)}"
 
-    print("  [PASS] Playbook HUD, all 3 controls, 5 routines, and 9 tabs verified in XAML.")
+    print("  [PASS] Playbook HUD, all 4 controls (including Download CSV), 5 routines, and 9 tabs verified in XAML.")
 
 def test_playbook_code_coverage():
     print("\n--- Test 2: Playbook Multi-Tab & Button Coverage ---")
@@ -139,9 +139,10 @@ def test_headless_playbook_execution():
         res = subprocess.run(['pwsh', '-ExecutionPolicy', 'Bypass', '-Command', ps_code], capture_output=True, encoding='utf-8', errors='replace')
         assert res.returncode == 0, f"Routine '{routine}' failed with exit code {res.returncode}:\n{res.stderr}"
         assert "completed successfully across all 9 tabs" in res.stdout, f"Routine '{routine}' did not report success across all 9 tabs:\n{res.stdout}"
+        assert "[PLAYBOOK CSV] Audit report exported to:" in res.stdout, f"Routine '{routine}' missing CSV export line in output:\n{res.stdout}"
         for tab_num in range(1, 10):
             assert f"Tab {tab_num}/9:" in res.stdout, f"Routine '{routine}' missing Tab {tab_num}/9 in output!"
-        print(f"    [PASS] '{routine}' completed cleanly across all 9 tabs.")
+        print(f"    [PASS] '{routine}' completed cleanly across all 9 tabs with CSV exported.")
 
 def test_powershell51_ast():
     print("\n--- Test 4: PowerShell 5.1 AST Syntax Integrity ---")

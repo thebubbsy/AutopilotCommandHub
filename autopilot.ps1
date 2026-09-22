@@ -4185,6 +4185,105 @@ function Export-AutopilotCsv {
     }
 }
 
+# --- Function: Protect-HubCsvRecords (CSV formula-injection hardening) ---
+function Protect-HubCsvRecords {
+    param([Parameter(Mandatory = $true)][array]$Records)
+    $dangerous = @('=', '+', '-', '@', "`t", "`r", "`n")
+    $safe = foreach ($rec in $Records) {
+        $ordered = [ordered]@{}
+        foreach ($prop in $rec.PSObject.Properties) {
+            $val = $prop.Value
+            if ($val -is [string] -and $val.Length -gt 0 -and ($dangerous -contains $val[0].ToString())) {
+                $val = "'" + $val
+            }
+            $ordered[$prop.Name] = $val
+        }
+        [PSCustomObject]$ordered
+    }
+    return @($safe)
+}
+
+# --- Function: Export-HubPlaybookCsv (Deployment Playbook Audit Trail Exporter) ---
+function Export-HubPlaybookCsv {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [array]$Records,
+        [string]$RoutineName = 'Playbook',
+        [string]$Path = '',
+        [switch]$AutoDetectUsb
+    )
+
+    if (-not $Records -or $Records.Count -eq 0) {
+        return [PSCustomObject]@{ Success = $false; Message = 'No playbook execution records provided.' }
+    }
+
+    $cleanRoutine = ($RoutineName -replace '[^\w\-]', '_').Trim('_')
+    $serial = try {
+        if ($script:DeviceState -and $script:DeviceState.SerialNumber) {
+            $script:DeviceState.SerialNumber
+        } else {
+            (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber
+        }
+    } catch { 'UNKNOWN' }
+    if ([string]::IsNullOrWhiteSpace($serial)) { $serial = $env:COMPUTERNAME }
+
+    $timestamp = [datetime]::Now.ToString('yyyyMMdd_HHmmss')
+    $csvFileName = "Playbook_${cleanRoutine}_${serial}_${timestamp}.csv"
+
+    $targetPath = $Path
+
+    # Priority 1: Check detected USB flash drive
+    if ([string]::IsNullOrWhiteSpace($targetPath) -or $AutoDetectUsb) {
+        try {
+            $usbDrives = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType = 2" -ErrorAction SilentlyContinue
+            foreach ($d in $usbDrives) {
+                if (Test-Path "$($d.DeviceID)\") {
+                    $pbDir = Join-Path -Path "$($d.DeviceID)\" -ChildPath "Autopilot_Playbooks"
+                    if (-not (Test-Path $pbDir)) { New-Item -ItemType Directory -Path $pbDir -Force | Out-Null }
+                    $targetPath = Join-Path -Path $pbDir -ChildPath $csvFileName
+                    break
+                }
+            }
+        } catch { }
+    }
+
+    # Priority 2: Check local AutopilotLogs path, Desktop, or Temp
+    if ([string]::IsNullOrWhiteSpace($targetPath)) {
+        $logDir = "C:\AutopilotLogs\Playbooks"
+        try {
+            if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+            $targetPath = Join-Path -Path $logDir -ChildPath $csvFileName
+        } catch {
+            $desktop = [Environment]::GetFolderPath('Desktop')
+            if ($desktop -and (Test-Path $desktop)) {
+                $targetPath = Join-Path -Path $desktop -ChildPath $csvFileName
+            } else {
+                $targetPath = Join-Path -Path $env:TEMP -ChildPath $csvFileName
+            }
+        }
+    }
+
+    try {
+        $targetDir = Split-Path -Path $targetPath -Parent
+        if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+
+        (Protect-HubCsvRecords -Records $Records) | Export-Csv -LiteralPath $targetPath -NoTypeInformation -Encoding UTF8
+        return [PSCustomObject]@{
+            Success  = $true
+            Path     = $targetPath
+            FileName = [System.IO.Path]::GetFileName($targetPath)
+            Count    = $Records.Count
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Success = $false
+            Path    = $targetPath
+            Message = $_.Exception.Message
+        }
+    }
+}
+
 # --- Helper: Get-GraphErrorMessage ---
 function Get-GraphErrorMessage {
     param([Parameter(Mandatory=$true)]$ErrorRecord)
@@ -6379,14 +6478,48 @@ function Invoke-HeadlessActionRoutine {
         }
     }
 
+    $headlessLogEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
+
     function Invoke-HeadlessStep {
         param([string]$Label, [scriptblock]$Work)
         Write-Host $Label -ForegroundColor White
+        $stepStart = [datetime]::Now
+        $stepStatus = 'Success'
+        $stepErr = ''
         try {
             & $Work
         } catch {
+            $stepStatus = 'Warning'
+            $stepErr = $_.Exception.Message
             Write-Host "  [WARN] Step failed, continuing: $($_.Exception.Message)" -ForegroundColor Yellow
         }
+        $duration = [math]::Round(([datetime]::Now - $stepStart).TotalSeconds, 2)
+
+        $tabName = 'General'
+        $actionName = $Label
+        if ($Label -match '^\[Tab\s+\d+/\d+:\s*([^\]]+)\]\s*(.*)$') {
+            $tabName = $Matches[1].Trim()
+            $actionName = $Matches[2].Trim()
+        }
+
+        $serial = try { if ($script:DeviceState -and $script:DeviceState.SerialNumber) { $script:DeviceState.SerialNumber } else { (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber } } catch { 'UNKNOWN' }
+        $mfg = try { if ($script:DeviceState -and $script:DeviceState.Manufacturer) { $script:DeviceState.Manufacturer } else { (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Manufacturer } } catch { 'UNKNOWN' }
+        $model = try { if ($script:DeviceState -and $script:DeviceState.Model) { $script:DeviceState.Model } else { (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Model } } catch { 'UNKNOWN' }
+
+        $headlessLogEntries.Add([PSCustomObject]@{
+            Timestamp    = $stepStart.ToString('yyyy-MM-dd HH:mm:ss')
+            ComputerName = $env:COMPUTERNAME
+            SerialNumber = $serial
+            Manufacturer = $mfg
+            Model        = $model
+            Playbook     = $RoutineName
+            Step         = $headlessLogEntries.Count + 1
+            TabName      = $tabName
+            ActionName   = $actionName
+            Status       = $stepStatus
+            DurationSec  = $duration
+            Details      = $stepErr
+        })
     }
 
     switch -Wildcard ($RoutineName) {
@@ -6636,6 +6769,14 @@ function Invoke-HeadlessActionRoutine {
         }
     }
     Write-Host "`n[DONE] Playbook '$RoutineName' completed successfully across all 9 tabs!" -ForegroundColor Green
+    if ($headlessLogEntries -and $headlessLogEntries.Count -gt 0) {
+        $exportRes = Export-HubPlaybookCsv -Records $headlessLogEntries -RoutineName $RoutineName -AutoDetectUsb
+        if ($exportRes.Success) {
+            Write-Host "[PLAYBOOK CSV] Audit report exported to: $($exportRes.Path)" -ForegroundColor Green
+        } else {
+            Write-Host "[PLAYBOOK CSV] Export note: $($exportRes.Message)" -ForegroundColor Yellow
+        }
+    }
 }
 
 # ==============================================================================
@@ -7318,7 +7459,8 @@ function Start-AutopilotHubGui {
                 <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,10,0">
                     <Button Name="BtnPlaybookRun" Content="[&#x25B6; Run Playbook]" Style="{StaticResource AccentBtn}" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" ToolTip="Start the selected automated click-through playbook"/>
                     <Button Name="BtnPlaybookPause" Content="[&#x23F8; Pause]" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" IsEnabled="False" ToolTip="Pause or resume current playbook execution"/>
-                    <Button Name="BtnPlaybookStop" Content="[&#x23F9; Stop]" Style="{StaticResource DestructiveBtn}" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,8,0" IsEnabled="False" ToolTip="Abort current playbook execution"/>
+                    <Button Name="BtnPlaybookStop" Content="[&#x23F9; Stop]" Style="{StaticResource DestructiveBtn}" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" IsEnabled="False" ToolTip="Abort current playbook execution"/>
+                    <Button Name="BtnPlaybookDownloadCsv" Content="[v] Download CSV" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,8,0" IsEnabled="False" ToolTip="Download and save the Playbook audit log and step results as a CSV spreadsheet"/>
                 </StackPanel>
 
                 <!-- Right: Current Step Indicator Status -->
@@ -8801,6 +8943,7 @@ function Start-AutopilotHubGui {
     $btnPlaybookRun        = $window.FindName('BtnPlaybookRun')
     $btnPlaybookPause      = $window.FindName('BtnPlaybookPause')
     $btnPlaybookStop       = $window.FindName('BtnPlaybookStop')
+    $btnPlaybookDownloadCsv = $window.FindName('BtnPlaybookDownloadCsv')
     $txtPlaybookStep       = $window.FindName('TxtPlaybookStep')
     $playbookProgressBar   = $window.FindName('PlaybookProgressBar')
 
@@ -13814,6 +13957,10 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
         $script:PlaybookState.IsPaused = $false
         $script:PlaybookState.CancelRequested = $false
         $script:PlaybookState.TotalSteps = $steps.Count
+        $stepLogEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
+        $serial = try { if ($script:DeviceState -and $script:DeviceState.SerialNumber) { $script:DeviceState.SerialNumber } else { (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber } } catch { 'UNKNOWN' }
+        $mfg = try { if ($script:DeviceState -and $script:DeviceState.Manufacturer) { $script:DeviceState.Manufacturer } else { (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Manufacturer } } catch { 'UNKNOWN' }
+        $model = try { if ($script:DeviceState -and $script:DeviceState.Model) { $script:DeviceState.Model } else { (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Model } } catch { 'UNKNOWN' }
 
         $btnPlaybookRun.IsEnabled = $false
         $btnPlaybookPause.IsEnabled = $true
@@ -13888,6 +14035,9 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                 }
 
                 # 5. Execute Action
+                $stepStartTime = [datetime]::Now
+                $stepStatus = 'Success'
+                $stepDetails = ''
                 try {
                     if ($step.Action) {
                         & $step.Action
@@ -13895,6 +14045,8 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                         $step.Button.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
                     }
                 } catch {
+                    $stepStatus = 'Failed'
+                    $stepDetails = $_.Exception.Message
                     Write-HubLog "Playbook error in step '$($step.ActionName)': $($_.Exception.Message)" "WARN"
                 }
 
@@ -13927,6 +14079,25 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                     $activeButton = $null
                     $origBg = $null
                 }
+
+                $stepDuration = [math]::Round(([datetime]::Now - $stepStartTime).TotalSeconds, 2)
+                $btnName = if ($step.Button -and $step.Button.Name) { $step.Button.Name } else { 'DirectAction' }
+                $stepLogEntries.Add([PSCustomObject]@{
+                    Timestamp    = $stepStartTime.ToString('yyyy-MM-dd HH:mm:ss')
+                    ComputerName = $env:COMPUTERNAME
+                    SerialNumber = $serial
+                    Manufacturer = $mfg
+                    Model        = $model
+                    Playbook     = $RoutineName
+                    Step         = $stepNum
+                    TotalSteps   = $steps.Count
+                    TabName      = $step.TabName
+                    ActionName   = $step.ActionName
+                    Button       = $btnName
+                    Status       = $stepStatus
+                    DurationSec  = $stepDuration
+                    Details      = $stepDetails
+                })
                 Update-WpfUI
             }
         } finally {
@@ -13944,16 +14115,39 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
             $btnPlaybookStop.IsEnabled = $false
             $cboPlaybookRoutine.IsEnabled = $true
 
+            $exportRes = $null
+            if ($stepLogEntries -and $stepLogEntries.Count -gt 0) {
+                $script:LastPlaybookExecutionRecords = $stepLogEntries
+                $script:LastPlaybookRoutineName = $RoutineName
+                $exportRes = Export-HubPlaybookCsv -Records $stepLogEntries -RoutineName $RoutineName -AutoDetectUsb
+                if ($exportRes.Success) {
+                    $script:LastPlaybookCsvPath = $exportRes.Path
+                    $btnPlaybookDownloadCsv.IsEnabled = $true
+                    $btnPlaybookDownloadCsv.ToolTip = "Download or export the playbook audit CSV (Auto-saved to: $($exportRes.Path))"
+                    Write-HubLog "Playbook CSV audit log saved to: $($exportRes.Path)" "SUCCESS"
+                }
+            }
+
             if ($script:PlaybookState.CancelRequested) {
-                $txtPlaybookStep.Text = "Playbook stopped by operator."
+                $txtPlaybookStep.Text = "Playbook stopped by operator. (Click '[v] Download CSV' to save audit report)"
                 Write-HubLog "Playbook '$RoutineName' stopped." "WARN"
                 Set-HubProgress -Percent 0 -Status "Playbook Aborted"
             } else {
-                $txtPlaybookStep.Text = "Playbook '$RoutineName' completed successfully! (All steps finished)"
+                $txtPlaybookStep.Text = "Playbook '$RoutineName' completed! (Click '[v] Download CSV' to save audit report)"
                 $playbookProgressBar.Value = 100
                 Write-HubLog "Playbook '$RoutineName' completed successfully across all tabs!" "SUCCESS"
                 Set-HubProgress -Percent 100 -Status "Playbook Complete"
                 try { Play-HubAudio -Type Success } catch { }
+
+                if ($exportRes -and $exportRes.Success) {
+                    try {
+                        $csvMsg = "Playbook '$RoutineName' has finished executing all $($stepLogEntries.Count) coordinated steps!`n`nPlaybook CSV audit report saved to:`n$($exportRes.Path)`n`nWould you like to download / save a copy to another destination (e.g. USB flash drive)?"
+                        $ans = [System.Windows.MessageBox]::Show($csvMsg, "Playbook Complete - Download CSV", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Information)
+                        if ($ans -eq [System.Windows.MessageBoxResult]::Yes) {
+                            Save-HubPlaybookCsvDialog -Owner $window
+                        }
+                    } catch { }
+                }
             }
             Update-WpfUI
         }
@@ -14003,6 +14197,52 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
             $txtPlaybookStep.Text = "Stopping playbook..."
         }
     })
+
+    # --- Helper: Save-HubPlaybookCsvDialog (Export / Download Playbook CSV) ---
+    function Save-HubPlaybookCsvDialog {
+        param($Owner)
+        if (-not $script:LastPlaybookExecutionRecords -or $script:LastPlaybookExecutionRecords.Count -eq 0) {
+            [System.Windows.MessageBox]::Show("No playbook has been executed yet in this session. Run an action playbook first to generate audit data.", "No Playbook Data", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+            return
+        }
+
+        $sfd = [Microsoft.Win32.SaveFileDialog]::new()
+        $sfd.Title = "Download Playbook Execution CSV Report"
+        $sfd.Filter = "CSV Spreadsheet (*.csv)|*.csv|All Files (*.*)|*.*"
+        $cleanRoutine = ($script:LastPlaybookRoutineName -replace '[^\w\-]', '_').Trim('_')
+        $serial = try { if ($script:DeviceState -and $script:DeviceState.SerialNumber) { $script:DeviceState.SerialNumber } else { (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber } } catch { 'UNKNOWN' }
+        $sfd.FileName = "Playbook_${cleanRoutine}_${serial}_$([datetime]::Now.ToString('yyyyMMdd_HHmmss')).csv"
+
+        try {
+            $usbDrives = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType = 2" -ErrorAction SilentlyContinue
+            foreach ($d in $usbDrives) {
+                if (Test-Path "$($d.DeviceID)\") {
+                    $sfd.InitialDirectory = "$($d.DeviceID)\"
+                    break
+                }
+            }
+        } catch { }
+
+        $showResult = if ($Owner) { $sfd.ShowDialog($Owner) } else { $sfd.ShowDialog() }
+        if ($showResult -eq $true) {
+            try {
+                (Protect-HubCsvRecords -Records $script:LastPlaybookExecutionRecords) | Export-Csv -LiteralPath $sfd.FileName -NoTypeInformation -Encoding UTF8
+                Write-HubLog "Playbook CSV report downloaded to: $($sfd.FileName)" "SUCCESS"
+                $ans = [System.Windows.MessageBox]::Show("Playbook CSV exported successfully to:`n$($sfd.FileName)`n`nOpen containing folder?", "Download Complete", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Information)
+                if ($ans -eq [System.Windows.MessageBoxResult]::Yes) {
+                    Start-Process explorer.exe -ArgumentList "/select,`"$($sfd.FileName)`""
+                }
+            } catch {
+                Write-HubLog "Failed to download Playbook CSV: $($_.Exception.Message)" "ERROR"
+                [System.Windows.MessageBox]::Show("Error saving CSV: $($_.Exception.Message)", "Export Failed", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+            }
+        }
+    }
+
+    $btnPlaybookDownloadCsv.Add_Click({
+        Save-HubPlaybookCsvDialog -Owner $window
+    })
+
 
     # Initial Diagnostic Run. The 7-stage ladder is ~3 s of network waits. It was kicked off in a
     # dedicated runspace back in Section C (before the console intro), so by the time the window is built
