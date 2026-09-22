@@ -5756,6 +5756,20 @@ function Start-HubWindowsUpdate {
     }
 }
 
+# --- Function: Test-HubSystemRebootPending ---
+function Test-HubSystemRebootPending {
+    [CmdletBinding()]
+    param()
+    $pending = $false
+    try {
+        if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") { $pending = $true }
+        if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") { $pending = $true }
+        $sm = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name "PendingFileRenameOperations" -ErrorAction SilentlyContinue).PendingFileRenameOperations
+        if ($sm) { $pending = $true }
+    } catch { }
+    return $pending
+}
+
 # --- Cascade State File Path ---
 $script:CascadeStateFile = Join-Path $script:PersistRoot 'patch_cascade.json'
 
@@ -5855,15 +5869,20 @@ function Start-HubAutonomousPatchCascade {
     $installRes = Start-HubWindowsUpdate -IncludeDrivers:$IncludeDrivers -SelectedUpdates $rawUpdates -StatusCallback $StatusCallback
     $totalInstalled += $installRes.InstalledCount
 
-    if ($installRes.RebootRequired) {
+    $rebootNeeded = [bool]$installRes.RebootRequired
+    if (-not $rebootNeeded) {
+        $rebootNeeded = ($installRes.InstalledCount -gt 0) -or (Test-HubSystemRebootPending)
+    }
+
+    if ($rebootNeeded) {
         $nextPass = $currentPass + 1
         if ($nextPass -le $MaxPasses) {
             if ($StatusCallback) {
-                & $StatusCallback "Reboot is required. Scheduling restart-resume task for Pass $nextPass of $MaxPasses..."
+                & $StatusCallback "Reboot is required to commit updates. Scheduling restart-resume task for Pass $nextPass of $MaxPasses..."
             }
             Set-HubPatchCascadeState -CurrentPass $nextPass -MaxPasses $MaxPasses -IncludeDrivers:$IncludeDrivers -TotalInstalled $totalInstalled
             Register-HubResumeAfterRestart
-            if ($StatusCallback) { & $StatusCallback "Restarting system in 5 seconds..." }
+            if ($StatusCallback) { & $StatusCallback "Restarting system automatically in 5 seconds..." }
             Start-Sleep -Seconds 5
             Restart-Computer -Force
             return [PSCustomObject]@{
@@ -5876,8 +5895,10 @@ function Start-HubAutonomousPatchCascade {
         } else {
             Clear-HubPatchCascadeState
             if ($StatusCallback) {
-                & $StatusCallback "Reached MaxPasses ($MaxPasses). Final reboot is required to finish installing updates."
+                & $StatusCallback "Reached MaxPasses ($MaxPasses). Final reboot to commit installed updates..."
             }
+            Start-Sleep -Seconds 5
+            Restart-Computer -Force
             return [PSCustomObject]@{
                 Completed      = $true
                 CurrentPass    = $currentPass
@@ -5886,22 +5907,15 @@ function Start-HubAutonomousPatchCascade {
             }
         }
     } else {
-        # No reboot needed, but updates were installed. Re-run cascade in same session
-        $nextPass = $currentPass + 1
-        if ($nextPass -le $MaxPasses) {
-            Set-HubPatchCascadeState -CurrentPass $nextPass -MaxPasses $MaxPasses -IncludeDrivers:$IncludeDrivers -TotalInstalled $totalInstalled
-            return Start-HubAutonomousPatchCascade -MaxPasses $MaxPasses -IncludeDrivers:$IncludeDrivers -StatusCallback $StatusCallback
-        } else {
-            Clear-HubPatchCascadeState
-            if ($StatusCallback) {
-                & $StatusCallback "Reached MaxPasses ($MaxPasses). Cascade complete. Total updates installed: $totalInstalled."
-            }
-            return [PSCustomObject]@{
-                Completed      = $true
-                CurrentPass    = $currentPass
-                TotalInstalled = $totalInstalled
-                RebootRequired = $false
-            }
+        Clear-HubPatchCascadeState
+        if ($StatusCallback) {
+            & $StatusCallback "Zero updates pending reboot. Cascade complete. Total updates installed: $totalInstalled."
+        }
+        return [PSCustomObject]@{
+            Completed      = $true
+            CurrentPass    = $currentPass
+            TotalInstalled = $totalInstalled
+            RebootRequired = $false
         }
     }
 }
@@ -9796,19 +9810,13 @@ function Start-AutopilotHubGui {
     })
 
     $btnReboot.Add_Click({
-        $ctx = $script:RuntimeContext
-        $comeback = if ($ctx.IsOobe) { 'OOBE' } else { 'the desktop' }
-        $confirm = [System.Windows.MessageBox]::Show("Restart the machine now?`n`nYes = restart and automatically re-open this Hub when $comeback comes back`nNo = plain restart`nCancel = do nothing", "Restart System", [System.Windows.MessageBoxButton]::YesNoCancel, [System.Windows.MessageBoxImage]::Question)
-        if ($confirm -eq [System.Windows.MessageBoxResult]::Cancel) { return }
-        if ($confirm -eq [System.Windows.MessageBoxResult]::Yes) {
-            try {
-                $persisted = Register-HubResumeAfterRestart
-                Write-HubLog "Resume persistence registered. Hub source persisted to $persisted." "SUCCESS"
-            } catch {
-                Write-HubLog "Could not register resume persistence: $($_.Exception.Message)" "ERROR"
-                $ans = [System.Windows.MessageBox]::Show("The Hub could not schedule itself to re-open after the restart:`n$($_.Exception.Message)`n`nRestart anyway (without persistence)?", "Persistence Failed", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
-                if ($ans -ne [System.Windows.MessageBoxResult]::Yes) { return }
-            }
+        $confirm = [System.Windows.MessageBox]::Show("Restart system now? The Hub will automatically re-launch on startup.", "Restart System", [System.Windows.MessageBoxButton]::OKCancel, [System.Windows.MessageBoxImage]::Question)
+        if ($confirm -ne [System.Windows.MessageBoxResult]::OK) { return }
+        try {
+            $persisted = Register-HubResumeAfterRestart
+            Write-HubLog "Resume persistence registered ($persisted)." "SUCCESS"
+        } catch {
+            Write-HubLog "Resume registration notice: $($_.Exception.Message)" "WARN"
         }
         Write-HubLog "Initiating system restart..." "WARN"
         Restart-Computer -Force
@@ -10309,6 +10317,8 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
         if ($btnStopCascade) { $btnStopCascade.Visibility = [System.Windows.Visibility]::Visible; $btnStopCascade.IsEnabled = $true }
         if ($btnWuScan) { $btnWuScan.IsEnabled = $false }
         if ($btnWuInstall) { $btnWuInstall.IsEnabled = $false }
+        if ($btnWuRebootNow) { $btnWuRebootNow.Visibility = [System.Windows.Visibility]::Collapsed }
+        if ($txtWuRebootNotice) { $txtWuRebootNotice.Text = "" }
 
         if ($txtCascadeStatus) { $txtCascadeStatus.Text = "CASCADE ACTIVE" }
         if ($badgeCascadeStatus) {
@@ -10452,6 +10462,13 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                     }
                 }
 
+                if (-not $rebootNeeded) {
+                    if ((Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") -or
+                        (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending")) {
+                        $rebootNeeded = $true
+                    }
+                }
+
                 Set-WuWorkerProgress 100 "Installation Complete"
                 return [PSCustomObject]@{
                     Succeeded = $succeeded
@@ -10468,6 +10485,9 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
 
                 $passInstalled = if ($summary) { $summary.Succeeded } else { 0 }
                 $rebootNeeded = if ($summary) { [bool]$summary.RebootRequired } else { $false }
+                if (-not $rebootNeeded) {
+                    $rebootNeeded = ($passInstalled -gt 0) -or (Test-HubSystemRebootPending)
+                }
                 $totalInstalled += $passInstalled
 
                 if ($summary -and $summary.Results) {
@@ -10485,6 +10505,10 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                 if ($progWuBar) { $progWuBar.IsIndeterminate = $false; $progWuBar.Value = 100 }
                 if ($txtWuProgress) { $txtWuProgress.Text = "100%" }
 
+                # In autonomous cascade, never show manual reboot button or notice
+                if ($btnWuRebootNow) { $btnWuRebootNow.Visibility = [System.Windows.Visibility]::Collapsed }
+                if ($txtWuRebootNotice) { $txtWuRebootNotice.Text = "" }
+
                 if ($rebootNeeded) {
                     $nextPass = $currPass + 1
                     if ($nextPass -le $maxPasses) {
@@ -10492,14 +10516,9 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                         Set-HubPatchCascadeState -CurrentPass $nextPass -MaxPasses $maxPasses -IncludeDrivers:$includeDrivers -TotalInstalled $totalInstalled
                         Register-HubResumeAfterRestart
 
-                        if ($autoReboot) {
-                            Start-RebootCountdown -Seconds 5 -OnComplete {
-                                Restart-Computer -Force
-                            }
-                        } else {
-                            if ($btnWuRebootNow) { $btnWuRebootNow.Visibility = [System.Windows.Visibility]::Visible }
-                            if ($txtWuRebootNotice) { $txtWuRebootNotice.Text = "Reboot required for Pass $nextPass. Click 'Restart System Now'." }
-                            if ($txtWuStatus) { $txtWuStatus.Text = "Updates installed. System restart is REQUIRED before Pass $nextPass." }
+                        # Autonomous 5-second countdown to reboot - ZERO extra clicks!
+                        Start-RebootCountdown -Seconds 5 -OnComplete {
+                            Restart-Computer -Force
                         }
                     } else {
                         Clear-HubPatchCascadeState
@@ -10507,40 +10526,30 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                         if ($btnStartCascade) { $btnStartCascade.Visibility = [System.Windows.Visibility]::Visible; $btnStartCascade.IsEnabled = $true }
                         if ($btnStopCascade) { $btnStopCascade.Visibility = [System.Windows.Visibility]::Collapsed }
                         if ($btnWuScan) { $btnWuScan.IsEnabled = $true }
-                        if ($btnWuRebootNow) { $btnWuRebootNow.Visibility = [System.Windows.Visibility]::Visible }
-                        Write-HubLog "Reached maximum cascade passes ($maxPasses). Final reboot is required." "WARN"
-                        if ($txtWuStatus) { $txtWuStatus.Text = "Reached maximum passes ($maxPasses). Final reboot required to complete updates." }
+                        Write-HubLog "Reached maximum cascade passes ($maxPasses). Total updates installed: $totalInstalled. Performing final reboot to commit updates..." "WARN"
+                        if ($txtWuStatus) { $txtWuStatus.Text = "Max passes ($maxPasses) reached ($totalInstalled installed). Committing updates via final reboot in 5s..." }
+                        if ($txtCascadeStatus) { $txtCascadeStatus.Text = "CASCADE COMPLETE" }
+                        # Automatically reboot final time so updates commit without requiring user clicks
+                        Start-RebootCountdown -Seconds 5 -OnComplete {
+                            Restart-Computer -Force
+                        }
                     }
                 } else {
-                    $nextPass = $currPass + 1
-                    if ($nextPass -le $maxPasses -and $passInstalled -gt 0) {
-                        Write-HubLog "Pass $currPass finished ($passInstalled installed, no reboot needed). Advancing to Pass $nextPass to verify..." "INFO"
-                        Set-HubPatchCascadeState -CurrentPass $nextPass -MaxPasses $maxPasses -IncludeDrivers:$includeDrivers -TotalInstalled $totalInstalled
-
-                        # Use lightweight non-blocking UI timer for delay before next pass
-                        $nextPassTimer = [System.Windows.Threading.DispatcherTimer]::new()
-                        $nextPassTimer.Interval = [TimeSpan]::FromSeconds(2)
-                        $nextPassTimer.Add_Tick({
-                            $nextPassTimer.Stop()
-                            if ($script:CascadeRunning) { Invoke-GuiCascadePass }
-                        }.GetNewClosure())
-                        $nextPassTimer.Start()
-                    } else {
-                        Clear-HubPatchCascadeState
-                        $script:CascadeRunning = $false
-                        if ($btnStartCascade) { $btnStartCascade.Visibility = [System.Windows.Visibility]::Visible; $btnStartCascade.IsEnabled = $true }
-                        if ($btnStopCascade) { $btnStopCascade.Visibility = [System.Windows.Visibility]::Collapsed }
-                        if ($btnWuScan) { $btnWuScan.IsEnabled = $true }
-                        if ($txtCascadeStatus) { $txtCascadeStatus.Text = "100% PATCHED" }
-                        if ($badgeCascadeStatus) {
-                            $badgeCascadeStatus.Background = $brushConv.ConvertFromString("#1F2822")
-                            $badgeCascadeStatus.BorderBrush = $brushConv.ConvertFromString("#2A5435")
-                        }
-                        if ($txtCascadeStatus) { $txtCascadeStatus.Foreground = $brushConv.ConvertFromString("#6CCB5F") }
-                        if ($txtWuStatus) { $txtWuStatus.Text = "Cascade complete! Total updates installed: $totalInstalled." }
-                        Write-HubLog "Patch Cascade complete: Total updates installed: $totalInstalled." "SUCCESS"
-                        try { [System.Media.SystemSounds]::Asterisk.Play() } catch { }
+                    Clear-HubPatchCascadeState
+                    $script:CascadeRunning = $false
+                    if ($btnStartCascade) { $btnStartCascade.Visibility = [System.Windows.Visibility]::Visible; $btnStartCascade.IsEnabled = $true }
+                    if ($btnStopCascade) { $btnStopCascade.Visibility = [System.Windows.Visibility]::Collapsed }
+                    if ($btnWuScan) { $btnWuScan.IsEnabled = $true }
+                    if ($txtCascadeStatus) { $txtCascadeStatus.Text = "100% PATCHED" }
+                    if ($badgeCascadeStatus) {
+                        $badgeCascadeStatus.Background = $brushConv.ConvertFromString("#1F2822")
+                        $badgeCascadeStatus.BorderBrush = $brushConv.ConvertFromString("#2A5435")
                     }
+                    if ($txtCascadeStatus) { $txtCascadeStatus.Foreground = $brushConv.ConvertFromString("#6CCB5F") }
+                    if ($txtCascadeStateDetail) { $txtCascadeStateDetail.Text = "Zero updates pending. All security patches, quality updates, and hardware drivers are fully applied." }
+                    if ($txtWuStatus) { $txtWuStatus.Text = "Cascade complete! System is 100% up to date. Total installed: $totalInstalled" }
+                    Write-HubLog "Patch Cascade complete: Zero updates pending reboot. System is 100% up to date! Total installed: $totalInstalled" "SUCCESS"
+                    try { [System.Media.SystemSounds]::Asterisk.Play() } catch { }
                 }
             }
         }
@@ -10658,9 +10667,14 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
 
     if ($btnWuRebootNow) {
         $btnWuRebootNow.Add_Click({
-            $ans = [System.Windows.MessageBox]::Show("Restart system now to complete update installation?`n`nThe Hub will register a resume task and re-launch automatically when the system boots back up.", "Confirm Restart", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
-            if ($ans -eq [System.Windows.MessageBoxResult]::Yes) {
+            Write-HubLog "Restart requested by operator. Registering resume task..." "INFO"
+            try {
                 Register-HubResumeAfterRestart
+                Write-HubLog "Restart-resume hook registered. Hub will re-launch automatically on boot." "SUCCESS"
+            } catch {
+                Write-HubLog "Resume registration notice: $($_.Exception.Message)" "WARN"
+            }
+            Start-RebootCountdown -Seconds 3 -OnComplete {
                 Restart-Computer -Force
             }
         })
@@ -10787,12 +10801,13 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                     }
                     if ($lstIntegratedUpdates) { $lstIntegratedUpdates.Items.Refresh() }
 
-                    Write-HubLog "Update installation complete: $($summary.Succeeded) succeeded, $($summary.Failed) failed. Reboot required: $($summary.RebootRequired)" $(if ($summary.Failed -eq 0) { "SUCCESS" } else { "WARN" })
+                    $rebootReq = [bool]($summary.RebootRequired -or ($summary.Succeeded -gt 0 -and (Test-HubSystemRebootPending)))
+                    Write-HubLog "Update installation complete: $($summary.Succeeded) succeeded, $($summary.Failed) failed. Reboot required: $rebootReq" $(if ($summary.Failed -eq 0) { "SUCCESS" } else { "WARN" })
                     if ($txtWuStatus) { $txtWuStatus.Text = "Update complete: $($summary.Succeeded) installed, $($summary.Failed) failed." }
                     if ($progWuBar) { $progWuBar.Value = 100 }
                     try { [System.Media.SystemSounds]::Asterisk.Play() } catch { }
 
-                    if ($summary.RebootRequired) {
+                    if ($rebootReq) {
                         if ($btnWuRebootNow) { $btnWuRebootNow.Visibility = [System.Windows.Visibility]::Visible }
                         if ($txtWuRebootNotice) { $txtWuRebootNotice.Text = "Updates installed successfully. System restart is REQUIRED." }
                         if ($chkCascadeAutoReboot -and $chkCascadeAutoReboot.IsChecked) {
