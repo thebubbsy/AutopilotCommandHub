@@ -6359,9 +6359,9 @@ function Start-AutopilotHubGui {
 
         <!-- WinUI 3 Destructive Button Style -->
         <Style x:Key="DestructiveBtn" TargetType="Button">
-            <Setter Property="Background" Value="#442726"/>
-            <Setter Property="Foreground" Value="#FF99A4"/>
-            <Setter Property="BorderBrush" Value="#5C3130"/>
+            <Setter Property="Background" Value="#FEE2E2"/>
+            <Setter Property="Foreground" Value="#B91C1C"/>
+            <Setter Property="BorderBrush" Value="#FCA5A5"/>
             <Setter Property="BorderThickness" Value="1"/>
             <Setter Property="Padding" Value="12,6"/>
             <Setter Property="FontSize" Value="12.5"/>
@@ -6377,12 +6377,12 @@ function Start-AutopilotHubGui {
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter Property="Background" TargetName="border" Value="#5C3130"/>
-                                <Setter Property="BorderBrush" TargetName="border" Value="#7A3F3E"/>
+                                <Setter Property="Background" TargetName="border" Value="#FCA5A5"/>
+                                <Setter Property="BorderBrush" TargetName="border" Value="#F87171"/>
                             </Trigger>
                             <Trigger Property="IsPressed" Value="True">
-                                <Setter Property="Background" TargetName="border" Value="#381F1E"/>
-                                <Setter Property="BorderBrush" TargetName="border" Value="#442726"/>
+                                <Setter Property="Background" TargetName="border" Value="#FECACA"/>
+                                <Setter Property="BorderBrush" TargetName="border" Value="#FEE2E2"/>
                             </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
                                 <Setter Property="Opacity" Value="0.35"/>
@@ -6651,7 +6651,7 @@ function Start-AutopilotHubGui {
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="ItemBorder" Property="Background" Value="#383838"/>
+                                <Setter TargetName="ItemBorder" Property="Background" Value="#EFF6FF"/>
                             </Trigger>
                             <Trigger Property="IsSelected" Value="True">
                                 <Setter TargetName="ItemBorder" Property="Background" Value="#0067C0"/>
@@ -6693,7 +6693,7 @@ function Start-AutopilotHubGui {
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="28" />
                                     </Grid.ColumnDefinitions>
-                                    <TextBox x:Name="PART_EditableTextBox" Style="{x:Null}" Background="Transparent" Foreground="#FFFFFF"
+                                    <TextBox x:Name="PART_EditableTextBox" Style="{x:Null}" Background="Transparent" Foreground="#1E293B"
                                              CaretBrush="#0067C0" BorderThickness="0" Padding="8,4"
                                              VerticalContentAlignment="Center" FontSize="12"/>
                                     <ToggleButton x:Name="EditableToggleButton" Grid.Column="1"
@@ -6727,7 +6727,7 @@ function Start-AutopilotHubGui {
                                 <Setter TargetName="EditableBorder" Property="Visibility" Value="Visible" />
                             </Trigger>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="EditableBorder" Property="BorderBrush" Value="#484848" />
+                                <Setter TargetName="EditableBorder" Property="BorderBrush" Value="#CBD5E1" />
                             </Trigger>
                             <Trigger Property="IsKeyboardFocusWithin" Value="True">
                                 <Setter TargetName="EditableBorder" Property="BorderBrush" Value="#0067C0" />
@@ -8409,7 +8409,7 @@ function Start-AutopilotHubGui {
         if ($script:GraphAuthContext -and $script:GraphAuthContext.AccessToken -and $script:GraphAuthContext.ExpiresOn -gt [datetime]::UtcNow.AddMinutes(2)) {
             $dotGraphStatus.Fill = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#15803D")
             $badgeGraphAuth.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#DCFCE7")
-            $badgeGraphAuth.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#2A5435")
+            $badgeGraphAuth.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#86EFAC")
             $tDisplay = if ($script:GraphAuthContext.TenantId -and $script:GraphAuthContext.TenantId -ne 'organizations') {
                 if ($script:GraphAuthContext.TenantId.Length -gt 18) {
                     $script:GraphAuthContext.TenantId.Substring(0, 8) + '...'
@@ -8447,9 +8447,9 @@ function Start-AutopilotHubGui {
         } else {
             $dotGraphStatus.Fill = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#B91C1C")
             $badgeGraphAuth.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#F1F5F9")
-            $badgeGraphAuth.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#542E2A")
+            $badgeGraphAuth.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#CBD5E1")
             $txtGraphStatus.Text = "GRAPH: NOT SIGNED IN"
-            $txtGraphStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#D0D0D0")
+            $txtGraphStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#64748B")
             $btnConnectGraph.Content = "Sign In to Intune"
             $btnConnectGraph.Style = [System.Windows.Style]$window.Resources['AccentBtn']
         }
@@ -8830,13 +8830,13 @@ function Start-AutopilotHubGui {
     if ($ctx.MeetsPreferred) {
         $dotPrivilege.Fill = $brushConv.ConvertFromString("#15803D")
         $badgePrivilege.Background = $brushConv.ConvertFromString("#DCFCE7")
-        $badgePrivilege.BorderBrush = $brushConv.ConvertFromString("#2A5435")
+        $badgePrivilege.BorderBrush = $brushConv.ConvertFromString("#86EFAC")
         $txtPrivilege.Text = "PRIV: $($ctx.PrivilegeLevel) | $($ctx.Mode)"
         $txtPrivilege.Foreground = $brushConv.ConvertFromString("#15803D")
     } else {
         $dotPrivilege.Fill = $brushConv.ConvertFromString("#B91C1C")
-        $badgePrivilege.Background = $brushConv.ConvertFromString("#5C2B29")
-        $badgePrivilege.BorderBrush = $brushConv.ConvertFromString("#8A3E3A")
+        $badgePrivilege.Background = $brushConv.ConvertFromString("#FEE2E2")
+        $badgePrivilege.BorderBrush = $brushConv.ConvertFromString("#FCA5A5")
         $txtPrivilege.Text = "PRIV: $($ctx.PrivilegeLevel) | $($ctx.Mode)"
         $txtPrivilege.Foreground = $brushConv.ConvertFromString("#B91C1C")
         $btnFixPrivilege.Visibility = [System.Windows.Visibility]::Visible
@@ -8883,45 +8883,45 @@ function Start-AutopilotHubGui {
                 $title = "DEVICE STATE: AUTOPILOT BYPASSED (LOCAL INSTALL)"
                 $detail = "$($ds.Summary). Autopilot has been skipped on this install. OOBE will finish as a normal Windows with a local account.$cloudNote"
                 $bg = '#E0F2FE'; $border = '#BAE6FD'; $fg = '#0284C7'; $showAction = $false
-                $txtDeviceState.Text = "AUTOPILOT BYPASSED"; $txtDeviceState.Foreground = $bc.ConvertFromString('#60CDFF')
+                $txtDeviceState.Text = "AUTOPILOT BYPASSED"; $txtDeviceState.Foreground = $bc.ConvertFromString('#0284C7')
             }
             'AutopilotRegistered' {
                 $title = "DEVICE STATE: AUTOPILOT REGISTERED"
                 $detail = "$($ds.Summary). This PC already received its deployment profile from the Autopilot Deployment Service - that is why it boots into the branded OOBE. Registration is NOT required; use this tab only to export a CSV or change the group tag.$cloudNote"
                 if ($ds.CloudChecked -and -not $ds.CloudRegistered) { $detail += " You are probably signed in to a different tenant than the one this device belongs to ($tenant)." }
                 $bg = '#DCFCE7'; $border = '#BBF7D0'; $fg = '#15803D'; $showAction = $false
-                $txtDeviceState.Text = "AUTOPILOT: $tenant"; $txtDeviceState.Foreground = $bc.ConvertFromString('#6CCB5F')
+                $txtDeviceState.Text = "AUTOPILOT: $tenant"; $txtDeviceState.Foreground = $bc.ConvertFromString('#15803D')
             }
             'IntuneEnrolled' {
                 $title = "DEVICE STATE: INTUNE ENROLLED, NO AUTOPILOT PROFILE"
                 $detail = "$($ds.Summary). The device is managed, but Autopilot does not own it - a reset or reprovision would land in the generic OOBE. Harvest the hardware hash and register it so Autopilot takes over next time.$cloudNote"
-                $bg = '#2E2A1F'; $border = '#5C4A29'; $fg = '#FCE100'
-                $txtDeviceState.Text = "INTUNE: $tenant"; $txtDeviceState.Foreground = $bc.ConvertFromString('#FCE100')
+                $bg = '#FEF9C3'; $border = '#FDE68A'; $fg = '#A16207'
+                $txtDeviceState.Text = "INTUNE: $tenant"; $txtDeviceState.Foreground = $bc.ConvertFromString('#A16207')
             }
             'EntraJoined' {
                 $title = "DEVICE STATE: ENTRA JOINED, NOT ENROLLED"
                 $detail = "$($ds.Summary). No MDM enrollment and no Autopilot profile. Harvest and register the hash to bring it under Autopilot.$cloudNote"
-                $bg = '#2E2A1F'; $border = '#5C4A29'; $fg = '#FCE100'
-                $txtDeviceState.Text = "ENTRA: $tenant"; $txtDeviceState.Foreground = $bc.ConvertFromString('#FCE100')
+                $bg = '#FEF9C3'; $border = '#FDE68A'; $fg = '#A16207'
+                $txtDeviceState.Text = "ENTRA: $tenant"; $txtDeviceState.Foreground = $bc.ConvertFromString('#A16207')
             }
             'DomainJoined' {
                 $title = "DEVICE STATE: ON-PREM DOMAIN JOINED"
                 $detail = "$($ds.Summary). Harvest and register the hardware hash if this device is moving to Autopilot.$cloudNote"
-                $bg = '#2E2A1F'; $border = '#5C4A29'; $fg = '#FCE100'
-                $txtDeviceState.Text = "DOMAIN JOINED"; $txtDeviceState.Foreground = $bc.ConvertFromString('#FCE100')
+                $bg = '#FEF9C3'; $border = '#FDE68A'; $fg = '#A16207'
+                $txtDeviceState.Text = "DOMAIN JOINED"; $txtDeviceState.Foreground = $bc.ConvertFromString('#A16207')
             }
             default {
                 $title = "DEVICE STATE: NOT REGISTERED"
                 $detail = "$($ds.Summary). Harvest the hardware hash, then register it with Intune (Graph) or export the CSV for a bulk import.$cloudNote"
                 $bg = '#FEE2E2'; $border = '#FCA5A5'; $fg = '#B91C1C'
-                $txtDeviceState.Text = "NOT REGISTERED"; $txtDeviceState.Foreground = $bc.ConvertFromString('#FFAA99')
+                $txtDeviceState.Text = "NOT REGISTERED"; $txtDeviceState.Foreground = $bc.ConvertFromString('#DC2626')
             }
         }
         if ($ds.CloudChecked -and $ds.CloudRegistered -and $ds.Verdict -ne 'AutopilotRegistered') {
             $title = "DEVICE STATE: REGISTERED IN SIGNED-IN TENANT"
             $detail = "The signed-in tenant already holds an Autopilot identity for this serial number.$cloudNote Registering again is unnecessary; the local machine simply has not been through Autopilot OOBE yet."
             $bg = '#DCFCE7'; $border = '#BBF7D0'; $fg = '#15803D'; $showAction = $false
-            $txtDeviceState.Text = "AUTOPILOT (TENANT)"; $txtDeviceState.Foreground = $bc.ConvertFromString('#6CCB5F')
+            $txtDeviceState.Text = "AUTOPILOT (TENANT)"; $txtDeviceState.Foreground = $bc.ConvertFromString('#15803D')
         }
         $bannerDeviceState.Background = $bc.ConvertFromString($bg)
         $bannerDeviceState.BorderBrush = $bc.ConvertFromString($border)
@@ -8932,8 +8932,8 @@ function Start-AutopilotHubGui {
 
         # App Deployment advisory - app assignment belongs to Intune once the device is managed
         if ($ds.Verdict -in @('AutopilotRegistered', 'IntuneEnrolled') -or $ds.CloudRegistered) {
-            $bannerAppAdvisory.Background = $bc.ConvertFromString('#2E2A1F'); $bannerAppAdvisory.BorderBrush = $bc.ConvertFromString('#5C4A29')
-            $txtAppAdvisory.Foreground = $bc.ConvertFromString('#FCE100')
+            $bannerAppAdvisory.Background = $bc.ConvertFromString('#FEF9C3'); $bannerAppAdvisory.BorderBrush = $bc.ConvertFromString('#FDE68A')
+            $txtAppAdvisory.Foreground = $bc.ConvertFromString('#A16207')
             $txtAppAdvisory.Text = "This device is managed by Intune ($tenant). App deployment normally belongs to Intune app assignments and the Enrollment Status Page - use this tab for bench builds, one-off tools and troubleshooting, not as a substitute for policy."
         } else {
             $bannerAppAdvisory.Background = $bc.ConvertFromString('#262626'); $bannerAppAdvisory.BorderBrush = $bc.ConvertFromString('#383838')
@@ -9123,7 +9123,7 @@ function Start-AutopilotHubGui {
             } else {
                 $txtHashBox.Text = ''
                 $txtHashStatus.Text = "HASH UNAVAILABLE"
-                $badgeHashStatus.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#5C2B29")
+                $badgeHashStatus.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FEE2E2")
                 $txtHashStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FF99A4")
                 $reason = if ($hashInfo) { $hashInfo.StatusReason } elseif ($err) { $err.Message } else { 'Get-AutopilotHash returned nothing' }
                 $serial = if ($hashInfo) { $hashInfo.SerialNumber } else { 'Unknown' }
@@ -10367,15 +10367,15 @@ function Start-AutopilotHubGui {
                 if ($w.IsUnderWarranty) {
                     if ($w.DaysRemaining -le 90) {
                         $borderRefreshVerdict.Background = $brushConv.ConvertFromString("#292621")
-                        $borderRefreshVerdict.BorderBrush = $brushConv.ConvertFromString("#5C4A29")
+                        $borderRefreshVerdict.BorderBrush = $brushConv.ConvertFromString("#FDE68A")
                         if ($borderVerdictBadge) { $borderVerdictBadge.Background = $brushConv.ConvertFromString("#443B26") }
                         if ($txtVerdictBadge) {
                             $txtVerdictBadge.Text = "EXPIRING SOON"
-                            $txtVerdictBadge.Foreground = $brushConv.ConvertFromString("#FCE100")
+                            $txtVerdictBadge.Foreground = $brushConv.ConvertFromString("#A16207")
                         }
                         $txtVerdictTitle.Text = $w.RefreshVerdict
                         $txtVerdictTitle.Foreground = $brushConv.ConvertFromString("#FFFFFF")
-                        $txtDellDaysRemaining.Foreground = $brushConv.ConvertFromString("#FCE100")
+                        $txtDellDaysRemaining.Foreground = $brushConv.ConvertFromString("#A16207")
                     } else {
                         $borderRefreshVerdict.Background = $brushConv.ConvertFromString("#212923")
                         $borderRefreshVerdict.BorderBrush = $brushConv.ConvertFromString("#295C33")
@@ -10390,7 +10390,7 @@ function Start-AutopilotHubGui {
                     }
                 } else {
                     $borderRefreshVerdict.Background = $brushConv.ConvertFromString("#292121")
-                    $borderRefreshVerdict.BorderBrush = $brushConv.ConvertFromString("#5C2B29")
+                    $borderRefreshVerdict.BorderBrush = $brushConv.ConvertFromString("#FEE2E2")
                     if ($borderVerdictBadge) { $borderVerdictBadge.Background = $brushConv.ConvertFromString("#442726") }
                     if ($txtVerdictBadge) {
                         $txtVerdictBadge.Text = "OUT OF WARRANTY"
@@ -10571,15 +10571,15 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
             if ($batInfo -and $batInfo.Present) {
                 if ($txtPowerStatus) { $txtPowerStatus.Text = "POWER: BATTERY ($($batInfo.EstimatedCharge))" }
                 if ($badgePower) {
-                    $badgePower.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#2E2A1F")
-                    $badgePower.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#5C4A29")
+                    $badgePower.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FEF9C3")
+                    $badgePower.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FDE68A")
                 }
-                if ($txtPowerStatus) { $txtPowerStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FCE100") }
+                if ($txtPowerStatus) { $txtPowerStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#A16207") }
             } else {
                 if ($txtPowerStatus) { $txtPowerStatus.Text = "POWER: AC MAINS" }
                 if ($badgePower) {
                     $badgePower.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#DCFCE7")
-                    $badgePower.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#2A5435")
+                    $badgePower.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#86EFAC")
                 }
                 if ($txtPowerStatus) { $txtPowerStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#15803D") }
             }
