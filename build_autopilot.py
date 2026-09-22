@@ -867,31 +867,36 @@ function Invoke-HubSystemReboot {
     try {
         $shutdownExe = Join-Path $env:SystemRoot 'System32\shutdown.exe'
         if (Test-Path $shutdownExe) {
-            $argList = "/r /t $DelaySeconds /f /c `"$Reason`""
-            $p = Start-Process -FilePath $shutdownExe -ArgumentList $argList -NoNewWindow -PassThru -ErrorAction SilentlyContinue
-            if ($p) {
-                $p.WaitForExit(2000)
-                if ($p.HasExited -and $p.ExitCode -ne 0 -and $p.ExitCode -ne 1190) {
-                    Write-HubLog "shutdown.exe with comment exited with code $($p.ExitCode), trying without comment..." "WARN"
-                    $p2 = Start-Process -FilePath $shutdownExe -ArgumentList "/r /t $DelaySeconds /f" -NoNewWindow -PassThru -ErrorAction SilentlyContinue
-                    if ($p2) {
-                        $p2.WaitForExit(2000)
-                        if (-not $p2.HasExited -or $p2.ExitCode -eq 0 -or $p2.ExitCode -eq 1190) {
-                            Write-HubLog "Initiated reboot via shutdown.exe /r /t $DelaySeconds /f" "SUCCESS"
-                            return
-                        }
-                    }
-                } else {
-                    Write-HubLog "Initiated reboot via shutdown.exe /r /t $DelaySeconds /f" "SUCCESS"
-                    return
-                }
+            # Direct invocation without Start-Process quoting pitfalls
+            & $shutdownExe /r /t $DelaySeconds /f /c "$Reason"
+            if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 1190) {
+                Write-HubLog "Initiated reboot via shutdown.exe /r /t $DelaySeconds /f" "SUCCESS"
+                return
+            }
+            # Fallback without comment if comment caused issues
+            & $shutdownExe /r /t $DelaySeconds /f
+            if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 1190) {
+                Write-HubLog "Initiated reboot via shutdown.exe /r /t $DelaySeconds /f (no comment)" "SUCCESS"
+                return
             }
         }
     } catch {
         Write-HubLog "shutdown.exe invocation warning: $($_.Exception.Message)" "WARN"
     }
 
-    # Tier 2: Win32 API InitiateSystemShutdownEx & ExitWindowsEx
+    # Tier 2: WMI / CIM Win32Shutdown(6 = Forced Reboot)
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+        if ($os) {
+            $cimRes = Invoke-CimMethod -InputObject $os -MethodName Win32Shutdown -Arguments @{ Flags = [int]6; Reserved = [int]0 } -ErrorAction SilentlyContinue
+            if ($cimRes -and $cimRes.ReturnValue -eq 0) {
+                Write-HubLog "Initiated reboot via CIM Win32Shutdown(6)" "SUCCESS"
+                return
+            }
+        }
+    } catch { }
+
+    # Tier 3: Win32 API InitiateSystemShutdownEx & ExitWindowsEx
     try {
         if (-not ([System.Management.Automation.PSTypeName]'Win32NativeShutdown').Type) {
             Add-Type -TypeDefinition @"
@@ -919,7 +924,7 @@ public class Win32NativeShutdown {
         }
     } catch { }
 
-    # Tier 3: Restart-Computer -Force fallback
+    # Tier 4: Restart-Computer -Force fallback
     try {
         Restart-Computer -Force -ErrorAction Stop
         Write-HubLog "Initiated reboot via Restart-Computer -Force" "SUCCESS"
@@ -10878,6 +10883,9 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                     $action = $script:RebootCountdownAction
                     $script:RebootCountdownAction = $null
                     & $action
+                    try {
+                        if ($window) { $window.Close() }
+                    } catch { }
                 }
             }
         })
