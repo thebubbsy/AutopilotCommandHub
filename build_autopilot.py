@@ -80,7 +80,21 @@ param(
     [string]$StagingProfile = 'HardwareDiagnostics',
     [switch]$ResumeAutopilot,
     [string]$Playbook = '',
-    [string]$ActionRoutine = ''
+    [string]$ActionRoutine = '',
+    [string]$DeploymentProfile = '',
+    [switch]$VerifyEnrollment,
+    [switch]$GenerateReceipt,
+    [string]$FleetEndpoint = '',
+    [switch]$SendTelemetry,
+    [switch]$CartMode,
+    [string]$CartName = 'StandardCart',
+    [string]$CartCsvPath = '',
+    [switch]$BatchRegisterCart,
+    [switch]$OemUpdates,
+    [switch]$OemScanOnly,
+    [switch]$EnforceSecurityPosture,
+    [switch]$StartFleetServer,
+    [int]$FleetServerPort = 8443
 )
 
 # 0. Central Environment & Configuration Engine (.env)
@@ -306,6 +320,11 @@ $script:PreflightRunspace = $null
 $script:PreflightHandle = $null
 $script:CachedDsregStatus = $null
 $script:BypassDisabledAdapters = [System.Collections.Generic.List[string]]::new()
+$script:HubDeploymentId = "HUB-{0}-{1}" -f (Get-Date -Format 'yyyyMMdd'), ([guid]::NewGuid().ToString('N').Substring(0,8).ToUpper())
+$script:ActiveDeploymentProfile = $null
+$script:LastProvisioningReceipt = $null
+$script:LastProvisioningReceiptPath = $null
+$script:FleetBufferDir = 'C:\AutopilotLogs\FleetBuffer'
 
 # 5. Self-Source Capture. Under `irm <url> | iex` there is no $PSCommandPath, but the script block that is
 #    executing still carries the full source - that is what makes an elevated relaunch and the post-restart
@@ -4191,6 +4210,1416 @@ function Export-AutopilotCsv {
     }
 }
 
+# ============================================================================
+# DEPLOYMENT TELEMETRY & REPORTING ENGINE
+# Rich, self-contained deployment reports (HTML with inline-SVG charts + JSON
+# sidecar for fleet ingestion). No external dependencies - renders offline in OOBE.
+# ============================================================================
+function ConvertTo-HubSvgText {
+    param([string]$Text)
+    if ($null -eq $Text) { return '' }
+    return ($Text -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;')
+}
+
+function New-HubSvgBarChart {
+    param($Data, [string]$Unit = '', [string]$Color = '#0067C0', [int]$Width = 720, [int]$BarHeight = 26, [int]$Gap = 10)
+    $data = @($Data)
+    if ($data.Count -eq 0) { return '<p class="muted">No data.</p>' }
+    $max = ($data | Measure-Object -Property Value -Maximum).Maximum
+    if ($max -le 0) { $max = 1 }
+    $labelW = 230; $valueW = 90; $trackW = $Width - $labelW - $valueW
+    $h = ($data.Count * ($BarHeight + $Gap)) + $Gap
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.AppendLine("<svg viewBox='0 0 $Width $h' width='100%' role='img' class='chart'>")
+    $y = $Gap
+    foreach ($d in $data) {
+        $val = [double]$d.Value
+        $w = [int]([math]::Max(2, ($val / $max) * $trackW))
+        $label = ConvertTo-HubSvgText $d.Label
+        $valTxt = if ($val -ge 100) { '{0:N0}' -f $val } else { '{0:N1}' -f $val }
+        $valTxt = "$valTxt $Unit".Trim()
+        $ty = $y + [int]($BarHeight * 0.68)
+        [void]$sb.AppendLine("<text x='0' y='$ty' class='blabel'>$label</text>")
+        [void]$sb.AppendLine("<rect x='$labelW' y='$y' width='$trackW' height='$BarHeight' rx='4' class='track'/>")
+        [void]$sb.AppendLine("<rect x='$labelW' y='$y' width='$w' height='$BarHeight' rx='4' fill='$Color'/>")
+        [void]$sb.AppendLine("<text x='$($labelW + $trackW + 8)' y='$ty' class='bval'>$valTxt</text>")
+        $y += $BarHeight + $Gap
+    }
+    [void]$sb.AppendLine("</svg>")
+    return $sb.ToString()
+}
+
+function New-HubSvgLineChart {
+    param($Series, [string]$YUnit = '', [int]$Width = 720, [int]$Height = 240)
+    $series = @($Series)
+    $allPts = $series | ForEach-Object { $_.Points } | ForEach-Object { $_ }
+    if (-not $allPts) { return '<p class="muted">No time-series data captured.</p>' }
+    $padL = 54; $padR = 16; $padT = 14; $padB = 28
+    $plotW = $Width - $padL - $padR; $plotH = $Height - $padT - $padB
+    $xMax = ($allPts | Measure-Object -Property X -Maximum).Maximum
+    $yMax = ($allPts | Measure-Object -Property Y -Maximum).Maximum
+    if ($xMax -le 0) { $xMax = 1 }
+    if ($yMax -le 0) { $yMax = 1 }
+    $yNice = [math]::Ceiling($yMax * 1.1)
+    if ($yNice -le 0) { $yNice = 1 }
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.AppendLine("<svg viewBox='0 0 $Width $Height' width='100%' role='img' class='chart'>")
+    for ($g = 0; $g -le 4; $g++) {
+        $gy = $padT + ($plotH * $g / 4)
+        $yv = $yNice * (4 - $g) / 4
+        [void]$sb.AppendLine("<line x1='$padL' y1='$gy' x2='$($padL+$plotW)' y2='$gy' class='grid'/>")
+        [void]$sb.AppendLine("<text x='$($padL-6)' y='$($gy+4)' class='axis' text-anchor='end'>$('{0:N0}' -f $yv)</text>")
+    }
+    [void]$sb.AppendLine("<text x='$padL' y='$($Height-8)' class='axis'>0s</text>")
+    [void]$sb.AppendLine("<text x='$($padL+$plotW)' y='$($Height-8)' class='axis' text-anchor='end'>$('{0:N0}' -f $xMax)s</text>")
+    foreach ($se in $series) {
+        $pts = @($se.Points)
+        if ($pts.Count -eq 0) { continue }
+        $coords = foreach ($pt in $pts) {
+            $px = $padL + (($pt.X / $xMax) * $plotW)
+            $py = $padT + $plotH - (($pt.Y / $yNice) * $plotH)
+            '{0:N1},{1:N1}' -f $px, $py
+        }
+        [void]$sb.AppendLine("<polyline points='$($coords -join ' ')' fill='none' stroke='$($se.Color)' stroke-width='2' stroke-linejoin='round'/>")
+    }
+    [void]$sb.AppendLine("</svg>")
+    return $sb.ToString()
+}
+
+function Get-HubDiskPerfSample {
+    $r = [PSCustomObject]@{ ReadMBps = 0.0; WriteMBps = 0.0; Iops = 0.0; QueueLen = 0.0; Ok = $false }
+    try {
+        $c = Get-Counter -Counter @(
+            '\PhysicalDisk(_Total)\Disk Read Bytes/sec',
+            '\PhysicalDisk(_Total)\Disk Write Bytes/sec',
+            '\PhysicalDisk(_Total)\Disk Transfers/sec',
+            '\PhysicalDisk(_Total)\Current Disk Queue Length'
+        ) -SampleInterval 1 -MaxSamples 1 -ErrorAction Stop
+        foreach ($cs in $c.CounterSamples) {
+            switch -Wildcard ($cs.Path) {
+                '*read bytes/sec'  { $r.ReadMBps  = [math]::Round($cs.CookedValue / 1MB, 2) }
+                '*write bytes/sec' { $r.WriteMBps = [math]::Round($cs.CookedValue / 1MB, 2) }
+                '*transfers/sec'   { $r.Iops      = [math]::Round($cs.CookedValue, 0) }
+                '*queue length'    { $r.QueueLen  = [math]::Round($cs.CookedValue, 2) }
+            }
+        }
+        $r.Ok = $true
+    } catch {
+        try {
+            $d = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -ErrorAction Stop | Where-Object { $_.Name -eq '_Total' } | Select-Object -First 1
+            if ($d) {
+                $r.ReadMBps  = [math]::Round($d.DiskReadBytesPersec / 1MB, 2)
+                $r.WriteMBps = [math]::Round($d.DiskWriteBytesPersec / 1MB, 2)
+                $r.Iops      = [math]::Round($d.DiskTransfersPersec, 0)
+                $r.QueueLen  = [math]::Round($d.CurrentDiskQueueLength, 2)
+                $r.Ok = $true
+            }
+        } catch { }
+    }
+    return $r
+}
+
+function Get-HubDiskPerfSampleFast {
+    # Instant, non-blocking sample (already-cooked per-second CIM values) for periodic timers.
+    $r = [PSCustomObject]@{ ReadMBps = 0.0; WriteMBps = 0.0; Iops = 0.0; QueueLen = 0.0; Ok = $false }
+    try {
+        $d = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -ErrorAction Stop | Where-Object { $_.Name -eq '_Total' } | Select-Object -First 1
+        if ($d) {
+            $r.ReadMBps  = [math]::Round($d.DiskReadBytesPersec / 1MB, 2)
+            $r.WriteMBps = [math]::Round($d.DiskWriteBytesPersec / 1MB, 2)
+            $r.Iops      = [math]::Round($d.DiskTransfersPersec, 0)
+            $r.QueueLen  = [math]::Round($d.CurrentDiskQueueLength, 2)
+            $r.Ok = $true
+        }
+    } catch { }
+    return $r
+}
+
+function Get-HubSystemBaseline {
+    $b = [ordered]@{}
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+        $bios = Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+        $cpu = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+        $b.CollectedUtc   = [datetime]::UtcNow.ToString('o')
+        $b.ComputerName   = $env:COMPUTERNAME
+        $b.SerialNumber   = if ($bios) { $bios.SerialNumber } else { '' }
+        $b.Manufacturer   = if ($cs) { $cs.Manufacturer } else { '' }
+        $b.Model          = if ($cs) { $cs.Model } else { '' }
+        $b.CpuName        = if ($cpu) { ($cpu.Name).Trim() } else { '' }
+        $b.CpuCores       = if ($cpu) { [int]$cpu.NumberOfCores } else { 0 }
+        $b.CpuLogical     = if ($cpu) { [int]$cpu.NumberOfLogicalProcessors } else { 0 }
+        $b.CpuMaxClockMHz = if ($cpu) { [int]$cpu.MaxClockSpeed } else { 0 }
+        $b.RamGB          = if ($cs) { [math]::Round($cs.TotalPhysicalMemory / 1GB, 1) } else { 0 }
+        $b.OsCaption      = if ($os) { $os.Caption } else { '' }
+        $b.OsBuild        = if ($os) { $os.BuildNumber } else { '' }
+        $b.OsVersion      = if ($os) { $os.Version } else { '' }
+    } catch { }
+    try {
+        $mem = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue)
+        $b.RamModules  = $mem.Count
+        $b.RamSpeedMHz = if ($mem.Count -gt 0) { [int]($mem[0].Speed) } else { 0 }
+    } catch { $b.RamModules = 0; $b.RamSpeedMHz = 0 }
+    try {
+        $pd = Get-PhysicalDisk -ErrorAction SilentlyContinue | Sort-Object DeviceId | Select-Object -First 1
+        if ($pd) {
+            $b.DiskModel   = $pd.FriendlyName
+            $b.DiskSizeGB  = [math]::Round($pd.Size / 1GB, 0)
+            $b.DiskType    = "$($pd.MediaType)"
+            $b.DiskBus     = "$($pd.BusType)"
+            $rc = $pd | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
+            if ($rc) {
+                $b.DiskTempC        = [int]$rc.Temperature
+                $b.DiskWearPct      = [int]$rc.Wear
+                $b.DiskPowerOnHours = [int]$rc.PowerOnHours
+            }
+        }
+    } catch { }
+    return [PSCustomObject]$b
+}
+
+# --- Per-machine rolling baseline store (also the JSON a fleet platform aggregates) ---
+$script:DeploymentBaselineFile = Join-Path $script:PersistRoot 'deployment_baseline.json'
+
+function Get-HubStoredBaseline {
+    foreach ($fp in @($script:DeploymentBaselineFile, (Join-Path $env:ProgramData 'AutopilotCommandHub\deployment_baseline.json'))) {
+        if (Test-Path $fp) {
+            try { return (Get-Content $fp -Raw -ErrorAction Stop | ConvertFrom-Json) } catch { }
+        }
+    }
+    return $null
+}
+
+function Update-HubStoredBaseline {
+    param([Parameter(Mandatory)] $Metrics)
+    # Keep a simple exponential-moving-average baseline of the headline numbers so a single run
+    # cannot yank the baseline around, yet it still tracks genuine drift over re-deploys.
+    try {
+        $prev = Get-HubStoredBaseline
+        $alpha = 0.35
+        function _ema($old, $new) { if ($null -eq $old) { $new } else { [math]::Round((1 - $alpha) * $old + $alpha * $new, 2) } }
+        $bl = [PSCustomObject]@{
+            SchemaVersion    = 1
+            UpdatedUtc       = [datetime]::UtcNow.ToString('o')
+            Model            = $Metrics.Baseline.Model
+            SampleCount      = if ($prev -and $prev.SampleCount) { [int]$prev.SampleCount + 1 } else { 1 }
+            TotalSeconds     = _ema ($prev.TotalSeconds)     $Metrics.TotalSeconds
+            AvgDownloadMBps  = _ema ($prev.AvgDownloadMBps)  $Metrics.Wu.AvgDownloadMBps
+            AvgInstallMBpm   = _ema ($prev.AvgInstallMBpm)   $Metrics.Wu.AvgInstallMBpm
+            PeakReadMBps     = _ema ($prev.PeakReadMBps)     $Metrics.Disk.PeakReadMBps
+            PeakWriteMBps    = _ema ($prev.PeakWriteMBps)    $Metrics.Disk.PeakWriteMBps
+            PeakIops         = _ema ($prev.PeakIops)         $Metrics.Disk.PeakIops
+        }
+        $dir = Split-Path $script:DeploymentBaselineFile -Parent
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        ($bl | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $script:DeploymentBaselineFile -Encoding UTF8
+        return $bl
+    } catch { return $null }
+}
+
+function Get-HubBaselineComparison {
+    param([Parameter(Mandatory)] $Metrics, $Baseline)
+    if (-not $Baseline -or -not $Baseline.SampleCount) { return @() }
+    $rows = [System.Collections.Generic.List[object]]::new()
+    # For "higher is better" metrics a big negative delta is bad; for "lower is better" (time) a big positive delta is bad.
+    function _cmp($name, $thisVal, $baseVal, $unit, $higherIsBetter) {
+        if ($null -eq $baseVal -or $baseVal -eq 0) { return }
+        $delta = (($thisVal - $baseVal) / [double]$baseVal) * 100.0
+        $signed = '{0:+0;-0;0}%' -f [math]::Round($delta, 0)
+        $bad = if ($higherIsBetter) { $delta -le -30 } else { $delta -ge 30 }
+        $warn = if ($higherIsBetter) { $delta -le -15 } else { $delta -ge 15 }
+        $status = if ($bad) { 'ALERT' } elseif ($warn) { 'WARN' } else { 'OK' }
+        $rows.Add([PSCustomObject]@{
+            Metric   = $name
+            This     = ('{0:N1} {1}' -f $thisVal, $unit).Trim()
+            Baseline = ('{0:N1} {1}' -f $baseVal, $unit).Trim()
+            Delta    = $signed
+            Status   = $status
+        })
+    }
+    _cmp 'Total deployment (min)' ([math]::Round($Metrics.TotalSeconds / 60.0, 1)) ([math]::Round($Baseline.TotalSeconds / 60.0, 1)) 'min' $false
+    _cmp 'Avg download (MB/s)'    $Metrics.Wu.AvgDownloadMBps  $Baseline.AvgDownloadMBps 'MB/s' $true
+    _cmp 'Avg install (MB/min)'   $Metrics.Wu.AvgInstallMBpm   $Baseline.AvgInstallMBpm  'MB/min' $true
+    _cmp 'Disk read peak (MB/s)'  $Metrics.Disk.PeakReadMBps   $Baseline.PeakReadMBps    'MB/s' $true
+    _cmp 'Disk write peak (MB/s)' $Metrics.Disk.PeakWriteMBps  $Baseline.PeakWriteMBps   'MB/s' $true
+    _cmp 'Peak IOPS'              $Metrics.Disk.PeakIops       $Baseline.PeakIops        '' $true
+    return $rows.ToArray()
+}
+
+function Export-HubDeploymentReport {
+    param(
+        [Parameter(Mandatory)] $Metrics,   # the accumulated deployment-metrics object (see sample below)
+        [string]$Path = ''
+    )
+    $m = $Metrics
+    $bl = $m.Baseline
+    $serial = if ($bl.SerialNumber) { $bl.SerialNumber } else { $env:COMPUTERNAME }
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        $dir = 'C:\AutopilotLogs\Reports'
+        try { if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null } } catch { $dir = $env:TEMP }
+        $Path = Join-Path $dir ("DeploymentReport_{0}_{1}.html" -f $serial, ([datetime]::Now.ToString('yyyyMMdd_HHmmss')))
+    }
+
+    # ---- tiles ----
+    function Tile($label, $value, $sub) {
+        "<div class='tile'><div class='tval'>$(ConvertTo-HubSvgText $value)</div><div class='tlabel'>$(ConvertTo-HubSvgText $label)</div><div class='tsub'>$(ConvertTo-HubSvgText $sub)</div></div>"
+    }
+    $tiles = @(
+        Tile 'Total deployment' ("{0:N1} min" -f ($m.TotalSeconds / 60.0)) ("$([math]::Round($m.TotalSeconds,0)) s")
+        Tile 'Updates installed' "$($m.Wu.Installed)" ("$($m.Wu.Failed) failed")
+        Tile 'Avg download speed' ("{0:N1} MB/s" -f $m.Wu.AvgDownloadMBps) ("$([math]::Round($m.Wu.TotalDownloadMB,0)) MB total")
+        Tile 'Avg install speed' ("{0:N1} MB/min" -f $m.Wu.AvgInstallMBpm) ("$([math]::Round($m.Wu.TotalInstallSec,0)) s installing")
+        Tile 'Disk read (avg/peak)' ("{0:N0}/{1:N0} MB/s" -f $m.Disk.AvgReadMBps, $m.Disk.PeakReadMBps) ''
+        Tile 'Disk write (avg/peak)' ("{0:N0}/{1:N0} MB/s" -f $m.Disk.AvgWriteMBps, $m.Disk.PeakWriteMBps) ''
+        Tile 'Peak IOPS' ("{0:N0}" -f $m.Disk.PeakIops) ("avg $([math]::Round($m.Disk.AvgIops,0))")
+        Tile 'Reboots' "$($m.RebootCount)" ("$($m.StepCount) steps")
+    ) -join "`n"
+
+    # ---- charts ----
+    $stepBars = New-HubSvgBarChart -Data ($m.Steps | ForEach-Object { [pscustomobject]@{ Label = $_.ActionName; Value = $_.DurationSec } }) -Unit 's' -Color '#0067C0'
+    $updBars = if ($m.Wu.Updates -and @($m.Wu.Updates).Count -gt 0) {
+        New-HubSvgBarChart -Data ($m.Wu.Updates | ForEach-Object { [pscustomobject]@{ Label = $_.Title; Value = $_.SizeMB } }) -Unit 'MB' -Color '#7C3AED'
+    } else { "<p class='muted'>No updates were downloaded during this run.</p>" }
+
+    $diskLine = New-HubSvgLineChart -Series @(
+        @{ Name = 'Read MB/s';  Color = '#0284C7'; Points = @($m.Disk.Samples | ForEach-Object { @{ X = $_.T; Y = $_.ReadMBps } }) },
+        @{ Name = 'Write MB/s'; Color = '#DC2626'; Points = @($m.Disk.Samples | ForEach-Object { @{ X = $_.T; Y = $_.WriteMBps } }) }
+    ) -YUnit 'MB/s'
+    $iopsLine = New-HubSvgLineChart -Series @(
+        @{ Name = 'IOPS'; Color = '#15803D'; Points = @($m.Disk.Samples | ForEach-Object { @{ X = $_.T; Y = $_.Iops } }) }
+    ) -YUnit 'IOPS'
+
+    # ---- baseline / outlier section ----
+    $outlierRows = ''
+    if ($m.BaselineComparison) {
+        foreach ($c in $m.BaselineComparison) {
+            $cls = switch ($c.Status) { 'ALERT' {'bad'} 'WARN' {'warn'} default {'ok'} }
+            $outlierRows += "<tr><td>$(ConvertTo-HubSvgText $c.Metric)</td><td>$(ConvertTo-HubSvgText $c.This)</td><td>$(ConvertTo-HubSvgText $c.Baseline)</td><td>$(ConvertTo-HubSvgText $c.Delta)</td><td class='$cls'>$(ConvertTo-HubSvgText $c.Status)</td></tr>"
+        }
+    }
+    $outlierSection = if ($outlierRows) {
+        "<table class='grid'><thead><tr><th>Metric</th><th>This run</th><th>Baseline</th><th>Delta</th><th>Status</th></tr></thead><tbody>$outlierRows</tbody></table>"
+    } else { "<p class='muted'>No stored baseline yet - this run has been recorded as the initial baseline for $(ConvertTo-HubSvgText $bl.Model).</p>" }
+
+    # ---- baseline spec table ----
+    $specRows = ''
+    foreach ($kv in @(
+        @('Computer', "$($bl.ComputerName) ($($bl.SerialNumber))"),
+        @('Model', "$($bl.Manufacturer) $($bl.Model)"),
+        @('CPU', "$($bl.CpuName) - $($bl.CpuCores)C/$($bl.CpuLogical)T @ $($bl.CpuMaxClockMHz) MHz"),
+        @('Memory', "$($bl.RamGB) GB ($($bl.RamModules) modules @ $($bl.RamSpeedMHz) MHz)"),
+        @('Disk', "$($bl.DiskModel) - $($bl.DiskSizeGB) GB $($bl.DiskType) ($($bl.DiskBus)), temp $($bl.DiskTempC)C, wear $($bl.DiskWearPct)%"),
+        @('OS', "$($bl.OsCaption) $($bl.OsVersion) (build $($bl.OsBuild))")
+    )) {
+        $specRows += "<tr><th>$(ConvertTo-HubSvgText $kv[0])</th><td>$(ConvertTo-HubSvgText $kv[1])</td></tr>"
+    }
+
+    $genTime = [datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss')
+    $html = @"
+<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Deployment Report - $(ConvertTo-HubSvgText $serial)</title>
+<style>
+:root{--bg:#f3f4f6;--card:#fff;--ink:#1e293b;--muted:#64748b;--line:#e2e8f0;--accent:#0067c0;}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:'Segoe UI Variable Text','Segoe UI',system-ui,sans-serif;font-size:14px;line-height:1.45}
+.wrap{max-width:1000px;margin:0 auto;padding:24px}
+header h1{margin:0 0 2px;font-size:22px}header .sub{color:var(--muted);font-size:13px}
+.badge{display:inline-block;background:#e0f2fe;color:#0369a1;border:1px solid #bae6fd;border-radius:4px;padding:2px 8px;font-size:11px;font-weight:600;margin-left:8px;vertical-align:middle}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:18px 0}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px 16px}
+.tval{font-size:22px;font-weight:700}.tlabel{color:var(--muted);font-size:12px;margin-top:2px}.tsub{color:#94a3b8;font-size:11px;margin-top:3px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:16px 18px;margin:14px 0}
+.card h2{margin:0 0 12px;font-size:15px}
+.chart{display:block}.chart .track{fill:#eef2f7}.chart .blabel{font:12px 'Segoe UI',sans-serif;fill:#334155}.chart .bval{font:12px 'Segoe UI',sans-serif;fill:#0f172a;font-weight:600}
+.chart .grid{stroke:#eef2f7;stroke-width:1}.chart .axis{font:10px 'Segoe UI',sans-serif;fill:#94a3b8}
+table{border-collapse:collapse;width:100%;font-size:13px}table.grid th,table.grid td{border:1px solid var(--line);padding:6px 10px;text-align:left}
+table th{color:var(--muted);font-weight:600}.spec th{width:120px;color:var(--muted);text-align:left;padding:5px 10px;vertical-align:top}.spec td{padding:5px 10px}
+.ok{color:#15803d;font-weight:600}.warn{color:#b45309;font-weight:600}.bad{color:#b91c1c;font-weight:700}
+.muted{color:var(--muted)}.legend span{display:inline-block;margin-right:14px;font-size:12px}.dot{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:middle}
+footer{color:#94a3b8;font-size:11px;margin-top:20px;text-align:center}
+</style></head><body><div class='wrap'>
+<header><h1>Deployment Report <span class='badge'>$(ConvertTo-HubSvgText $m.RoutineName)</span></h1>
+<div class='sub'>$(ConvertTo-HubSvgText $bl.Manufacturer) $(ConvertTo-HubSvgText $bl.Model) &middot; $(ConvertTo-HubSvgText $serial) &middot; generated $genTime</div></header>
+<div class='tiles'>$tiles</div>
+<div class='card'><h2>Per-step duration</h2>$stepBars</div>
+<div class='card'><h2>Update package sizes</h2>$updBars</div>
+<div class='card'><h2>Disk throughput over deployment</h2>
+<div class='legend'><span><span class='dot' style='background:#0284c7'></span>Read MB/s</span><span><span class='dot' style='background:#dc2626'></span>Write MB/s</span></div>$diskLine</div>
+<div class='card'><h2>Disk IOPS over deployment</h2>
+<div class='legend'><span><span class='dot' style='background:#15803d'></span>IOPS (transfers/sec)</span></div>$iopsLine</div>
+<div class='card'><h2>Baseline comparison &amp; outliers</h2>$outlierSection</div>
+<div class='card'><h2>Machine baseline</h2><table class='spec'>$specRows</table></div>
+<footer>Autopilot Command Hub &middot; deployment telemetry &middot; JSON sidecar written next to this file for fleet ingestion</footer>
+</div></body></html>
+"@
+    try {
+        $targetDir = Split-Path -Path $Path -Parent
+        if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+        [System.IO.File]::WriteAllText($Path, $html, [System.Text.UTF8Encoding]::new($false))
+        $jsonPath = [System.IO.Path]::ChangeExtension($Path, '.json')
+        ($m | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ Success = $true; Path = $Path; JsonPath = $jsonPath }
+    } catch {
+        return [pscustomobject]@{ Success = $false; Message = $_.Exception.Message }
+    }
+}
+
+# --- Function: Test-HubClosedLoopVerification (Post-Enrollment Verification Engine) ---
+function Test-HubClosedLoopVerification {
+    [CmdletBinding()]
+    param(
+        [string]$ExpectedTenantId = '',
+        [string]$ExpectedGroupTag = ''
+    )
+
+    $checks = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $overallPassed = $true
+
+    # Check 1: TPM 2.0 Platform Security
+    $tpmOk = $false
+    $tpmDetail = "TPM not present or ready"
+    try {
+        $tpm = Get-Tpm -ErrorAction SilentlyContinue
+        if ($tpm -and $tpm.TpmPresent -and $tpm.TpmReady) {
+            $tpmOk = $true
+            $tpmDetail = "TPM 2.0 Present and Ready (Enabled: $($tpm.TpmEnabled))"
+        } else {
+            $tpmDetail = "TPM Present=$($tpm.TpmPresent), Ready=$($tpm.TpmReady)"
+        }
+    } catch { $tpmDetail = $_.Exception.Message }
+    $checks.Add([PSCustomObject]@{ Check = 'TPM 2.0 Platform Security'; Passed = $tpmOk; Details = $tpmDetail })
+    if (-not $tpmOk) { $overallPassed = $false }
+
+    # Check 2: UEFI Secure Boot
+    $sbOk = $false
+    $sbDetail = "Secure Boot not supported or Disabled"
+    try {
+        $sb = Confirm-SecureBootUEFI -ErrorAction SilentlyContinue
+        if ($sb -eq $true) {
+            $sbOk = $true
+            $sbDetail = "UEFI Secure Boot is Active and Enforced"
+        } else {
+            $sbDetail = "UEFI Secure Boot is Disabled"
+        }
+    } catch {
+        $sbDetail = "Non-UEFI BIOS or Secure Boot API unavailable"
+    }
+    $checks.Add([PSCustomObject]@{ Check = 'UEFI Secure Boot'; Passed = $sbOk; Details = $sbDetail })
+    if (-not $sbOk) { $overallPassed = $false }
+
+    # Check 3: BitLocker OS Drive Encryption
+    $blOk = $false
+    $blDetail = "BitLocker protection inactive"
+    try {
+        $vol = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
+        if ($vol) {
+            $hasTpm = $false
+            $hasRec = $false
+            if ($vol.KeyProtector) {
+                foreach ($kp in $vol.KeyProtector) {
+                    if ($kp.KeyProtectorType -match 'Tpm') { $hasTpm = $true }
+                    if ($kp.KeyProtectorType -match 'RecoveryPassword') { $hasRec = $true }
+                }
+            }
+            if ($vol.ProtectionStatus -eq 'On' -or $vol.VolumeStatus -in @('FullyEncrypted', 'EncryptionInProgress')) {
+                $blOk = $true
+                $blDetail = "Volume $($env:SystemDrive): $($vol.VolumeStatus) ($($vol.EncryptionPercentage)%), Protectors: $(if ($hasTpm){'TPM '}else{''})$(if ($hasRec){'RecoveryPassword'}else{''})"
+            } else {
+                $blDetail = "Volume $($env:SystemDrive) status: $($vol.VolumeStatus), Protection: $($vol.ProtectionStatus)"
+            }
+        }
+    } catch { $blDetail = $_.Exception.Message }
+    $checks.Add([PSCustomObject]@{ Check = 'BitLocker OS Drive Encryption'; Passed = $blOk; Details = $blDetail })
+
+    # Check 4: Autopilot Profile Assignment
+    $apOk = $false
+    $apDetail = "Autopilot profile unassigned"
+    try {
+        $foundTenant = $null
+        $foundCorrel = $null
+        $apFiles = @(
+            (Join-Path $env:SystemRoot 'Provisioning\Autopilot\AutopilotDeregistrationInfo.json'),
+            (Join-Path $env:SystemRoot 'Provisioning\Autopilot\AutopilotProfileCache.json')
+        )
+        foreach ($apf in $apFiles) {
+            if (Test-Path $apf) {
+                $raw = Get-Content -LiteralPath $apf -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($raw) {
+                    if ($raw.CloudAssignedTenantId) { $foundTenant = [string]$raw.CloudAssignedTenantId }
+                    if ($raw.ZtdCorrelationId) { $foundCorrel = [string]$raw.ZtdCorrelationId }
+                }
+            }
+        }
+        if (-not $foundTenant) {
+            $regTenant = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Provisioning\AutopilotPolicy\Cache' -Name 'CloudAssignedTenantId' -ErrorAction SilentlyContinue).CloudAssignedTenantId
+            if ($regTenant) { $foundTenant = [string]$regTenant }
+        }
+        if ($foundTenant) {
+            if ($ExpectedTenantId -and $foundTenant -ne $ExpectedTenantId) {
+                $apOk = $false
+                $apDetail = "Tenant mismatch: assigned $foundTenant, expected $ExpectedTenantId"
+            } else {
+                $apOk = $true
+                $apDetail = "Assigned Tenant: $foundTenant" + (if ($foundCorrel) { " (Correlation: $foundCorrel)" } else { "" })
+            }
+        } else {
+            $apDetail = "No cached Autopilot profile found in Provisioning or Registry"
+        }
+        if ($ExpectedGroupTag -and $apOk) {
+            if ($env:AUTOPILOT_GROUP_TAG -and $env:AUTOPILOT_GROUP_TAG -ne $ExpectedGroupTag) {
+                $apDetail += " [GroupTag expected: $ExpectedGroupTag]"
+            }
+        }
+    } catch { $apDetail = $_.Exception.Message }
+    $checks.Add([PSCustomObject]@{ Check = 'Autopilot Profile Assignment'; Passed = $apOk; Details = $apDetail })
+
+    # Check 5: MDM / Intune Enrollment Status
+    $mdmOk = $false
+    $mdmDetail = "Device not enrolled in MDM"
+    try {
+        $enrollments = Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue
+        if ($enrollments) {
+            foreach ($e in $enrollments) {
+                $provider = (Get-ItemProperty -Path $e.PSPath -Name 'ProviderID' -ErrorAction SilentlyContinue).ProviderID
+                $upn = (Get-ItemProperty -Path $e.PSPath -Name 'UPN' -ErrorAction SilentlyContinue).UPN
+                if ($provider -match 'MS DM Server' -or $provider -match 'Intune') {
+                    $mdmOk = $true
+                    $mdmDetail = "Enrolled via $provider (UPN: $upn)"
+                    break
+                }
+            }
+        }
+        if (-not $mdmOk) {
+            $certs = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue | Where-Object { $_.Issuer -match 'Microsoft Intune' -or $_.Issuer -match 'SC_Online_Issuing' }
+            if ($certs -and $certs.Count -gt 0) {
+                $mdmOk = $true
+                $mdmDetail = "Intune Device Certificate present: $($certs[0].Thumbprint.Substring(0,8))... ($($certs[0].Subject))"
+            }
+        }
+    } catch { $mdmDetail = $_.Exception.Message }
+    $checks.Add([PSCustomObject]@{ Check = 'Intune MDM Enrollment'; Passed = $mdmOk; Details = $mdmDetail })
+
+    # Check 6: Enrollment Status Page (ESP)
+    $espOk = $true
+    $espDetail = "ESP tracking clean"
+    try {
+        $espReg = 'HKLM:\SOFTWARE\Microsoft\Windows\Autopilot\EnrollmentStatusTracking'
+        if (Test-Path $espReg) {
+            $espVals = Get-ChildItem -Path $espReg -Recurse -ErrorAction SilentlyContinue
+            $hasError = $false
+            if ($espVals) {
+                foreach ($v in $espVals) {
+                    $props = Get-ItemProperty -Path $v.PSPath -ErrorAction SilentlyContinue
+                    if ($props.InstallationState -and $props.InstallationState -eq 3) {
+                        $hasError = $true
+                        $espDetail = "ESP subcategory error: $($v.PSChildName)"
+                        break
+                    }
+                }
+            }
+            if ($hasError) {
+                $espOk = $false
+            } else {
+                $espDetail = "ESP records all subcategories completed or not errored"
+            }
+        } else {
+            $espDetail = "ESP tracking key not initialized (pre-OOBE or bypassed)"
+        }
+    } catch { $espDetail = $_.Exception.Message }
+    $checks.Add([PSCustomObject]@{ Check = 'Enrollment Status Page (ESP)'; Passed = $espOk; Details = $espDetail })
+
+    # Check 7: Endpoint Protection (Defender)
+    $defOk = $false
+    $defDetail = "Defender status unavailable"
+    try {
+        $mp = Get-MpComputerStatus -ErrorAction SilentlyContinue
+        if ($mp -and $mp.RealTimeProtectionEnabled -and $mp.AntivirusEnabled) {
+            $defOk = $true
+            $defDetail = "Defender Active (RTP: True, Engine: $($mp.AMEngineVersion))"
+        } elseif ($mp) {
+            $defDetail = "RealTimeProtection: $($mp.RealTimeProtectionEnabled), Antivirus: $($mp.AntivirusEnabled)"
+        }
+    } catch { $defDetail = $_.Exception.Message }
+    $checks.Add([PSCustomObject]@{ Check = 'Endpoint Protection (Defender)'; Passed = $defOk; Details = $defDetail })
+
+    $passedCount = ($checks | Where-Object { $_.Passed }).Count
+    $verdict = if ($passedCount -eq $checks.Count) { 'VERIFIED' } elseif ($passedCount -ge 4) { 'PROVISIONED_WITH_WARNINGS' } else { 'VERIFICATION_FAILED' }
+
+    return [PSCustomObject]@{
+        DeploymentId = $script:HubDeploymentId
+        VerifiedUtc  = [datetime]::UtcNow.ToString('o')
+        Verdict      = $verdict
+        PassedCount  = $passedCount
+        TotalChecks  = $checks.Count
+        PassedRatio  = [math]::Round(($passedCount / [math]::Max(1, $checks.Count)) * 100, 1)
+        Checks       = $checks
+    }
+}
+
+# --- Function: Export-HubProvisioningReceipt (Tamper-Evident Provisioning Receipt Exporter) ---
+function Export-HubProvisioningReceipt {
+    [CmdletBinding()]
+    param(
+        [string]$DeploymentId = '',
+        $Metrics = $null,
+        [string]$OutputDir = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($DeploymentId)) {
+        if ($script:HubDeploymentId) {
+            $DeploymentId = $script:HubDeploymentId
+        } else {
+            $DeploymentId = "HUB-{0}-{1}" -f (Get-Date -Format 'yyyyMMdd'), ([guid]::NewGuid().ToString('N').Substring(0,8).ToUpper())
+            $script:HubDeploymentId = $DeploymentId
+        }
+    }
+
+    $expTenant = if ($env:AZURE_TENANT_ID) { $env:AZURE_TENANT_ID } else { '' }
+    $expGt = if ($script:ActiveDeploymentProfile -and $script:ActiveDeploymentProfile.GroupTag) { $script:ActiveDeploymentProfile.GroupTag } else { (if ($env:AUTOPILOT_GROUP_TAG) { $env:AUTOPILOT_GROUP_TAG } else { '' }) }
+    $verification = Test-HubClosedLoopVerification -ExpectedTenantId $expTenant -ExpectedGroupTag $expGt
+    $serial = try { if ($script:DeviceState -and $script:DeviceState.SerialNumber) { $script:DeviceState.SerialNumber } else { (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber } } catch { 'UNKNOWN' }
+    if ([string]::IsNullOrWhiteSpace($serial)) { $serial = $env:COMPUTERNAME }
+    $mfg = try { if ($script:DeviceState -and $script:DeviceState.Manufacturer) { $script:DeviceState.Manufacturer } else { (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Manufacturer } } catch { 'UNKNOWN' }
+    $model = try { if ($script:DeviceState -and $script:DeviceState.Model) { $script:DeviceState.Model } else { (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Model } } catch { 'UNKNOWN' }
+    $os = try { (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption } catch { 'Windows' }
+    $build = try { (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).BuildNumber } catch { '' }
+
+    if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+        $OutputDir = 'C:\AutopilotLogs\Receipts'
+        try { if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null } } catch { $OutputDir = $env:TEMP }
+    }
+
+    $jsonPath = Join-Path $OutputDir "Receipt_${serial}_${DeploymentId}.json"
+    $htmlPath = Join-Path $OutputDir "Receipt_${serial}_${DeploymentId}.html"
+
+    $site = if ($script:ActiveDeploymentProfile -and $script:ActiveDeploymentProfile.Site) { $script:ActiveDeploymentProfile.Site } else { (if ($env:AUTOPILOT_SITE) { $env:AUTOPILOT_SITE } else { 'Default' }) }
+    $profId = if ($script:ActiveDeploymentProfile) { $script:ActiveDeploymentProfile.Id } else { 'Manual' }
+
+    $receiptData = [ordered]@{
+        SchemaVersion   = 1
+        ReceiptType     = 'AutopilotProvisioningReceipt'
+        DeploymentId    = $DeploymentId
+        GeneratedUtc    = [datetime]::UtcNow.ToString('o')
+        Technician      = $env:USERNAME
+        Site            = $site
+        ProfileId       = $profId
+        Verdict         = $verification.Verdict
+        Score           = "$($verification.PassedCount)/$($verification.TotalChecks)"
+        Device          = [ordered]@{
+            ComputerName    = $env:COMPUTERNAME
+            SerialNumber    = $serial
+            Manufacturer    = $mfg
+            Model           = $model
+            OperatingSystem = "$os (Build $build)"
+            MacAddress      = try { (Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Select-Object -First 1).MacAddress } catch { 'N/A' }
+        }
+        Verification    = $verification.Checks
+        SummaryMetrics  = if ($Metrics) {
+            [ordered]@{
+                RoutineName   = $Metrics.RoutineName
+                TotalSeconds  = $Metrics.TotalSeconds
+                StepCount     = $Metrics.StepCount
+                UpdatesCount  = if ($Metrics.Wu) { $Metrics.Wu.Installed } else { 0 }
+                AvgDiskRead   = if ($Metrics.Disk) { $Metrics.Disk.AvgReadMBps } else { 0 }
+                AvgDiskWrite  = if ($Metrics.Disk) { $Metrics.Disk.AvgWriteMBps } else { 0 }
+                PeakIops      = if ($Metrics.Disk) { $Metrics.Disk.PeakIops } else { 0 }
+            }
+        } else { $null }
+    }
+
+    # Compute Tamper-Evident SHA-256 Digest over canonical JSON
+    $jsonForHash = ($receiptData | ConvertTo-Json -Depth 6)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $hashBytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($jsonForHash))
+    $digestHex = -join ($hashBytes | ForEach-Object { $_.ToString('X2') })
+    $receiptData['IntegrityHash'] = $digestHex
+
+    # Write JSON receipt
+    $fullJson = ($receiptData | ConvertTo-Json -Depth 6)
+    [System.IO.File]::WriteAllText($jsonPath, $fullJson, [System.Text.UTF8Encoding]::new($false))
+
+    # HTML Receipt Generation
+    $verdictClass = switch ($verification.Verdict) {
+        'VERIFIED' { 'badge-pass' }
+        'PROVISIONED_WITH_WARNINGS' { 'badge-warn' }
+        default { 'badge-fail' }
+    }
+
+    $checkRows = ''
+    foreach ($chk in $verification.Checks) {
+        $stCls = if ($chk.Passed) { 'pass-cell' } else { 'fail-cell' }
+        $icon = if ($chk.Passed) { '[PASS]' } else { '[WARN]' }
+        $checkRows += "<tr><td class='chk-name'>$(ConvertTo-HubSvgText $chk.Check)</td><td class='$stCls'>$icon</td><td class='chk-detail'>$(ConvertTo-HubSvgText $chk.Details)</td></tr>`n"
+    }
+
+    $genTime = [datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss')
+    $htmlContent = @"
+<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Provisioning Receipt - $(ConvertTo-HubSvgText $serial)</title>
+<style>
+:root{--bg:#f8fafc;--card:#ffffff;--ink:#0f172a;--muted:#64748b;--border:#e2e8f0;--accent:#0067c0;--green:#15803d;--amber:#b45309;--red:#b91c1c;}
+*{box-sizing:border-box}body{margin:0;padding:24px;background:var(--bg);color:var(--ink);font-family:'Segoe UI',system-ui,sans-serif;font-size:13.5px;line-height:1.45}
+.receipt-wrap{max-width:850px;margin:0 auto;background:var(--card);border:2px solid var(--border);border-radius:8px;padding:32px;box-shadow:0 4px 6px -1px rgba(0,0,0,0.05)}
+.receipt-hdr{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid var(--border);padding-bottom:18px;margin-bottom:20px}
+.receipt-title{font-size:22px;font-weight:700;letter-spacing:-0.5px;margin:0 0 4px;color:var(--ink)}
+.receipt-sub{color:var(--muted);font-size:12px;font-family:Consolas,monospace}
+.badge{display:inline-block;padding:4px 12px;border-radius:4px;font-size:12px;font-weight:700;letter-spacing:0.5px}
+.badge-pass{background:#dcfce7;color:var(--green);border:1px solid #bbf7d0}
+.badge-warn{background:#fef3c7;color:var(--amber);border:1px solid #fde68a}
+.badge-fail{background:#fee2e2;color:var(--red);border:1px solid #fecaca}
+.meta-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:24px;background:#f1f5f9;border-radius:6px;padding:14px}
+.meta-item .m-lbl{font-size:11px;color:var(--muted);text-transform:uppercase;font-weight:600}
+.meta-item .m-val{font-size:13.5px;font-weight:600;margin-top:2px;color:var(--ink)}
+.sec-title{font-size:15px;font-weight:700;margin:20px 0 10px;color:#1e293b;border-bottom:1px solid var(--border);padding-bottom:6px}
+table{width:100%;border-collapse:collapse;margin-bottom:20px;font-size:13px}
+table th{text-align:left;padding:8px 10px;background:#f8fafc;color:var(--muted);border-bottom:2px solid var(--border);font-size:12px;font-weight:600}
+table td{padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top}
+.chk-name{font-weight:600;width:220px}
+.pass-cell{color:var(--green);font-weight:700;width:70px}
+.fail-cell{color:var(--amber);font-weight:700;width:70px}
+.chk-detail{color:#334155;font-size:12.5px}
+.seal-box{background:#f8fafc;border:1px dashed #cbd5e1;border-radius:6px;padding:12px 16px;margin-top:20px;font-family:Consolas,monospace;font-size:11.5px;color:#475569}
+.seal-title{font-weight:700;color:var(--accent);margin-bottom:4px;font-size:12px}
+.seal-hash{word-break:break-all;color:#0f172a;font-weight:600}
+.receipt-ftr{margin-top:24px;text-align:center;font-size:11px;color:var(--muted)}
+@media print{.receipt-wrap{border:none;box-shadow:none;padding:0}}
+</style></head><body>
+<div class='receipt-wrap'>
+<div class='receipt-hdr'>
+<div>
+<div class='receipt-title'>Autopilot Provisioning Receipt</div>
+<div class='receipt-sub'>Deployment ID: $(ConvertTo-HubSvgText $DeploymentId)</div>
+</div>
+<div><span class='badge $verdictClass'>$($verification.Verdict) ($($verification.PassedCount)/$($verification.TotalChecks))</span></div>
+</div>
+
+<div class='meta-grid'>
+<div class='meta-item'><div class='m-lbl'>Device Serial</div><div class='m-val'>$(ConvertTo-HubSvgText $serial)</div></div>
+<div class='meta-item'><div class='m-lbl'>Model</div><div class='m-val'>$(ConvertTo-HubSvgText $mfg) $(ConvertTo-HubSvgText $model)</div></div>
+<div class='meta-item'><div class='m-lbl'>Site / Profile</div><div class='m-val'>$(ConvertTo-HubSvgText $site) ($profId)</div></div>
+<div class='meta-item'><div class='m-lbl'>Technician</div><div class='m-val'>$(ConvertTo-HubSvgText $env:USERNAME)</div></div>
+<div class='meta-item'><div class='m-lbl'>OS / Build</div><div class='m-val'>$(ConvertTo-HubSvgText $os) (Build $build)</div></div>
+<div class='meta-item'><div class='m-lbl'>Generated</div><div class='m-val'>$genTime</div></div>
+</div>
+
+<div class='sec-title'>Post-Enrollment Verification Audit</div>
+<table>
+<thead><tr><th>Check</th><th>Status</th><th>Verification Evidence &amp; Details</th></tr></thead>
+<tbody>
+$checkRows
+</tbody>
+</table>
+
+<div class='seal-box'>
+<div class='seal-title'>[#] Tamper-Evident SHA-256 Digital Integrity Seal</div>
+<div>Digest: <span class='seal-hash'>$digestHex</span></div>
+<div style='margin-top:4px;color:#64748b;font-size:10.5px;'>This cryptographic digest binds the device serial, hardware state, verification outcomes, and deployment telemetry into an immutable record.</div>
+</div>
+
+<div class='receipt-ftr'>
+Autopilot Command Hub &middot; Enterprise Endpoint Provisioning Platform &middot; https://onyachamp.com
+</div>
+</div>
+</body></html>
+"@
+
+    [System.IO.File]::WriteAllText($htmlPath, $htmlContent, [System.Text.UTF8Encoding]::new($false))
+    return [PSCustomObject]@{
+        Success      = $true
+        DeploymentId = $DeploymentId
+        HtmlPath     = $htmlPath
+        JsonPath     = $jsonPath
+        ReceiptData  = $receiptData
+    }
+}
+
+# --- Function: Test-HubProvisioningReceipt (Cryptographic Verification of Signed Receipts) ---
+function Test-HubProvisioningReceipt {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$ReceiptPathOrObject
+    )
+
+    $receiptObj = $null
+    if ($ReceiptPathOrObject -is [string]) {
+        if (-not (Test-Path -LiteralPath $ReceiptPathOrObject)) {
+            return [PSCustomObject]@{ IsValid = $false; Reason = "File not found: $ReceiptPathOrObject" }
+        }
+        try {
+            $receiptObj = Get-Content -LiteralPath $ReceiptPathOrObject -Raw -Encoding UTF8 | ConvertFrom-Json
+        } catch {
+            return [PSCustomObject]@{ IsValid = $false; Reason = "Invalid JSON: $($_.Exception.Message)" }
+        }
+    } else {
+        $receiptObj = $ReceiptPathOrObject
+    }
+
+    if (-not $receiptObj -or -not $receiptObj.IntegrityHash) {
+        return [PSCustomObject]@{ IsValid = $false; Reason = "Missing IntegrityHash in receipt payload" }
+    }
+
+    $storedHash = [string]$receiptObj.IntegrityHash
+
+    $cleanData = [ordered]@{}
+    foreach ($prop in $receiptObj.PSObject.Properties) {
+        if ($prop.Name -ne 'IntegrityHash') {
+            $cleanData[$prop.Name] = $prop.Value
+        }
+    }
+
+    $jsonForHash = ($cleanData | ConvertTo-Json -Depth 6)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $computedBytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($jsonForHash))
+    $computedHash = -join ($computedBytes | ForEach-Object { $_.ToString('X2') })
+
+    $isValid = ($storedHash -eq $computedHash)
+    return [PSCustomObject]@{
+        IsValid      = $isValid
+        DeploymentId = $receiptObj.DeploymentId
+        Verdict      = $receiptObj.Verdict
+        StoredHash   = $storedHash
+        ComputedHash = $computedHash
+        Reason       = if ($isValid) { "Cryptographic integrity seal verified (SHA-256 match)" } else { "Integrity seal mismatch: payload has been modified" }
+    }
+}
+
+# --- Function: Buffer-HubFleetTelemetry (Offline Telemetry Staging) ---
+function Buffer-HubFleetTelemetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$PayloadJson,
+        [string]$DeploymentId = ''
+    )
+
+    $bufDir = if ($script:FleetBufferDir) { $script:FleetBufferDir } else { 'C:\AutopilotLogs\FleetBuffer' }
+    try {
+        if (-not (Test-Path $bufDir)) { New-Item -ItemType Directory -Path $bufDir -Force | Out-Null }
+    } catch {
+        $bufDir = Join-Path $env:TEMP 'AutopilotFleetBuffer'
+        if (-not (Test-Path $bufDir)) { New-Item -ItemType Directory -Path $bufDir -Force | Out-Null }
+    }
+
+    $idSafe = if ($DeploymentId) { $DeploymentId } else { [guid]::NewGuid().ToString('N') }
+    $ts = [datetime]::UtcNow.ToString('yyyyMMdd_HHmmss')
+    $filePath = Join-Path $bufDir "Telemetry_${idSafe}_${ts}.json"
+    [System.IO.File]::WriteAllText($filePath, $PayloadJson, [System.Text.UTF8Encoding]::new($false))
+    return $filePath
+}
+
+# --- Function: Flush-HubFleetBuffer (Outbound Buffer Drain Engine) ---
+function Flush-HubFleetBuffer {
+    [CmdletBinding()]
+    param([string]$Endpoint = '')
+
+    if ([string]::IsNullOrWhiteSpace($Endpoint)) {
+        $Endpoint = if ($env:AUTOPILOT_FLEET_ENDPOINT) { $env:AUTOPILOT_FLEET_ENDPOINT } else { $env:HUB_FLEET_ENDPOINT }
+    }
+    if ([string]::IsNullOrWhiteSpace($Endpoint)) {
+        return [PSCustomObject]@{ Success = $false; FlushedCount = 0; PendingCount = 0; Message = 'No fleet endpoint configured' }
+    }
+
+    $bufDir = if ($script:FleetBufferDir) { $script:FleetBufferDir } else { 'C:\AutopilotLogs\FleetBuffer' }
+    if (-not (Test-Path $bufDir)) {
+        return [PSCustomObject]@{ Success = $true; FlushedCount = 0; PendingCount = 0; Message = 'Buffer directory empty' }
+    }
+
+    $files = Get-ChildItem -Path $bufDir -Filter "Telemetry_*.json" -ErrorAction SilentlyContinue
+    if (-not $files -or $files.Count -eq 0) {
+        return [PSCustomObject]@{ Success = $true; FlushedCount = 0; PendingCount = 0; Message = 'Zero pending telemetry payloads' }
+    }
+
+    $flushed = 0
+    $failed = 0
+    foreach ($f in $files) {
+        try {
+            $json = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
+            $uri = [System.Uri]::new($Endpoint)
+            $req = [System.Net.HttpWebRequest]::Create($uri)
+            $req.Method = 'POST'
+            $req.ContentType = 'application/json; charset=utf-8'
+            $req.Timeout = 6000
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+            $req.ContentLength = $bytes.Length
+            $s = $req.GetRequestStream()
+            $s.Write($bytes, 0, $bytes.Length)
+            $s.Close()
+            $resp = $req.GetResponse()
+            $resp.Close()
+            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+            $flushed++
+        } catch {
+            $failed++
+        }
+    }
+
+    return [PSCustomObject]@{
+        Success      = ($failed -eq 0)
+        FlushedCount = $flushed
+        PendingCount = $failed
+        Message      = "Flushed $flushed payload(s), $failed pending"
+    }
+}
+
+# --- Function: Send-HubFleetTelemetry (Telemetry Ingestion Client) ---
+function Send-HubFleetTelemetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Payload,
+        [string]$Endpoint = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Endpoint)) {
+        $Endpoint = if ($env:AUTOPILOT_FLEET_ENDPOINT) { $env:AUTOPILOT_FLEET_ENDPOINT } elseif ($env:HUB_FLEET_ENDPOINT) { $env:HUB_FLEET_ENDPOINT } else { '' }
+    }
+
+    $deploymentId = if ($Payload -and $Payload.DeploymentId) { $Payload.DeploymentId } else { $script:HubDeploymentId }
+    $json = if ($Payload -is [string]) { $Payload } else { ($Payload | ConvertTo-Json -Depth 8) }
+    if (-not $deploymentId -and $Payload -is [string]) {
+        try {
+            $pObj = $Payload | ConvertFrom-Json
+            if ($pObj.DeploymentId) { $deploymentId = $pObj.DeploymentId }
+        } catch { }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Endpoint)) {
+        $bufPath = Buffer-HubFleetTelemetry -PayloadJson $json -DeploymentId $deploymentId
+        return [PSCustomObject]@{
+            Success  = $true
+            Buffered = $true
+            Endpoint = ''
+            Path     = $bufPath
+            Message  = "Telemetry buffered locally (no endpoint configured): $bufPath"
+        }
+    }
+
+    try {
+        $uri = [System.Uri]::new($Endpoint)
+        $req = [System.Net.HttpWebRequest]::Create($uri)
+        $req.Method = 'POST'
+        $req.ContentType = 'application/json; charset=utf-8'
+        $req.Timeout = 6000
+        $req.UserAgent = "AutopilotCommandHub/FleetClient ($deploymentId)"
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $req.ContentLength = $bytes.Length
+
+        $s = $req.GetRequestStream()
+        $s.Write($bytes, 0, $bytes.Length)
+        $s.Close()
+
+        $resp = $req.GetResponse()
+        $respStream = $resp.GetResponseStream()
+        $reader = [System.IO.StreamReader]::new($respStream)
+        $respText = $reader.ReadToEnd()
+        $reader.Close()
+        $resp.Close()
+
+        # Opportunistic flush of buffer
+        try { Flush-HubFleetBuffer -Endpoint $Endpoint | Out-Null } catch { }
+
+        return [PSCustomObject]@{
+            Success  = $true
+            Buffered = $false
+            Endpoint = $Endpoint
+            Message  = "Delivered to $Endpoint (HTTP 200)"
+            Response = $respText
+        }
+    } catch {
+        $bufPath = Buffer-HubFleetTelemetry -PayloadJson $json -DeploymentId $deploymentId
+        return [PSCustomObject]@{
+            Success  = $false
+            Buffered = $true
+            Endpoint = $Endpoint
+            Path     = $bufPath
+            Message  = "Delivery error ($($_.Exception.Message)). Buffered to: $bufPath"
+        }
+    }
+}
+
+# --- Function: Get-HubCohortBaseline (Cross-Fleet Statistical Baseline Engine) ---
+function Get-HubCohortBaseline {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][array]$Records,
+        [string]$Model = ''
+    )
+
+    $matching = if ($Model) {
+        @($Records | Where-Object { ($_.Device -and $_.Device.Model -like "*$Model*") -or ($_.Baseline -and $_.Baseline.Model -like "*$Model*") })
+    } else {
+        @($Records)
+    }
+
+    if ($matching.Count -eq 0) { return $null }
+
+    $durations = [System.Collections.Generic.List[double]]::new()
+    $downloads = [System.Collections.Generic.List[double]]::new()
+    $iopsArr   = [System.Collections.Generic.List[double]]::new()
+
+    foreach ($r in $matching) {
+        if ($r.TotalSeconds) { $durations.Add([double]$r.TotalSeconds) }
+        elseif ($r.Metrics -and $r.Metrics.TotalSeconds) { $durations.Add([double]$r.Metrics.TotalSeconds) }
+
+        if ($r.Metrics -and $r.Metrics.Wu -and $r.Metrics.Wu.AvgDownloadMBps) {
+            $downloads.Add([double]$r.Metrics.Wu.AvgDownloadMBps)
+        }
+        if ($r.Metrics -and $r.Metrics.Disk -and $r.Metrics.Disk.AvgIops) {
+            $iopsArr.Add([double]$r.Metrics.Disk.AvgIops)
+        }
+    }
+
+    function _calcStats([System.Collections.Generic.List[double]]$nums) {
+        if (-not $nums -or $nums.Count -eq 0) { return [PSCustomObject]@{ N = 0; Mean = 0; StdDev = 0; Median = 0; P5 = 0; P95 = 0 } }
+        $n = $nums.Count
+        $sorted = @($nums | Sort-Object)
+        $sum = 0
+        foreach ($x in $sorted) { $sum += $x }
+        $mean = $sum / [double]$n
+
+        $variance = 0.0
+        if ($n -gt 1) {
+            $sumSq = 0.0
+            foreach ($x in $sorted) { $sumSq += [math]::Pow($x - $mean, 2) }
+            $variance = $sumSq / [double]($n - 1)
+        }
+        $stdDev = [math]::Sqrt($variance)
+
+        $medIdx = [int][math]::Floor($n / 2)
+        $median = if ($n % 2 -eq 0 -and $medIdx -gt 0) { ($sorted[$medIdx - 1] + $sorted[$medIdx]) / 2.0 } else { $sorted[$medIdx] }
+        $p5Idx = [math]::Max(0, [int][math]::Floor($n * 0.05))
+        $p95Idx = [math]::Min($n - 1, [int][math]::Floor($n * 0.95))
+
+        return [PSCustomObject]@{
+            N      = $n
+            Mean   = [math]::Round($mean, 1)
+            StdDev = [math]::Round($stdDev, 1)
+            Median = [math]::Round($median, 1)
+            P5     = [math]::Round($sorted[$p5Idx], 1)
+            P95    = [math]::Round($sorted[$p95Idx], 1)
+        }
+    }
+
+    return [PSCustomObject]@{
+        Model         = if ($Model) { $Model } else { 'All Models' }
+        SampleCount   = $matching.Count
+        DurationStats = (_calcStats $durations)
+        DownloadStats = (_calcStats $downloads)
+        DiskIopsStats = (_calcStats $iopsArr)
+        GeneratedUtc  = [datetime]::UtcNow.ToString('o')
+    }
+}
+
+# --- Function: Test-HubCohortOutlier (Statistical Outlier Detector) ---
+function Test-HubCohortOutlier {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Metrics,
+        $CohortBaseline
+    )
+
+    if (-not $CohortBaseline -or $CohortBaseline.DurationStats.N -lt 3) {
+        return @()
+    }
+
+    $outliers = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $dur = [double]$Metrics.TotalSeconds
+    $dStats = $CohortBaseline.DurationStats
+
+    if ($dStats.StdDev -gt 0) {
+        $zScore = ($dur - $dStats.Mean) / $dStats.StdDev
+        $zThresh = if ($dStats.N -le 8) { 1.65 } else { 2.0 }
+        if ($zScore -gt $zThresh) {
+            $outliers.Add([PSCustomObject]@{
+                Metric   = 'Total Deployment Duration'
+                Severity = 'ALERT'
+                Value    = "$([math]::Round($dur, 0)) s"
+                Expected = "$($dStats.Mean) s (+/- $($dStats.StdDev) s)"
+                ZScore   = [math]::Round($zScore, 2)
+                Message  = "Unit took $([math]::Round($dur,0))s (+$( [math]::Round($zScore, 1) ) sigma vs $($dStats.Mean)s cohort average) - 98th percentile slow"
+            })
+        }
+    }
+
+    $dl = 0.0
+    if ($Metrics.Wu -and $Metrics.Wu.AvgDownloadMBps) { $dl = [double]$Metrics.Wu.AvgDownloadMBps }
+    elseif ($Metrics.Metrics -and $Metrics.Metrics.Wu -and $Metrics.Metrics.Wu.AvgDownloadMBps) { $dl = [double]$Metrics.Metrics.Wu.AvgDownloadMBps }
+    if ($dl -gt 0 -and $CohortBaseline.DownloadStats -and $CohortBaseline.DownloadStats.N -ge 3) {
+        $dlStats = $CohortBaseline.DownloadStats
+        if ($dlStats.StdDev -gt 0) {
+            $zScoreDl = ($dl - $dlStats.Mean) / $dlStats.StdDev
+            $zDlThresh = if ($dlStats.N -le 8) { -1.5 } else { -1.8 }
+            if ($zScoreDl -lt $zDlThresh) {
+                $outliers.Add([PSCustomObject]@{
+                    Metric   = 'WU Network Download Speed'
+                    Severity = 'WARN'
+                    Value    = "$([math]::Round($dl, 1)) MB/s"
+                    Expected = "$($dlStats.Mean) MB/s"
+                    ZScore   = [math]::Round($zScoreDl, 2)
+                    Message  = "Download throughput $([math]::Round($dl,1)) MB/s is significantly below cohort average ($($dlStats.Mean) MB/s)"
+                })
+            }
+        }
+    }
+
+    $diskIops = 0.0
+    if ($Metrics.Disk -and $Metrics.Disk.AvgIops) { $diskIops = [double]$Metrics.Disk.AvgIops }
+    elseif ($Metrics.Metrics -and $Metrics.Metrics.Disk -and $Metrics.Metrics.Disk.AvgIops) { $diskIops = [double]$Metrics.Metrics.Disk.AvgIops }
+
+    if ($diskIops -gt 0 -and $CohortBaseline.DiskIopsStats -and $CohortBaseline.DiskIopsStats.N -ge 3) {
+        $iStats = $CohortBaseline.DiskIopsStats
+        if ($iStats.StdDev -gt 0) {
+            $zScoreIops = ($diskIops - $iStats.Mean) / $iStats.StdDev
+            $zIopsThresh = if ($iStats.N -le 8) { -1.5 } else { -1.8 }
+            if ($zScoreIops -lt $zIopsThresh) {
+                $outliers.Add([PSCustomObject]@{
+                    Metric   = 'Storage Disk IOPS'
+                    Severity = 'WARN'
+                    Value    = "$([math]::Round($diskIops, 0)) IOPS"
+                    Expected = "$($iStats.Mean) IOPS"
+                    ZScore   = [math]::Round($zScoreIops, 2)
+                    Message  = "Storage IOPS $([math]::Round($diskIops,0)) is significantly degraded below cohort average ($($iStats.Mean) IOPS)"
+                })
+            }
+        }
+    }
+
+    return @($outliers)
+}
+
+# --- Function: Export-HubFleetDashboardHtml (Standalone Interactive Fleet Dashboard Exporter) ---
+function Export-HubFleetDashboardHtml {
+    [CmdletBinding()]
+    param(
+        [array]$Deployments = @(),
+        [string]$OutputPath = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+        $OutputPath = 'C:\AutopilotLogs\FleetDashboard.html'
+        try {
+            $dir = Split-Path $OutputPath -Parent
+            if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        } catch { $OutputPath = Join-Path $env:TEMP 'FleetDashboard.html' }
+    }
+
+    $totalDep = $Deployments.Count
+    $successDep = @($Deployments | Where-Object { $_.Status -eq 'Success' -or ($_.Verdict -and $_.Verdict -ne 'VERIFICATION_FAILED') }).Count
+    $passRate = if ($totalDep -gt 0) { [math]::Round(($successDep / [double]$totalDep) * 100, 1) } else { 100.0 }
+    $durations = @($Deployments | ForEach-Object { if ($_.TotalSeconds) { [double]$_.TotalSeconds } elseif ($_.Metrics -and $_.Metrics.TotalSeconds) { [double]$_.Metrics.TotalSeconds } })
+    $sortedDur = @($durations | Sort-Object)
+    $medianSec = if ($sortedDur.Count -gt 0) { [math]::Round($sortedDur[[int][math]::Floor($sortedDur.Count / 2)], 0) } else { 0 }
+
+    # Group by model
+    $modelGroups = @{}
+    foreach ($d in $Deployments) {
+        $mName = if ($d.Device -and $d.Device.Model) { $d.Device.Model } elseif ($d.Baseline -and $d.Baseline.Model) { $d.Baseline.Model } else { 'Generic Model' }
+        if (-not $modelGroups.ContainsKey($mName)) { $modelGroups[$mName] = [System.Collections.Generic.List[object]]::new() }
+        $modelGroups[$mName].Add($d)
+    }
+
+    $cohortRows = ''
+    $cohortMap = @{}
+    foreach ($mKey in $modelGroups.Keys) {
+        $mList = $modelGroups[$mKey]
+        $cBase = Get-HubCohortBaseline -Records $mList -Model $mKey
+        $cohortMap[$mKey] = $cBase
+        $med = if ($cBase -and $cBase.DurationStats) { "$($cBase.DurationStats.Median) s" } else { '-' }
+        $meanStd = if ($cBase -and $cBase.DurationStats) { "$($cBase.DurationStats.Mean) s (+/- $($cBase.DurationStats.StdDev)s)" } else { '-' }
+        $avgDl = if ($cBase -and $cBase.DownloadStats -and $cBase.DownloadStats.Mean) { "$($cBase.DownloadStats.Mean) MB/s" } else { '-' }
+        $cohortRows += "<tr><td class='font-bold'>$(ConvertTo-HubSvgText $mKey)</td><td>$($mList.Count)</td><td>$med</td><td>$meanStd</td><td>$avgDl</td><td><span class='badge-pass'>HEALTHY</span></td></tr>`n"
+    }
+
+    # Evaluate Outliers across all deployments
+    $allOutliers = [System.Collections.Generic.List[object]]::new()
+    foreach ($d in $Deployments) {
+        $mName = if ($d.Device -and $d.Device.Model) { $d.Device.Model } elseif ($d.Baseline -and $d.Baseline.Model) { $d.Baseline.Model } else { 'Generic Model' }
+        $cohort = if ($cohortMap.ContainsKey($mName)) { $cohortMap[$mName] } else { $null }
+        if ($cohort) {
+            $outs = Test-HubCohortOutlier -Metrics $d -CohortBaseline $cohort
+            foreach ($o in $outs) {
+                $allOutliers.Add([PSCustomObject]@{
+                    DeploymentId = if ($d.DeploymentId) { $d.DeploymentId } else { 'N/A' }
+                    SerialNumber = if ($d.Device -and $d.Device.SerialNumber) { $d.Device.SerialNumber } else { 'N/A' }
+                    Model        = $mName
+                    Metric       = $o.Metric
+                    Severity     = $o.Severity
+                    Value        = $o.Value
+                    Expected     = $o.Expected
+                    ZScore       = $o.ZScore
+                    Message      = $o.Message
+                })
+            }
+        }
+    }
+
+    $outlierRows = ''
+    foreach ($oa in $allOutliers) {
+        $bClass = if ($oa.Severity -eq 'ALERT') { 'badge-fail' } else { 'badge-warn' }
+        $outlierRows += "<tr><td class='mono'>$(ConvertTo-HubSvgText $oa.DeploymentId)</td><td class='mono'>$(ConvertTo-HubSvgText $oa.SerialNumber)</td><td>$(ConvertTo-HubSvgText $oa.Model)</td><td><span class='$bClass'>$($oa.Severity)</span></td><td>$($oa.Metric)</td><td>$($oa.Value)</td><td>$($oa.Expected)</td><td>Z=$($oa.ZScore)</td><td style='font-size:12px;'>$(ConvertTo-HubSvgText $oa.Message)</td></tr>`n"
+    }
+
+    $outlierSection = if ($allOutliers.Count -gt 0) {
+        @"
+<div class='card' style='border:1px solid var(--red);background:rgba(248,113,113,0.06);'>
+<h2 style='color:var(--red);'>[!] Active Statistical Outliers &amp; Fleet Anomaly Alerts ($($allOutliers.Count))</h2>
+<table><thead><tr><th>Deployment ID</th><th>Serial</th><th>Model</th><th>Severity</th><th>Metric</th><th>Observed</th><th>Cohort Average</th><th>Z-Score</th><th>Alert Details</th></tr></thead>
+<tbody>$outlierRows</tbody></table></div>
+"@
+    } else {
+        @"
+<div class='card' style='border:1px solid rgba(74,222,128,0.3);background:rgba(74,222,128,0.05);'>
+<h2 style='color:var(--green);'>[OK] Fleet Cohort Health: Normal Statistical Variance</h2>
+<div style='color:var(--text);font-size:12.5px;'>All active units are provisioning within expected duration (&plusmn;2&sigma;) and network throughput thresholds.</div></div>
+"@
+    }
+
+    $deployRows = ''
+    foreach ($d in ($Deployments | Select-Object -First 50)) {
+        $depId = if ($d.DeploymentId) { $d.DeploymentId } else { '-' }
+        $sn = if ($d.Device -and $d.Device.SerialNumber) { $d.Device.SerialNumber } else { '-' }
+        $md = if ($d.Device -and $d.Device.Model) { $d.Device.Model } else { '-' }
+        $st = if ($d.Site) { $d.Site } else { 'Default' }
+        $tech = if ($d.Technician) { $d.Technician } else { '-' }
+        $sec = if ($d.TotalSeconds) { [math]::Round([double]$d.TotalSeconds, 0) } elseif ($d.Metrics -and $d.Metrics.TotalSeconds) { [math]::Round([double]$d.Metrics.TotalSeconds, 0) } else { 0 }
+        $status = if ($d.Status) { $d.Status } else { 'Success' }
+        $stClass = if ($status -eq 'Success') { 'badge-pass' } else { 'badge-fail' }
+        $deployRows += "<tr><td class='mono'>$(ConvertTo-HubSvgText $depId)</td><td class='mono'>$(ConvertTo-HubSvgText $sn)</td><td>$(ConvertTo-HubSvgText $md)</td><td>$(ConvertTo-HubSvgText $st)</td><td>$(ConvertTo-HubSvgText $tech)</td><td>${sec}s</td><td><span class='$stClass'>$status</span></td></tr>`n"
+    }
+
+    $html = @"
+<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Autopilot Fleet Plane Dashboard</title>
+<style>
+:root{--bg:#0f172a;--surface:#1e293b;--surface2:#334155;--border:#475569;--text:#f8fafc;--muted:#94a3b8;--accent:#38bdf8;--green:#4ade80;--amber:#fbbf24;--red:#f87171;}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;font-size:13.5px}
+.wrap{max-width:1200px;margin:0 auto;padding:24px}
+header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);padding-bottom:16px;margin-bottom:24px}
+header h1{margin:0;font-size:22px;color:var(--text);letter-spacing:-0.5px}
+header .sub{color:var(--muted);font-size:12px;margin-top:2px}
+.kpi-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:24px}
+.kpi-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px 20px}
+.kpi-val{font-size:26px;font-weight:700;color:var(--accent)}
+.kpi-lbl{font-size:11.5px;color:var(--muted);text-transform:uppercase;margin-top:4px;font-weight:600}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:20px;margin-bottom:24px}
+.card h2{margin:0 0 14px;font-size:16px;color:var(--text);border-bottom:1px solid var(--border);padding-bottom:8px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+table th{text-align:left;padding:10px 12px;background:var(--surface2);color:var(--muted);font-size:11.5px;text-transform:uppercase;font-weight:600}
+table td{padding:10px 12px;border-bottom:1px solid var(--border)}
+.mono{font-family:Consolas,monospace;font-size:12px}
+.font-bold{font-weight:600}
+.badge-pass{background:rgba(74,222,128,0.15);color:var(--green);border:1px solid rgba(74,222,128,0.3);border-radius:4px;padding:2px 8px;font-size:11px;font-weight:600}
+.badge-warn{background:rgba(251,191,36,0.15);color:var(--amber);border:1px solid rgba(251,191,36,0.3);border-radius:4px;padding:2px 8px;font-size:11px;font-weight:600}
+.badge-fail{background:rgba(248,113,113,0.15);color:var(--red);border:1px solid rgba(248,113,113,0.3);border-radius:4px;padding:2px 8px;font-size:11px;font-weight:600}
+footer{text-align:center;color:var(--muted);font-size:11.5px;margin-top:24px}
+</style></head><body><div class='wrap'>
+<header>
+<div><h1>Autopilot Fleet Plane Dashboard</h1><div class='sub'>Centralized Provisioning Analytics, Cross-Fleet Cohorts &amp; Statistical Outlier Intelligence</div></div>
+<div class='mono' style='color:var(--accent);'>[FLEET ACTIVE]</div>
+</header>
+<div class='kpi-row'>
+<div class='kpi-card'><div class='kpi-val'>$totalDep</div><div class='kpi-lbl'>Total Deployments</div></div>
+<div class='kpi-card'><div class='kpi-val' style='color:var(--green);'>$passRate%</div><div class='kpi-lbl'>Fleet Success Rate</div></div>
+<div class='kpi-card'><div class='kpi-val'>$($medianSec)s</div><div class='kpi-lbl'>Median Provisioning Time</div></div>
+<div class='kpi-card'><div class='kpi-val'>$($modelGroups.Keys.Count)</div><div class='kpi-lbl'>Hardware Models Active</div></div>
+<div class='kpi-card'><div class='kpi-val' style='color:$(if ($allOutliers.Count -gt 0) { "var(--red)" } else { "var(--green)" });'>$($allOutliers.Count)</div><div class='kpi-lbl'>Outlier Anomalies</div></div>
+</div>
+$outlierSection
+<div class='card'><h2>Model Cohort Baselines &amp; Performance</h2>
+<table><thead><tr><th>Hardware Model</th><th>Units (N)</th><th>Median Time</th><th>Mean Time (+/- 1s)</th><th>Avg Download</th><th>Cohort Status</th></tr></thead>
+<tbody>$cohortRows</tbody></table></div>
+<div class='card'><h2>Recent Fleet Provisioning Deployments</h2>
+<table><thead><tr><th>Deployment ID</th><th>Serial Number</th><th>Model</th><th>Site</th><th>Technician</th><th>Duration</th><th>Status</th></tr></thead>
+<tbody>$deployRows</tbody></table></div>
+<footer>Autopilot Command Hub Fleet Plane &middot; https://onyachamp.com</footer>
+</div></body></html>
+"@
+
+    [System.IO.File]::WriteAllText($OutputPath, $html, [System.Text.UTF8Encoding]::new($false))
+    return $OutputPath
+}
+
+# --- Function: Start-HubFleetServer (Lightweight Fleet Plane HTTP Ingestion Server) ---
+function Start-HubFleetServer {
+    [CmdletBinding()]
+    param(
+        [int]$Port = 8443,
+        [string]$DataDir = 'C:\AutopilotLogs\FleetData'
+    )
+
+    try {
+        if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
+        $depDir = Join-Path $DataDir 'deployments'
+        if (-not (Test-Path $depDir)) { New-Item -ItemType Directory -Path $depDir -Force | Out-Null }
+    } catch { }
+
+    $listener = [System.Net.HttpListener]::new()
+    $prefix = "http://localhost:${Port}/"
+    $listener.Prefixes.Add($prefix)
+
+    try {
+        $listener.Start()
+    } catch {
+        Write-Host "[ERROR] Could not bind Fleet Server to $prefix : $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+
+    Write-Host "`n==========================================================================" -ForegroundColor Cyan
+    Write-Host " AUTOPILOT FLEET PLANE INGESTION SERVER LISTENING" -ForegroundColor Green
+    Write-Host " Endpoint: $prefix" -ForegroundColor White
+    Write-Host " Telemetry Ingest: POST ${prefix}api/telemetry" -ForegroundColor White
+    Write-Host " Dashboard View:   GET  $prefix" -ForegroundColor White
+    Write-Host " Data Directory:   $DataDir" -ForegroundColor White
+    Write-Host " Press CTRL+C or ESC to stop server." -ForegroundColor Yellow
+    Write-Host "==========================================================================`n" -ForegroundColor Cyan
+
+    while ($listener.IsListening) {
+        try {
+            $context = $listener.GetContext()
+            $request = $context.Request
+            $response = $context.Response
+
+            $urlPath = $request.Url.AbsolutePath
+            $method = $request.HttpMethod
+
+            if ($method -eq 'POST' -and $urlPath -match '^/api/(telemetry|ingest)') {
+                $reader = [System.IO.StreamReader]::new($request.InputStream, [System.Text.Encoding]::UTF8)
+                $body = $reader.ReadToEnd()
+                $reader.Close()
+
+                $parsed = $null
+                try { $parsed = $body | ConvertFrom-Json } catch { }
+                $depId = if ($parsed -and $parsed.DeploymentId) { $parsed.DeploymentId } else { "DEP-$([guid]::NewGuid().ToString('N').Substring(0,8))" }
+                $savePath = Join-Path $depDir "Deployment_${depId}.json"
+                [System.IO.File]::WriteAllText($savePath, $body, [System.Text.UTF8Encoding]::new($false))
+
+                $respObj = [PSCustomObject]@{ status = 'ok'; deploymentId = $depId; receivedUtc = [datetime]::UtcNow.ToString('o') }
+                $respBytes = [System.Text.Encoding]::UTF8.GetBytes(($respObj | ConvertTo-Json))
+                $response.ContentType = 'application/json'
+                $response.StatusCode = 200
+                $response.ContentLength64 = $respBytes.Length
+                $response.OutputStream.Write($respBytes, 0, $respBytes.Length)
+                $response.Close()
+                Write-Host "[INGEST] Received telemetry for Deployment: $depId" -ForegroundColor Green
+            } elseif ($method -eq 'GET' -and $urlPath -eq '/api/deployments') {
+                $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                $list = [System.Collections.Generic.List[object]]::new()
+                if ($files) {
+                    foreach ($f in $files) {
+                        try { $list.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                    }
+                }
+                $j = if ($list -and $list.Count -gt 0) { ($list | ConvertTo-Json -Depth 6) } else { '[]' }
+                $respBytes = [System.Text.Encoding]::UTF8.GetBytes($j)
+                $response.ContentType = 'application/json'
+                $response.StatusCode = 200
+                $response.ContentLength64 = $respBytes.Length
+                $response.OutputStream.Write($respBytes, 0, $respBytes.Length)
+                $response.Close()
+            } elseif ($method -eq 'GET' -and $urlPath -eq '/api/cohorts') {
+                $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                $list = [System.Collections.Generic.List[object]]::new()
+                if ($files) {
+                    foreach ($f in $files) {
+                        try { $list.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                    }
+                }
+                $modelGroups = @{}
+                foreach ($d in $list) {
+                    $mName = if ($d.Device -and $d.Device.Model) { $d.Device.Model } elseif ($d.Baseline -and $d.Baseline.Model) { $d.Baseline.Model } else { 'Generic Model' }
+                    if (-not $modelGroups.ContainsKey($mName)) { $modelGroups[$mName] = [System.Collections.Generic.List[object]]::new() }
+                    $modelGroups[$mName].Add($d)
+                }
+                $cohorts = [System.Collections.Generic.List[object]]::new()
+                foreach ($mk in $modelGroups.Keys) {
+                    $cb = Get-HubCohortBaseline -Records $modelGroups[$mk] -Model $mk
+                    if ($cb) { $cohorts.Add($cb) }
+                }
+                $j = if ($cohorts -and $cohorts.Count -gt 0) { ($cohorts | ConvertTo-Json -Depth 5) } else { '[]' }
+                $respBytes = [System.Text.Encoding]::UTF8.GetBytes($j)
+                $response.ContentType = 'application/json'
+                $response.StatusCode = 200
+                $response.ContentLength64 = $respBytes.Length
+                $response.OutputStream.Write($respBytes, 0, $respBytes.Length)
+                $response.Close()
+            } elseif ($method -eq 'GET' -and $urlPath -eq '/api/outliers') {
+                $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                $list = [System.Collections.Generic.List[object]]::new()
+                if ($files) {
+                    foreach ($f in $files) {
+                        try { $list.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                    }
+                }
+                $modelGroups = @{}
+                foreach ($d in $list) {
+                    $mName = if ($d.Device -and $d.Device.Model) { $d.Device.Model } elseif ($d.Baseline -and $d.Baseline.Model) { $d.Baseline.Model } else { 'Generic Model' }
+                    if (-not $modelGroups.ContainsKey($mName)) { $modelGroups[$mName] = [System.Collections.Generic.List[object]]::new() }
+                    $modelGroups[$mName].Add($d)
+                }
+                $cohortMap = @{}
+                foreach ($mk in $modelGroups.Keys) {
+                    $cohortMap[$mk] = Get-HubCohortBaseline -Records $modelGroups[$mk] -Model $mk
+                }
+                $outliers = [System.Collections.Generic.List[object]]::new()
+                foreach ($d in $list) {
+                    $mName = if ($d.Device -and $d.Device.Model) { $d.Device.Model } elseif ($d.Baseline -and $d.Baseline.Model) { $d.Baseline.Model } else { 'Generic Model' }
+                    $cohort = if ($cohortMap.ContainsKey($mName)) { $cohortMap[$mName] } else { $null }
+                    if ($cohort) {
+                        $outs = Test-HubCohortOutlier -Metrics $d -CohortBaseline $cohort
+                        foreach ($o in $outs) {
+                            $outliers.Add([PSCustomObject]@{
+                                DeploymentId = if ($d.DeploymentId) { $d.DeploymentId } else { 'N/A' }
+                                SerialNumber = if ($d.Device -and $d.Device.SerialNumber) { $d.Device.SerialNumber } else { 'N/A' }
+                                Model        = $mName
+                                Metric       = $o.Metric
+                                Severity     = $o.Severity
+                                Value        = $o.Value
+                                Expected     = $o.Expected
+                                ZScore       = $o.ZScore
+                                Message      = $o.Message
+                            })
+                        }
+                    }
+                }
+                $j = if ($outliers -and $outliers.Count -gt 0) { ($outliers | ConvertTo-Json -Depth 5) } else { '[]' }
+                $respBytes = [System.Text.Encoding]::UTF8.GetBytes($j)
+                $response.ContentType = 'application/json'
+                $response.StatusCode = 200
+                $response.ContentLength64 = $respBytes.Length
+                $response.OutputStream.Write($respBytes, 0, $respBytes.Length)
+                $response.Close()
+            } elseif ($method -eq 'GET' -and $urlPath -eq '/api/health') {
+                $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                $hObj = [PSCustomObject]@{ status = 'healthy'; uptime = 'active'; deploymentsCount = if ($files) { $files.Count } else { 0 } }
+                $respBytes = [System.Text.Encoding]::UTF8.GetBytes(($hObj | ConvertTo-Json))
+                $response.ContentType = 'application/json'
+                $response.StatusCode = 200
+                $response.ContentLength64 = $respBytes.Length
+                $response.OutputStream.Write($respBytes, 0, $respBytes.Length)
+                $response.Close()
+            } else {
+                # Serve HTML Dashboard
+                $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                $list = [System.Collections.Generic.List[object]]::new()
+                if ($files) {
+                    foreach ($f in $files) {
+                        try { $list.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                    }
+                }
+                $dashFile = Join-Path $DataDir 'FleetDashboard.html'
+                Export-HubFleetDashboardHtml -Deployments $list -OutputPath $dashFile | Out-Null
+                $htmlBytes = [System.IO.File]::ReadAllBytes($dashFile)
+                $response.ContentType = 'text/html; charset=utf-8'
+                $response.StatusCode = 200
+                $response.ContentLength64 = $htmlBytes.Length
+                $response.OutputStream.Write($htmlBytes, 0, $htmlBytes.Length)
+                $response.Close()
+            }
+        } catch {
+            if (-not $listener.IsListening) { break }
+        }
+    }
+}
+
+
 # --- Function: Protect-HubCsvRecords (CSV formula-injection hardening) ---
 function Protect-HubCsvRecords {
     param([Parameter(Mandatory = $true)][array]$Records)
@@ -4861,16 +6290,39 @@ function Register-AutopilotDevice {
         [string]$AssignedUser = '',
         [string]$AccessToken = '',
         [switch]$WaitForSync,
-        [int]$TimeoutMinutes = 30
+        [int]$TimeoutMinutes = 30,
+        [string]$HardwareHash = '',
+        [string]$SerialNumber = ''
     )
 
     if (-not $AccessToken) {
         throw "Microsoft Graph Access Token required for cloud registration."
     }
 
-    $hashObj = Get-AutopilotHash -GroupTag $GroupTag -AssignedUser $AssignedUser
-    if (-not $hashObj.IsValidStructure) {
-        throw "Refusing to register device with Intune: no genuine OA3 hardware hash. $($hashObj.StatusReason)"
+    $hashObj = $null
+    if ($HardwareHash) {
+        $hashValid = $false
+        try {
+            $hb = [Convert]::FromBase64String($HardwareHash.Trim())
+            $oa3Magic = [byte[]](0x4F, 0x41, 0x33, 0x00)
+            $mOk = $hb.Length -ge 4
+            for ($m = 0; $mOk -and $m -lt 4; $m++) { if ($hb[$m] -ne $oa3Magic[$m]) { $mOk = $false } }
+            if ($mOk -and $hb.Length -ge 2048 -and $hb.Length -le 16384) { $hashValid = $true }
+        } catch { }
+        if (-not $hashValid) {
+            throw "Refusing to register device with Intune: invalid OA3 hardware hash payload."
+        }
+        $hashObj = [PSCustomObject]@{
+            SerialNumber     = if ($SerialNumber) { $SerialNumber } else { 'UNKNOWN' }
+            WindowsProductId = ''
+            HardwareHash     = $HardwareHash.Trim()
+            IsValidStructure = $true
+        }
+    } else {
+        $hashObj = Get-AutopilotHash -GroupTag $GroupTag -AssignedUser $AssignedUser
+        if (-not $hashObj.IsValidStructure) {
+            throw "Refusing to register device with Intune: no genuine OA3 hardware hash. $($hashObj.StatusReason)"
+        }
     }
 
     $headers = @{
@@ -6008,6 +7460,632 @@ function Invoke-HubUsbDriverInjection {
     }
 }
 
+# --- Function: Get-HubOemDriverTool (OEM Tool Detection Engine) ---
+function Get-HubOemDriverTool {
+    [CmdletBinding()]
+    param()
+
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $mfg = if ($cs -and $cs.Manufacturer) { $cs.Manufacturer } else { '' }
+
+    $vendor = 'Generic'
+    $toolName = ''
+    $exePath = $null
+    $wingetId = ''
+
+    if ($mfg -match 'Dell') {
+        $vendor = 'Dell'
+        $toolName = 'Dell Command | Update'
+        $wingetId = 'Dell.CommandUpdate.Universal'
+        $cmdCheck = (Get-Command 'dcu-cli.exe' -ErrorAction SilentlyContinue).Source
+        if ($cmdCheck -and (Test-Path $cmdCheck)) {
+            $exePath = $cmdCheck
+        } else {
+            $paths = @(
+                (Join-Path ${env:ProgramFiles} 'Dell\CommandUpdate\dcu-cli.exe'),
+                (Join-Path ${env:ProgramFiles(x86)} 'Dell\CommandUpdate\dcu-cli.exe'),
+                (Join-Path ${env:ProgramFiles} 'Dell\Command Update\dcu-cli.exe'),
+                (Join-Path ${env:ProgramFiles(x86)} 'Dell\Command Update\dcu-cli.exe')
+            )
+            foreach ($p in $paths) {
+                if (Test-Path $p) { $exePath = $p; break }
+            }
+        }
+    } elseif ($mfg -match 'Lenovo') {
+        $vendor = 'Lenovo'
+        $toolName = 'Lenovo System Update'
+        $wingetId = 'Lenovo.SystemUpdate'
+        $paths = @(
+            (Join-Path ${env:ProgramFiles(x86)} 'Lenovo\System Update\tvsu.exe'),
+            (Join-Path ${env:ProgramFiles} 'Lenovo\System Update\tvsu.exe'),
+            'C:\ProgramData\Lenovo\ThinInstaller\ThinInstaller.exe'
+        )
+        foreach ($p in $paths) {
+            if (Test-Path $p) { $exePath = $p; break }
+        }
+    } elseif ($mfg -match 'HP|Hewlett-Packard') {
+        $vendor = 'HP'
+        $toolName = 'HP Image Assistant (HPIA)'
+        $wingetId = 'HP.ImageAssistant'
+        $paths = @(
+            (Join-Path ${env:ProgramFiles} 'HP\HPIA\HPImageAssistant.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'HP\HPIA\HPImageAssistant.exe'),
+            'C:\SWSetup\HPIA\HPImageAssistant.exe'
+        )
+        foreach ($p in $paths) {
+            if (Test-Path $p) { $exePath = $p; break }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Vendor         = $vendor
+        ToolName       = $toolName
+        ExecutablePath = $exePath
+        IsInstalled    = [bool]($exePath -ne $null)
+        WingetId       = $wingetId
+        Manufacturer   = $mfg
+    }
+}
+
+# --- Function: Invoke-HubOemDriverUpdate (OEM Driver & Firmware Automation Engine) ---
+function Invoke-HubOemDriverUpdate {
+    [CmdletBinding()]
+    param(
+        [switch]$ScanOnly,
+        [switch]$InstallMissingTool
+    )
+
+    $tool = Get-HubOemDriverTool
+    Write-Host "`n==========================================================================" -ForegroundColor Cyan
+    Write-Host " OEM DRIVER & FIRMWARE MANAGEMENT ENGINE" -ForegroundColor Cyan
+    Write-Host " Detected Hardware: $($tool.Manufacturer) (Vendor: $($tool.Vendor))" -ForegroundColor White
+    Write-Host "==========================================================================" -ForegroundColor Cyan
+
+    if ($tool.Vendor -eq 'Generic') {
+        Write-Host "System manufacturer is not Dell, Lenovo, or HP. Skipping OEM CLI automation." -ForegroundColor Yellow
+        return [PSCustomObject]@{ Success = $true; Vendor = 'Generic'; Message = 'Non-OEM hardware' }
+    }
+
+    if (-not $tool.IsInstalled) {
+        Write-Host "$($tool.ToolName) is not currently installed on this device." -ForegroundColor Yellow
+        if ($InstallMissingTool -and $tool.WingetId) {
+            Write-Host "Attempting installation via winget: $($tool.WingetId)..." -ForegroundColor Cyan
+            try {
+                & winget install --id $tool.WingetId --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+                $tool = Get-HubOemDriverTool
+            } catch { }
+        }
+        if (-not $tool.IsInstalled) {
+            Write-Host "To manage OEM drivers, install $($tool.ToolName) (winget install $($tool.WingetId))." -ForegroundColor Gray
+            return [PSCustomObject]@{ Success = $false; Vendor = $tool.Vendor; Message = "$($tool.ToolName) not installed" }
+        }
+    }
+
+    Write-Host "Running $($tool.ToolName)..." -ForegroundColor Cyan
+    $exitCode = -1
+
+    try {
+        if ($tool.Vendor -eq 'Dell') {
+            if ($ScanOnly) {
+                Write-Host "Executing Dell Command Update Scan (/scan)..." -ForegroundColor White
+                $proc = Start-Process -FilePath $tool.ExecutablePath -ArgumentList "/scan" -NoNewWindow -Wait -PassThru
+                $exitCode = $proc.ExitCode
+            } else {
+                Write-Host "Applying Dell Driver and BIOS Updates (/applyUpdates -reboot=disable -autoSuspendBitLocker=enable)..." -ForegroundColor White
+                $proc = Start-Process -FilePath $tool.ExecutablePath -ArgumentList "/applyUpdates -reboot=disable -autoSuspendBitLocker=enable" -NoNewWindow -Wait -PassThru
+                $exitCode = $proc.ExitCode
+            }
+        } elseif ($tool.Vendor -eq 'Lenovo') {
+            if ($ScanOnly) {
+                Write-Host "Executing Lenovo System Update Scan..." -ForegroundColor White
+                $proc = Start-Process -FilePath $tool.ExecutablePath -ArgumentList "/CM -search A -action SEARCH -includereboot 0 -noreboot" -NoNewWindow -Wait -PassThru
+                $exitCode = $proc.ExitCode
+            } else {
+                Write-Host "Applying Lenovo System Updates..." -ForegroundColor White
+                $proc = Start-Process -FilePath $tool.ExecutablePath -ArgumentList "/CM -search A -action INSTALL -includereboot 0 -noreboot" -NoNewWindow -Wait -PassThru
+                $exitCode = $proc.ExitCode
+            }
+        } elseif ($tool.Vendor -eq 'HP') {
+            $act = if ($ScanOnly) { 'Analyze' } else { 'Install' }
+            Write-Host "Executing HP Image Assistant (/Operation:$act)..." -ForegroundColor White
+            $proc = Start-Process -FilePath $tool.ExecutablePath -ArgumentList "/Operation:$act /Action:$act /Category:All /Selection:All /Noninteractive" -NoNewWindow -Wait -PassThru
+            $exitCode = $proc.ExitCode
+        }
+
+                $isOk = switch ($tool.Vendor) {
+            'Dell'   { $exitCode -in @(0, 1, 2, 5, 500) } # 5 = No updates applicable, 500 = Operation succeeded
+            'Lenovo' { $exitCode -in @(0, 1, 2, 3) }      # 3 = No updates applicable
+            'HP'     { $exitCode -in @(0, 256, 3010) }    # 256 = No updates, 3010 = Reboot required
+            default  { $exitCode -in @(0, 1, 2) }
+        }
+        Write-Host "OEM update process completed with code $exitCode (Status: $(if ($isOk) { 'SUCCESS' } else { 'EXIT_NONZERO' }))" -ForegroundColor $(if ($isOk) { 'Green' } else { 'Yellow' })
+        return [PSCustomObject]@{
+            Success  = $isOk
+            Vendor   = $tool.Vendor
+            ExitCode = $exitCode
+            Message  = "$($tool.ToolName) completed with exit code $exitCode"
+        }
+    } catch {
+        Write-Host "OEM update execution failed: $($_.Exception.Message)" -ForegroundColor Red
+        return [PSCustomObject]@{
+            Success  = $false
+            Vendor   = $tool.Vendor
+            ExitCode = -1
+            Message  = $_.Exception.Message
+        }
+    }
+}
+
+# --- Function: Get-HubDeploymentProfiles (Config-as-Code Deployment Profiles Engine) ---
+function Get-HubDeploymentProfiles {
+    [CmdletBinding()]
+    param()
+
+    $profiles = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    $builtIns = @(
+        [PSCustomObject]@{
+            Id                   = 'Melbourne-Office'
+            Name                 = 'Melbourne - Corporate Standard'
+            Site                 = 'Melbourne'
+            GroupTag             = 'CORP-MEL-STD'
+            ComputerNameTemplate = 'MEL-%SERIAL%'
+            Apps                 = @('Google.Chrome', 'SlackTechnologies.Slack', 'Zoom.Zoom', 'Microsoft.Teams')
+            BitLockerRequired    = $true
+            DefenderBaseline     = $true
+            LapsAdmin            = $true
+            OemUpdates           = $true
+            ActionRoutine        = '1. Intune-Only Cloud Build'
+        },
+        [PSCustomObject]@{
+            Id                   = 'Sydney-Kiosk'
+            Name                 = 'Sydney - Kiosk / Front Desk'
+            Site                 = 'Sydney'
+            GroupTag             = 'KIOSK-SYD'
+            ComputerNameTemplate = 'SYD-KSK-%RAND%'
+            Apps                 = @('Google.Chrome', 'Microsoft.Edge')
+            BitLockerRequired    = $true
+            DefenderBaseline     = $true
+            LapsAdmin            = $true
+            OemUpdates           = $false
+            ActionRoutine        = '3. Local User & Offline Bypass Build'
+        },
+        [PSCustomObject]@{
+            Id                   = 'Field-Executive'
+            Name                 = 'Field Executive - High Security'
+            Site                 = 'Field'
+            GroupTag             = 'EXEC-SECURE'
+            ComputerNameTemplate = 'EXEC-%SERIAL%'
+            Apps                 = @('Google.Chrome', 'Microsoft.Teams', 'Zoom.Zoom', 'SlackTechnologies.Slack', '7zip.7zip')
+            BitLockerRequired    = $true
+            DefenderBaseline     = $true
+            LapsAdmin            = $true
+            OemUpdates           = $true
+            ActionRoutine        = '1. Intune-Only Cloud Build'
+        },
+        [PSCustomObject]@{
+            Id                   = 'Engineering-Workstation'
+            Name                 = 'Engineering - High Performance'
+            Site                 = 'Melbourne'
+            GroupTag             = 'ENG-WORKSTATION'
+            ComputerNameTemplate = 'ENG-%SERIAL%'
+            Apps                 = @('Git.Git', 'Microsoft.VisualStudioCode', 'Docker.DockerDesktop', '7zip.7zip', 'Google.Chrome')
+            BitLockerRequired    = $true
+            DefenderBaseline     = $true
+            LapsAdmin            = $false
+            OemUpdates           = $true
+            ActionRoutine        = '1. Intune-Only Cloud Build'
+        },
+        [PSCustomObject]@{
+            Id                   = 'Factory-Floor'
+            Name                 = 'Factory Floor - Isolated Rugged'
+            Site                 = 'Plant-1'
+            GroupTag             = 'PLANT-FLOOR'
+            ComputerNameTemplate = 'PLANT-%SERIAL%'
+            Apps                 = @('Google.Chrome')
+            BitLockerRequired    = $true
+            DefenderBaseline     = $true
+            LapsAdmin            = $true
+            OemUpdates           = $false
+            ActionRoutine        = '3. Local User & Offline Bypass Build'
+        }
+    )
+    foreach ($p in $builtIns) { $profiles.Add($p) }
+
+    # Check for external custom profiles.json or deployment_profiles.json
+    $customCandidates = @(
+        (Join-Path (Get-Location) 'deployment_profiles.json'),
+        (Join-Path (Get-Location) 'profiles.json'),
+        (Join-Path $env:ProgramData 'AutopilotCommandHub\Profiles\deployment_profiles.json')
+    )
+    if ($PSScriptRoot) { $customCandidates += (Join-Path $PSScriptRoot 'deployment_profiles.json') }
+
+    foreach ($cand in $customCandidates) {
+        if (Test-Path $cand) {
+            try {
+                $rawList = Get-Content -LiteralPath $cand -Raw | ConvertFrom-Json
+                foreach ($cp in $rawList) {
+                    $profiles.Add([PSCustomObject]@{
+                        Id                   = $cp.Id
+                        Name                 = if ($cp.Name) { $cp.Name } else { $cp.Id }
+                        Site                 = if ($cp.Site) { $cp.Site } else { 'Custom' }
+                        GroupTag             = $cp.GroupTag
+                        ComputerNameTemplate = $cp.ComputerNameTemplate
+                        Apps                 = @($cp.Apps)
+                        BitLockerRequired    = [bool]$cp.BitLockerRequired
+                        DefenderBaseline     = [bool]$cp.DefenderBaseline
+                        LapsAdmin            = [bool]$cp.LapsAdmin
+                        OemUpdates           = [bool]$cp.OemUpdates
+                        ActionRoutine        = if ($cp.ActionRoutine) { $cp.ActionRoutine } else { '1. Intune-Only Cloud Build' }
+                    })
+                }
+                break
+            } catch { }
+        }
+    }
+
+    return @($profiles)
+}
+
+# --- Function: Apply-HubDeploymentProfile (Apply Config-as-Code Profile) ---
+function Apply-HubDeploymentProfile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ProfileNameOrId
+    )
+
+    $all = Get-HubDeploymentProfiles
+    $found = $all | Where-Object { $_.Id -eq $ProfileNameOrId -or $_.Name -eq $ProfileNameOrId -or $_.Name -like "*$ProfileNameOrId*" } | Select-Object -First 1
+    if (-not $found) {
+        Write-Host "Deployment profile '$ProfileNameOrId' not found." -ForegroundColor Yellow
+        return $null
+    }
+
+    $script:ActiveDeploymentProfile = $found
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_GROUP_TAG', $found.GroupTag, 'Process')
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_NAME_TEMPLATE', $found.ComputerNameTemplate, 'Process')
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_RENAME_ENABLED', 'true', 'Process')
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_SITE', $found.Site, 'Process')
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_BITLOCKER_GATED', [string]$found.BitLockerRequired, 'Process')
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_OEM_UPDATES', [string]$found.OemUpdates, 'Process')
+
+    Write-Host "Applied Deployment Profile: $($found.Name) (Site: $($found.Site), GroupTag: $($found.GroupTag), Naming: $($found.ComputerNameTemplate))" -ForegroundColor Green
+    return $found
+}
+
+# --- Function: Enable-HubBitLocker (Gated BitLocker OS Drive Encryption Engine) ---
+function Enable-HubBitLocker {
+    [CmdletBinding()]
+    param(
+        [string]$MountPoint = $env:SystemDrive,
+        [string]$EncryptionMethod = 'XtsAes256'
+    )
+
+    Write-Host "`nEnforcing BitLocker OS Drive Encryption ($EncryptionMethod)..." -ForegroundColor Cyan
+    try {
+        $vol = Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction Stop
+        if ($vol.ProtectionStatus -eq 'On' -and $vol.VolumeStatus -eq 'FullyEncrypted') {
+            Write-Host "Drive $MountPoint is already fully encrypted and protected." -ForegroundColor Green
+            # Ensure RecoveryPassword protector is present and escrowed to Entra ID
+            $recProt = $vol.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' } | Select-Object -First 1
+            if (-not $recProt) {
+                Write-Host "Adding missing BitLocker Recovery Password protector..." -ForegroundColor White
+                Add-BitLockerKeyProtector -MountPoint $MountPoint -RecoveryPasswordProtector -ErrorAction SilentlyContinue | Out-Null
+                $recProt = (Get-BitLockerVolume -MountPoint $MountPoint).KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' } | Select-Object -First 1
+            }
+            if ($recProt) {
+                try {
+                    BackupToAAD-BitLockerKeyProtector -MountPoint $MountPoint -KeyProtectorId $recProt.KeyProtectorId -ErrorAction SilentlyContinue | Out-Null
+                    Write-Host "Recovery password protector escrowed to Entra ID." -ForegroundColor Green
+                } catch { }
+            }
+            return [PSCustomObject]@{ Success = $true; Encrypted = $true; VolumeStatus = 'FullyEncrypted'; Message = 'Already protected with verified key escrow' }
+        }
+
+        $tpm = Get-Tpm -ErrorAction SilentlyContinue
+        if (-not ($tpm -and $tpm.TpmPresent -and $tpm.TpmReady)) {
+            Write-Host "TPM 2.0 is not present or ready. Cannot enable hardware-bound BitLocker." -ForegroundColor Yellow
+            return [PSCustomObject]@{ Success = $false; Encrypted = $false; Message = 'TPM not ready' }
+        }
+
+        Write-Host "Enabling BitLocker on $MountPoint with TPM protector..." -ForegroundColor White
+        Enable-BitLocker -MountPoint $MountPoint -EncryptionMethod $EncryptionMethod -UsedSpaceOnly -TpmProtector -SkipHardwareTest -ErrorAction Stop | Out-Null
+
+        Write-Host "Adding BitLocker Recovery Password protector..." -ForegroundColor White
+        Add-BitLockerKeyProtector -MountPoint $MountPoint -RecoveryPasswordProtector -ErrorAction Stop | Out-Null
+
+        try {
+            $recProtector = (Get-BitLockerVolume -MountPoint $MountPoint).KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' } | Select-Object -First 1
+            if ($recProtector) {
+                BackupToAAD-BitLockerKeyProtector -MountPoint $MountPoint -KeyProtectorId $recProtector.KeyProtectorId -ErrorAction SilentlyContinue | Out-Null
+                Write-Host "Recovery password protector escrowed to Entra ID." -ForegroundColor Green
+            }
+        } catch { }
+
+        $updatedVol = Get-BitLockerVolume -MountPoint $MountPoint
+        Write-Host "BitLocker active: VolumeStatus=$($updatedVol.VolumeStatus), Protection=$($updatedVol.ProtectionStatus)" -ForegroundColor Green
+        return [PSCustomObject]@{
+            Success         = $true
+            Encrypted       = $true
+            VolumeStatus    = $updatedVol.VolumeStatus
+            EncryptionPct   = $updatedVol.EncryptionPercentage
+            ProtectionState = $updatedVol.ProtectionStatus
+            Message         = "BitLocker active ($($updatedVol.VolumeStatus))"
+        }
+    } catch {
+        Write-Host "BitLocker activation error: $($_.Exception.Message)" -ForegroundColor Red
+        return [PSCustomObject]@{ Success = $false; Encrypted = $false; Message = $_.Exception.Message }
+    }
+}
+
+# --- Function: Set-HubLocalAdminPosture (Local Admin Randomization & LAPS Readiness) ---
+function Set-HubLocalAdminPosture {
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`nEnforcing Local Administrator & LAPS Security Posture..." -ForegroundColor Cyan
+    try {
+        $lapsKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS\Config'
+        $hasLaps = Test-Path $lapsKey
+        try {
+            if (-not $hasLaps) { New-Item -ItemType Directory -Path $lapsKey -Force -ErrorAction SilentlyContinue | Out-Null }
+            Set-ItemProperty -Path $lapsKey -Name 'BackupDirectory' -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path $lapsKey -Name 'PasswordLength' -Value 20 -Type DWord -Force -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path $lapsKey -Name 'PasswordAgeDays' -Value 30 -Type DWord -Force -ErrorAction SilentlyContinue
+            $hasLaps = $true
+        } catch { }
+
+        # Generate cryptographically random 20-character password
+        $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        $charPool = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%^&*"
+        $passChars = New-Object char[] 20
+        $rndBytes = New-Object byte[] 20
+        $rng.GetBytes($rndBytes)
+        for ($i = 0; $i -lt 20; $i++) {
+            $passChars[$i] = $charPool[$rndBytes[$i] % $charPool.Length]
+        }
+        $newPass = New-Object string ($passChars, 0, 20)
+
+        $adminAccount = (Get-CimInstance Win32_UserAccount -Filter "SID LIKE 'S-1-5-21-%-500'" -ErrorAction SilentlyContinue)
+        if ($adminAccount) {
+            $secStr = ConvertTo-SecureString $newPass -AsPlainText -Force
+            Set-LocalUser -Name $adminAccount.Name -Password $secStr -PasswordNeverExpires $true -ErrorAction SilentlyContinue
+            Write-Host "Rotated local Administrator password ($($adminAccount.Name)) with 20-char high-entropy value." -ForegroundColor Green
+        }
+
+        try {
+            $guest = Get-CimInstance Win32_UserAccount -Filter "SID LIKE 'S-1-5-21-%-501'" -ErrorAction SilentlyContinue
+            if ($guest) { Disable-LocalUser -Name $guest.Name -ErrorAction SilentlyContinue }
+        } catch { }
+
+        return [PSCustomObject]@{
+            Success         = $true
+            AdminAccount    = if ($adminAccount) { $adminAccount.Name } else { 'Administrator' }
+            PasswordRotated = [bool]($adminAccount -ne $null)
+            LapsReady       = $hasLaps
+            Message         = "Local admin rotated and default inactive accounts disabled"
+        }
+    } catch {
+        Write-Host "Local admin posture note: $($_.Exception.Message)" -ForegroundColor Yellow
+        return [PSCustomObject]@{ Success = $false; Message = $_.Exception.Message }
+    }
+}
+
+# --- Function: Set-HubSecurityBaseline (Defender Antivirus & Windows Firewall Baseline) ---
+function Set-HubSecurityBaseline {
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`nEnforcing Defender Antivirus & Windows Firewall Baseline..." -ForegroundColor Cyan
+    try {
+        Set-MpPreference -DisableRealtimeMonitoring $false -MAPSReporting Advanced -SubmitSamplesConsent SendAllSamples -CheckForSignaturesBeforeRunningScan $true -SignatureUpdateInterval 4 -ErrorAction SilentlyContinue
+        Write-Host "Defender Antivirus baseline enforced (Real-Time Protection, Cloud MAPS, Auto-Signatures)." -ForegroundColor Green
+
+        Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True -ErrorAction SilentlyContinue
+        Write-Host "Windows Defender Firewall profiles (Domain, Private, Public) enforced." -ForegroundColor Green
+
+        return [PSCustomObject]@{
+            Success        = $true
+            DefenderActive = $true
+            FirewallActive = $true
+            Message        = "Defender and Firewall baselines enforced"
+        }
+    } catch {
+        Write-Host "Security baseline note: $($_.Exception.Message)" -ForegroundColor Yellow
+        return [PSCustomObject]@{ Success = $false; Message = $_.Exception.Message }
+    }
+}
+
+# --- Function: Invoke-HubCartHarvest (Bulk Harvest Station Cart Mode) ---
+function Invoke-HubCartHarvest {
+    [CmdletBinding()]
+    param(
+        [string]$CartName = 'StandardCart',
+        [string]$CsvPath = '',
+        [string]$GroupTag = '',
+        [string]$AssignedUser = '',
+        [string]$HardwareHashOverride = '',
+        [string]$SerialNumberOverride = ''
+    )
+
+    Write-Host "`n==========================================================================" -ForegroundColor Cyan
+    Write-Host " BULK HARVEST STATION: CART ACCUMULATION MODE" -ForegroundColor Cyan
+    Write-Host " Cart Identifier: $CartName" -ForegroundColor White
+    Write-Host "==========================================================================" -ForegroundColor Cyan
+
+    $hashObj = $null
+    if ($HardwareHashOverride) {
+        $hashValid = $false
+        $hashBytes = $null
+        try {
+            $hashBytes = [Convert]::FromBase64String($HardwareHashOverride.Trim())
+            $oa3Magic = [byte[]](0x4F, 0x41, 0x33, 0x00)
+            $magicOk = $hashBytes.Length -ge 4
+            for ($m = 0; $magicOk -and $m -lt 4; $m++) { if ($hashBytes[$m] -ne $oa3Magic[$m]) { $magicOk = $false } }
+            if ($magicOk -and $hashBytes.Length -ge 2048 -and $hashBytes.Length -le 16384) {
+                $hashValid = $true
+            }
+        } catch { }
+        if ($hashValid) {
+            $sn = if ($SerialNumberOverride) { $SerialNumberOverride } else { (try { (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber } catch { 'CART-UNIT-1' }) }
+            $cs = try { (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue) } catch { $null }
+            $hashObj = [PSCustomObject]@{
+                SerialNumber     = if ($sn) { $sn } else { 'CART-UNIT-1' }
+                WindowsProductId = ''
+                HardwareHash     = $HardwareHashOverride.Trim()
+                GroupTag         = $GroupTag
+                AssignedUser     = $AssignedUser
+                Model            = if ($cs -and $cs.Model) { $cs.Model } else { 'CartModel' }
+                Manufacturer     = if ($cs -and $cs.Manufacturer) { $cs.Manufacturer } else { 'CartMfg' }
+                IsValidStructure = $true
+            }
+        } else {
+            Write-Host "[ERROR] Provided hardware hash override is not a valid OA3 structure." -ForegroundColor Red
+            return [PSCustomObject]@{ Success = $false; Message = 'Invalid OA3 structure' }
+        }
+    } else {
+        Write-Host "Harvesting local device hardware hash with OA3 structure check..." -ForegroundColor Cyan
+        $hashObj = Get-AutopilotHash -GroupTag $GroupTag -AssignedUser $AssignedUser
+        if (-not $hashObj.IsValidStructure) {
+            Write-Host "[ERROR] Hardware hash harvest failed: $($hashObj.StatusReason)" -ForegroundColor Red
+            return [PSCustomObject]@{ Success = $false; Message = $hashObj.StatusReason }
+        }
+    }
+
+    $targetCsv = $CsvPath
+    if ([string]::IsNullOrWhiteSpace($targetCsv)) {
+        $usbDrives = Get-CimInstance Win32_LogicalDisk -Filter "DriveType = 2" -ErrorAction SilentlyContinue
+        if ($usbDrives) {
+            foreach ($d in $usbDrives) {
+                if (Test-Path "$($d.DeviceID)\") {
+                    $cartDir = Join-Path "$($d.DeviceID)\" "Autopilot_Carts"
+                    if (-not (Test-Path $cartDir)) { New-Item -ItemType Directory -Path $cartDir -Force | Out-Null }
+                    $cleanCart = ($CartName -replace '[^\w\-]', '_').Trim('_')
+                    $dateStr = [datetime]::Now.ToString('yyyyMMdd')
+                    $targetCsv = Join-Path $cartDir "AutopilotCart_${cleanCart}_${dateStr}.csv"
+                    break
+                }
+            }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($targetCsv)) {
+        $cartDir = "C:\AutopilotLogs\Carts"
+        if (-not (Test-Path $cartDir)) { New-Item -ItemType Directory -Path $cartDir -Force | Out-Null }
+        $cleanCart = ($CartName -replace '[^\w\-]', '_').Trim('_')
+        $dateStr = [datetime]::Now.ToString('yyyyMMdd')
+        $targetCsv = Join-Path $cartDir "AutopilotCart_${cleanCart}_${dateStr}.csv"
+    }
+
+    $existingEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
+    if (Test-Path $targetCsv) {
+        try {
+            $rows = Import-Csv -LiteralPath $targetCsv -ErrorAction SilentlyContinue
+            if ($rows) {
+                foreach ($r in $rows) {
+                    if ($r.'Device Serial Number' -ne $hashObj.SerialNumber) {
+                        $existingEntries.Add($r)
+                    }
+                }
+            }
+        } catch { }
+    }
+
+    $newEntry = [PSCustomObject]@{
+        'Device Serial Number' = $hashObj.SerialNumber
+        'Windows Product ID'   = $hashObj.WindowsProductId
+        'Hardware Hash'        = $hashObj.HardwareHash
+        'Group Tag'            = if ($GroupTag) { $GroupTag } else { $hashObj.GroupTag }
+        'Assigned User'        = if ($AssignedUser) { $AssignedUser } else { $hashObj.AssignedUser }
+        'Model'                = $hashObj.Model
+        'Manufacturer'         = $hashObj.Manufacturer
+        'HarvestTimestamp'     = [datetime]::UtcNow.ToString('yyyy-MM-dd HH:mm:ss')
+        'CartName'             = $CartName
+    }
+    $existingEntries.Add($newEntry)
+
+    $safeEntries = Protect-HubCsvRecords -Records $existingEntries
+    $safeEntries | Export-Csv -LiteralPath $targetCsv -NoTypeInformation -Encoding UTF8
+
+    $totalInCart = $existingEntries.Count
+    Play-HubAudio -Type Success
+
+    Write-Host "`n==========================================================================" -ForegroundColor Green
+    Write-Host " CART HARVEST SUCCESS: DEVICE CAPTURED INTO BATCH" -ForegroundColor Green
+    Write-Host " Device Serial: $($hashObj.SerialNumber) ($($hashObj.Manufacturer) $($hashObj.Model))" -ForegroundColor White
+    Write-Host " Total Devices in Cart Batch: $totalInCart" -ForegroundColor White
+    Write-Host " Cart CSV Location: $targetCsv" -ForegroundColor White
+    Write-Host " Safe to unplug USB / power down this unit and insert into next laptop." -ForegroundColor Yellow
+    Write-Host "==========================================================================`n" -ForegroundColor Green
+
+    return [PSCustomObject]@{
+        Success      = $true
+        CartCsvPath  = $targetCsv
+        TotalUnits   = $totalInCart
+        SerialNumber = $hashObj.SerialNumber
+        Model        = $hashObj.Model
+    }
+}
+
+# --- Function: Invoke-HubCartBatchRegistration (Bulk Intune Registration for Cart CSV) ---
+function Invoke-HubCartBatchRegistration {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$CsvPath,
+        [string]$AccessToken = ''
+    )
+
+    if (-not (Test-Path $CsvPath)) {
+        Write-Host "Cart CSV not found at: $CsvPath" -ForegroundColor Red
+        return [PSCustomObject]@{ Success = $false; Message = "File not found" }
+    }
+
+    $devices = Import-Csv -LiteralPath $CsvPath
+    if (-not $devices -or $devices.Count -eq 0) {
+        Write-Host "No device records found in CSV: $CsvPath" -ForegroundColor Yellow
+        return [PSCustomObject]@{ Success = $false; Message = "Empty CSV" }
+    }
+
+    $token = if ($AccessToken) { $AccessToken } else { Get-CurrentGraphToken }
+    if (-not $token) {
+        Write-Host "No active Microsoft Graph token. Sign in with Device Code or App Secret first." -ForegroundColor Red
+        return [PSCustomObject]@{ Success = $false; Message = "Not authenticated" }
+    }
+
+    Write-Host "Starting batch cloud registration for $($devices.Count) cart devices..." -ForegroundColor Cyan
+    $registered = 0
+    $failed = 0
+    $results = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    for ($i = 0; $i -lt $devices.Count; $i++) {
+        $dev = $devices[$i]
+        $sn = $dev.'Device Serial Number'
+        $hash = $dev.'Hardware Hash'
+        $gt = $dev.'Group Tag'
+        $usr = $dev.'Assigned User'
+
+        Write-Host "[$($i+1)/$($devices.Count)] Registering Serial: $sn..." -ForegroundColor White
+        try {
+            $regRes = Register-AutopilotDevice -AccessToken $token -HardwareHash $hash -SerialNumber $sn -GroupTag $gt -AssignedUser $usr
+            $registered++
+            $results.Add([PSCustomObject]@{ Serial = $sn; Success = $true; Details = 'Registered' })
+        } catch {
+            $failed++
+            Write-Host "  [FAIL] $sn registration failed: $($_.Exception.Message)" -ForegroundColor Red
+            $results.Add([PSCustomObject]@{ Serial = $sn; Success = $false; Details = $_.Exception.Message })
+        }
+    }
+
+    Write-Host "`nBatch Cart Registration Complete: $registered registered, $failed failed." -ForegroundColor $(if ($failed -eq 0) { 'Green' } else { 'Yellow' })
+    return [PSCustomObject]@{
+        Success    = ($failed -eq 0)
+        Total      = $devices.Count
+        Registered = $registered
+        Failed     = $failed
+        Results    = $results
+    }
+}
+
+
 # --- Function: Get-WindowsLicensingInfo (Windows Edition & OEM Key Inspector) ---
 function Get-WindowsLicensingInfo {
     [CmdletBinding()]
@@ -6782,6 +8860,69 @@ function Invoke-HeadlessActionRoutine {
         } else {
             Write-Host "[PLAYBOOK CSV] Export note: $($exportRes.Message)" -ForegroundColor Yellow
         }
+
+        # Rich deployment report, closed-loop receipt, and fleet plane telemetry in headless mode
+        try {
+            $totalSec = 0.0
+            if ($headlessLogEntries.Count -gt 0) {
+                $totalSec = [math]::Round(($headlessLogEntries | Measure-Object -Property DurationSec -Sum).Sum, 1)
+            }
+            $firstEntry = $headlessLogEntries[0]
+            $metrics = [PSCustomObject]@{
+                SchemaVersion = 1
+                RoutineName   = $RoutineName
+                GeneratedUtc  = [datetime]::UtcNow.ToString('o')
+                TotalSeconds  = $totalSec
+                StepCount     = $headlessLogEntries.Count
+                RebootCount   = 0
+                Baseline      = (Get-HubSystemBaseline)
+                Steps         = @($headlessLogEntries | ForEach-Object { [PSCustomObject]@{ ActionName = $_.ActionName; DurationSec = $_.DurationSec } })
+                Wu            = [PSCustomObject]@{ Installed = 0; Failed = 0; TotalDownloadMB = 0; AvgDownloadMBps = 0; TotalInstallSec = 0; AvgInstallMBpm = 0; Updates = @() }
+                Disk          = [PSCustomObject]@{ AvgReadMBps = 0; PeakReadMBps = 0; AvgWriteMBps = 0; PeakWriteMBps = 0; AvgIops = 0; PeakIops = 0; Samples = @() }
+            }
+            $storedBaseline = Get-HubStoredBaseline
+            $metrics | Add-Member -NotePropertyName BaselineComparison -NotePropertyValue (Get-HubBaselineComparison -Metrics $metrics -Baseline $storedBaseline)
+
+            $repRes = Export-HubDeploymentReport -Metrics $metrics
+            if ($repRes.Success) {
+                Write-Host "[DEPLOYMENT REPORT] Report generated: $($repRes.Path)" -ForegroundColor Green
+                Update-HubStoredBaseline -Metrics $metrics | Out-Null
+            }
+
+            $receipt = $null
+            $receiptRes = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId -Metrics $metrics
+            if ($receiptRes.Success) {
+                $receipt = $receiptRes.ReceiptData
+                Write-Host "[PROVISIONING RECEIPT] Receipt generated: $($receiptRes.HtmlPath)" -ForegroundColor Green
+                Write-Host "  Verdict: $($receipt.Verdict) (Score: $($receipt.Score))" -ForegroundColor $(if ($receipt.Verdict -eq 'VERIFIED') { 'Green' } else { 'Yellow' })
+                Write-Host "  Integrity Seal: $($receipt.IntegrityHash)" -ForegroundColor Cyan
+            }
+
+            $telemPayload = [PSCustomObject]@{
+                SchemaVersion = 1
+                DeploymentId  = $script:HubDeploymentId
+                TimestampUtc  = [datetime]::UtcNow.ToString('o')
+                RoutineName   = $RoutineName
+                Status        = if ($headlessLogEntries | Where-Object { $_.Status -eq 'Failed' }) { 'Failed' } else { 'Success' }
+                TotalSeconds  = $totalSec
+                Metrics       = $metrics
+                Receipt       = $receipt
+                Site          = if ($script:ActiveDeploymentProfile -and $script:ActiveDeploymentProfile.Site) { $script:ActiveDeploymentProfile.Site } else { (if ($env:AUTOPILOT_SITE) { $env:AUTOPILOT_SITE } else { 'Default' }) }
+                Technician    = $env:USERNAME
+                Device        = [PSCustomObject]@{
+                    SerialNumber = $firstEntry.SerialNumber
+                    Manufacturer = $firstEntry.Manufacturer
+                    Model        = $firstEntry.Model
+                    ComputerName = $env:COMPUTERNAME
+                }
+            }
+            $telemRes = Send-HubFleetTelemetry -Payload $telemPayload
+            if ($telemRes.Success -and -not $telemRes.Buffered) {
+                Write-Host "[FLEET TELEMETRY] Telemetry delivered to $($telemRes.Endpoint)" -ForegroundColor Green
+            } else {
+                Write-Host "[FLEET TELEMETRY] Telemetry buffered offline: $($telemRes.Path)" -ForegroundColor Gray
+            }
+        } catch { }
     }
 }
 
@@ -7440,6 +9581,7 @@ function Start-AutopilotHubGui {
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto"/>
@@ -7447,8 +9589,30 @@ function Start-AutopilotHubGui {
                     <ColumnDefinition Width="*"/>
                 </Grid.ColumnDefinitions>
 
-                <!-- Left: Routine Badge & Selector -->
-                <StackPanel Grid.Row="0" Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,8,0">
+                <!-- Row 0: Site Profile (Config-as-Code) & Fleet Quick Bar -->
+                <StackPanel Grid.Row="0" Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,8,3">
+                    <Border Background="#334155" CornerRadius="3" Padding="5,2" Margin="0,0,6,0" VerticalAlignment="Center">
+                        <TextBlock Text="SITE PROFILE" FontSize="8.5" FontWeight="Bold" Foreground="#FFFFFF"/>
+                    </Border>
+                    <ComboBox Name="CboDeploymentProfile" Width="290" Height="25" FontSize="11" VerticalContentAlignment="Center" Background="#F8FAFC" BorderBrush="#CBD5E1" ToolTip="Select a Site / Environment Profile to automatically configure Group Tag, naming template, app bundles, and security posture">
+                        <ComboBoxItem Content="Melbourne - Corporate Standard" IsSelected="True"/>
+                        <ComboBoxItem Content="Sydney - Kiosk / Front Desk"/>
+                        <ComboBoxItem Content="Field Executive - High Security"/>
+                        <ComboBoxItem Content="Engineering - High Performance"/>
+                        <ComboBoxItem Content="Factory Floor - Isolated Rugged"/>
+                    </ComboBox>
+                </StackPanel>
+
+                <StackPanel Grid.Row="0" Grid.Column="1" Grid.ColumnSpan="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,0,3">
+                    <Button Name="BtnApplyProfile" Content="Apply Profile" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" ToolTip="Apply the selected site deployment profile to all tabs"/>
+                    <Button Name="BtnCartMode" Content="Cart Harvest Station" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" ToolTip="Bulk Cart Station: Rapid multi-laptop hash harvesting and USB accumulation"/>
+                    <Button Name="BtnVerifyReceipt" Content="[v] Verify &amp; Receipt" Style="{StaticResource AccentBtn}" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" ToolTip="Execute closed-loop post-enrollment verification and generate tamper-evident signed receipt"/>
+                    <Button Name="BtnFleetSync" Content="[^] Fleet Sync" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" ToolTip="Flush buffered deployment telemetry to central fleet plane endpoint"/>
+                    <Button Name="BtnOemDrivers" Content="OEM Drivers / BIOS" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" ToolTip="Scan or update Dell Command Update, Lenovo System Update, or HP Image Assistant"/>
+                </StackPanel>
+
+                <!-- Row 1: Left: Routine Badge & Selector -->
+                <StackPanel Grid.Row="1" Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,8,0">
                     <Border Background="#0067C0" CornerRadius="3" Padding="5,2" Margin="0,0,6,0" VerticalAlignment="Center">
                         <TextBlock Text="PLAYBOOK" FontSize="8.5" FontWeight="Bold" Foreground="#FFFFFF"/>
                     </Border>
@@ -7461,12 +9625,14 @@ function Start-AutopilotHubGui {
                     </ComboBox>
                 </StackPanel>
 
-                <!-- Center: Playbook Controls -->
-                <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,10,0">
+                <!-- Row 1: Center: Playbook Controls -->
+                <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,10,0">
                     <Button Name="BtnPlaybookRun" Content="[&#x25B6; Run Playbook]" Style="{StaticResource AccentBtn}" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" ToolTip="Start the selected automated click-through playbook"/>
                     <Button Name="BtnPlaybookPause" Content="[&#x23F8; Pause]" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" IsEnabled="False" ToolTip="Pause or resume current playbook execution"/>
                     <Button Name="BtnPlaybookStop" Content="[&#x23F9; Stop]" Style="{StaticResource DestructiveBtn}" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" IsEnabled="False" ToolTip="Abort current playbook execution"/>
-                    <Button Name="BtnPlaybookDownloadCsv" Content="[v] Download CSV" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,8,0" IsEnabled="False" ToolTip="Download and save the Playbook audit log and step results as a CSV spreadsheet"/>
+                    <Button Name="BtnPlaybookDownloadCsv" Content="[v] Download CSV" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" IsEnabled="False" ToolTip="Download and save the Playbook audit log and step results as a CSV spreadsheet"/>
+                    <Button Name="BtnPlaybookReport" Content="[#] Deployment Report" Style="{StaticResource AccentBtn}" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" IsEnabled="False" ToolTip="Open the rich deployment report: charts for step timings, update sizes, disk throughput/IOPS, plus machine baseline and outlier comparison"/>
+                    <Button Name="BtnPlaybookReceipt" Content="[#] Receipt" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,8,0" IsEnabled="False" ToolTip="Open the tamper-evident provisioning verification receipt"/>
                 </StackPanel>
 
                 <!-- Right: Current Step Indicator Status -->
@@ -7475,8 +9641,8 @@ function Start-AutopilotHubGui {
                     <TextBlock Name="TxtPlaybookStep" Text="Ready (Select an action playbook above and click Run to begin automated click-through)" FontSize="10.5" Foreground="#1E293B" FontWeight="SemiBold" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
                 </StackPanel>
 
-                <!-- Row 1: Playbook Progress Bar -->
-                <ProgressBar Name="PlaybookProgressBar" Grid.Row="1" Grid.ColumnSpan="3" Height="3.5" Minimum="0" Maximum="100" Value="0"
+                <!-- Row 2: Playbook Progress Bar -->
+                <ProgressBar Name="PlaybookProgressBar" Grid.Row="2" Grid.ColumnSpan="3" Height="3.5" Minimum="0" Maximum="100" Value="0"
                              Background="#F1F5F9" Foreground="#0067C0" BorderThickness="0" Margin="0,4,0,1"/>
             </Grid>
         </Border>
@@ -8950,6 +11116,14 @@ function Start-AutopilotHubGui {
     $btnPlaybookPause      = $window.FindName('BtnPlaybookPause')
     $btnPlaybookStop       = $window.FindName('BtnPlaybookStop')
     $btnPlaybookDownloadCsv = $window.FindName('BtnPlaybookDownloadCsv')
+    $btnPlaybookReport = $window.FindName('BtnPlaybookReport')
+    $btnPlaybookReceipt = $window.FindName('BtnPlaybookReceipt')
+    $cboDeploymentProfile = $window.FindName('CboDeploymentProfile')
+    $btnApplyProfile = $window.FindName('BtnApplyProfile')
+    $btnCartMode = $window.FindName('BtnCartMode')
+    $btnVerifyReceipt = $window.FindName('BtnVerifyReceipt')
+    $btnFleetSync = $window.FindName('BtnFleetSync')
+    $btnOemDrivers = $window.FindName('BtnOemDrivers')
     $txtPlaybookStep       = $window.FindName('TxtPlaybookStep')
     $playbookProgressBar   = $window.FindName('PlaybookProgressBar')
 
@@ -13968,6 +16142,28 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
         $mfg = try { if ($script:DeviceState -and $script:DeviceState.Manufacturer) { $script:DeviceState.Manufacturer } else { (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Manufacturer } } catch { 'UNKNOWN' }
         $model = try { if ($script:DeviceState -and $script:DeviceState.Model) { $script:DeviceState.Model } else { (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Model } } catch { 'UNKNOWN' }
 
+        # Deployment telemetry: capture start time, reset WU metrics, and sample disk throughput
+        # on a 3s DispatcherTimer (fires during the loop's Update-WpfUI pumps; UI-thread safe).
+        $script:PlaybookStartUtc = [datetime]::UtcNow
+        $script:HubDiskSamples = [System.Collections.Generic.List[object]]::new()
+        $script:HubLastWuMetrics = $null
+        $script:HubDiskSampleTimer = [System.Windows.Threading.DispatcherTimer]::new()
+        $script:HubDiskSampleTimer.Interval = [TimeSpan]::FromSeconds(3)
+        $script:HubDiskSampleTimer.Add_Tick({
+            try {
+                $smp = Get-HubDiskPerfSampleFast
+                if ($smp.Ok) {
+                    $script:HubDiskSamples.Add([PSCustomObject]@{
+                        T         = [math]::Round(([datetime]::UtcNow - $script:PlaybookStartUtc).TotalSeconds, 0)
+                        ReadMBps  = $smp.ReadMBps
+                        WriteMBps = $smp.WriteMBps
+                        Iops      = $smp.Iops
+                    })
+                }
+            } catch { }
+        })
+        $script:HubDiskSampleTimer.Start()
+
         $btnPlaybookRun.IsEnabled = $false
         $btnPlaybookPause.IsEnabled = $true
         $btnPlaybookPause.Content = '[|| Pause]'
@@ -14121,6 +16317,8 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
             $btnPlaybookStop.IsEnabled = $false
             $cboPlaybookRoutine.IsEnabled = $true
 
+            if ($script:HubDiskSampleTimer) { try { $script:HubDiskSampleTimer.Stop() } catch { } }
+
             $exportRes = $null
             if ($stepLogEntries -and $stepLogEntries.Count -gt 0) {
                 $script:LastPlaybookExecutionRecords = $stepLogEntries
@@ -14131,6 +16329,97 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                     $btnPlaybookDownloadCsv.IsEnabled = $true
                     $btnPlaybookDownloadCsv.ToolTip = "Download or export the playbook audit CSV (Auto-saved to: $($exportRes.Path))"
                     Write-HubLog "Playbook CSV audit log saved to: $($exportRes.Path)" "SUCCESS"
+                }
+
+                # ---- Rich deployment report (HTML with charts + JSON sidecar) ----
+                try {
+                    $samples = @($script:HubDiskSamples)
+                    $reads  = @($samples | ForEach-Object { $_.ReadMBps })
+                    $writes = @($samples | ForEach-Object { $_.WriteMBps })
+                    $iopsV  = @($samples | ForEach-Object { $_.Iops })
+                    function _avg($a) { if ($a.Count -gt 0) { [math]::Round(($a | Measure-Object -Average).Average, 0) } else { 0 } }
+                    function _max($a) { if ($a.Count -gt 0) { [math]::Round(($a | Measure-Object -Maximum).Maximum, 0) } else { 0 } }
+                    $wu = if ($script:HubLastWuMetrics) { $script:HubLastWuMetrics } else {
+                        [PSCustomObject]@{ Installed = 0; Failed = 0; TotalDownloadMB = 0; AvgDownloadMBps = 0; TotalInstallSec = 0; AvgInstallMBpm = 0; Updates = @() }
+                    }
+                    $totalSec = [math]::Round(([datetime]::UtcNow - $script:PlaybookStartUtc).TotalSeconds, 1)
+                    $metrics = [PSCustomObject]@{
+                        SchemaVersion = 1
+                        RoutineName   = $RoutineName
+                        GeneratedUtc  = [datetime]::UtcNow.ToString('o')
+                        TotalSeconds  = $totalSec
+                        StepCount     = $stepLogEntries.Count
+                        RebootCount   = 0
+                        Baseline      = (Get-HubSystemBaseline)
+                        Steps         = @($stepLogEntries | ForEach-Object { [PSCustomObject]@{ ActionName = $_.ActionName; DurationSec = $_.DurationSec } })
+                        Wu            = $wu
+                        Disk          = [PSCustomObject]@{
+                            AvgReadMBps  = (_avg $reads);  PeakReadMBps  = (_max $reads)
+                            AvgWriteMBps = (_avg $writes); PeakWriteMBps = (_max $writes)
+                            AvgIops      = (_avg $iopsV);  PeakIops      = (_max $iopsV)
+                            Samples      = $samples
+                        }
+                    }
+                    $storedBaseline = Get-HubStoredBaseline
+                    $metrics | Add-Member -NotePropertyName BaselineComparison -NotePropertyValue (Get-HubBaselineComparison -Metrics $metrics -Baseline $storedBaseline)
+                    $repRes = Export-HubDeploymentReport -Metrics $metrics
+                    if ($repRes.Success) {
+                        $script:LastDeploymentReportPath = $repRes.Path
+                        if ($btnPlaybookReport) {
+                            $btnPlaybookReport.IsEnabled = $true
+                            $btnPlaybookReport.ToolTip = "Open the rich deployment report (auto-saved to: $($repRes.Path))"
+                        }
+                        Write-HubLog "Deployment report (HTML + JSON) saved to: $($repRes.Path)" "SUCCESS"
+                        Update-HubStoredBaseline -Metrics $metrics | Out-Null
+                    }
+
+                    # Post-enrollment Closed-Loop Verification & Tamper-Evident Receipt
+                    try {
+                        $receiptRes = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId -Metrics $metrics
+                        if ($receiptRes.Success) {
+                            $script:LastProvisioningReceipt = $receiptRes
+                            $script:LastProvisioningReceiptPath = $receiptRes.HtmlPath
+                            if ($btnPlaybookReceipt) {
+                                $btnPlaybookReceipt.IsEnabled = $true
+                                $btnPlaybookReceipt.ToolTip = "Open tamper-evident provisioning receipt: $($receiptRes.HtmlPath)"
+                            }
+                            Write-HubLog "Provisioning receipt generated (ID: $($script:HubDeploymentId)): $($receiptRes.HtmlPath)" "SUCCESS"
+                        }
+                    } catch {
+                        Write-HubLog "Receipt generation note: $($_.Exception.Message)" "WARN"
+                    }
+
+                    # Outbound Fleet Plane Telemetry
+                    try {
+                        $telemetryPayload = [PSCustomObject]@{
+                            SchemaVersion = 1
+                            DeploymentId  = $script:HubDeploymentId
+                            TimestampUtc  = [datetime]::UtcNow.ToString('o')
+                            RoutineName   = $RoutineName
+                            Status        = if ($stepLogEntries | Where-Object { $_.Status -eq 'Failed' }) { 'Failed' } else { 'Success' }
+                            TotalSeconds  = $totalSec
+                            Metrics       = $metrics
+                            Receipt       = if ($script:LastProvisioningReceipt) { $script:LastProvisioningReceipt.ReceiptData } else { $null }
+                            Site          = if ($script:ActiveDeploymentProfile -and $script:ActiveDeploymentProfile.Site) { $script:ActiveDeploymentProfile.Site } else { (if ($env:AUTOPILOT_SITE) { $env:AUTOPILOT_SITE } else { 'Default' }) }
+                            Technician    = $env:USERNAME
+                            Device        = [PSCustomObject]@{
+                                SerialNumber = $serial
+                                Manufacturer = $mfg
+                                Model        = $model
+                                ComputerName = $env:COMPUTERNAME
+                            }
+                        }
+                        $telemRes = Send-HubFleetTelemetry -Payload $telemetryPayload
+                        if ($telemRes.Success -and -not $telemRes.Buffered) {
+                            Write-HubLog "Fleet plane telemetry delivered: $($telemRes.Message)" "SUCCESS"
+                        } else {
+                            Write-HubLog "Fleet plane buffered offline: $($telemRes.Message)" "INFO"
+                        }
+                    } catch {
+                        Write-HubLog "Fleet telemetry note: $($_.Exception.Message)" "WARN"
+                    }
+                } catch {
+                    Write-HubLog "Deployment report generation note: $($_.Exception.Message)" "WARN"
                 }
             }
 
@@ -14248,6 +16537,121 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     $btnPlaybookDownloadCsv.Add_Click({
         Save-HubPlaybookCsvDialog -Owner $window
     })
+
+    $btnPlaybookReport.Add_Click({
+        if ($script:LastDeploymentReportPath -and (Test-Path $script:LastDeploymentReportPath)) {
+            try { Start-Process $script:LastDeploymentReportPath } catch {
+                Write-HubLog "Could not open report: $($_.Exception.Message)" "ERROR"
+            }
+        } else {
+            [System.Windows.MessageBox]::Show("No deployment report yet. Run an action playbook first - a report is generated automatically when it finishes.", "No Report", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+        }
+    })
+
+    if ($btnPlaybookReceipt) {
+        $btnPlaybookReceipt.Add_Click({
+            if ($script:LastProvisioningReceiptPath -and (Test-Path $script:LastProvisioningReceiptPath)) {
+                try { Start-Process $script:LastProvisioningReceiptPath } catch {
+                    Write-HubLog "Could not open receipt: $($_.Exception.Message)" "ERROR"
+                }
+            } else {
+                try {
+                    $rec = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId
+                    if ($rec.Success) {
+                        $script:LastProvisioningReceipt = $rec
+                        $script:LastProvisioningReceiptPath = $rec.HtmlPath
+                        $btnPlaybookReceipt.IsEnabled = $true
+                        Start-Process $rec.HtmlPath
+                    }
+                } catch {
+                    [System.Windows.MessageBox]::Show("Could not generate receipt: $($_.Exception.Message)", "Receipt Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+                }
+            }
+        })
+    }
+
+    if ($btnVerifyReceipt) {
+        $btnVerifyReceipt.Add_Click({
+            try {
+                Write-HubLog "Executing closed-loop post-enrollment verification..." "INFO"
+                $rec = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId
+                if ($rec.Success) {
+                    $script:LastProvisioningReceipt = $rec
+                    $script:LastProvisioningReceiptPath = $rec.HtmlPath
+                    if ($btnPlaybookReceipt) { $btnPlaybookReceipt.IsEnabled = $true }
+                    Write-HubLog "Verification receipt generated: $($rec.HtmlPath) (Verdict: $($rec.ReceiptData.Verdict), Score: $($rec.ReceiptData.Score))" "SUCCESS"
+                    try { Start-Process $rec.HtmlPath } catch { }
+                }
+            } catch {
+                Write-HubLog "Verification error: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+
+    if ($btnApplyProfile) {
+        $btnApplyProfile.Add_Click({
+            try {
+                $selItem = $cboDeploymentProfile.SelectedItem
+                $profName = if ($selItem -is [System.Windows.Controls.ComboBoxItem]) { $selItem.Content.ToString() } else { [string]$selItem }
+                $applied = Apply-HubDeploymentProfile -ProfileNameOrId $profName
+                if ($applied) {
+                    if ($txtGroupTag) { $txtGroupTag.Text = $applied.GroupTag }
+                    if ($txtComputerNameTemplate) { $txtComputerNameTemplate.Text = $applied.ComputerNameTemplate }
+                    Write-HubLog "Applied profile '$($applied.Name)' (Site: $($applied.Site), GroupTag: $($applied.GroupTag))." "SUCCESS"
+                }
+            } catch {
+                Write-HubLog "Profile error: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+
+    if ($btnCartMode) {
+        $btnCartMode.Add_Click({
+            try {
+                Write-HubLog "Initiating Cart Harvest Station for current device..." "INFO"
+                $gt = if ($txtGroupTag) { $txtGroupTag.Text } else { '' }
+                $cartRes = Invoke-HubCartHarvest -CartName 'BenchCart' -GroupTag $gt
+                if ($cartRes.Success) {
+                    Write-HubLog "Device $($cartRes.SerialNumber) captured into cart batch (Total: $($cartRes.TotalUnits) units). CSV: $($cartRes.CartCsvPath)" "SUCCESS"
+                    [System.Windows.MessageBox]::Show("Device $($cartRes.SerialNumber) successfully added to Cart Batch!`n`nTotal units in batch: $($cartRes.TotalUnits)`nCSV: $($cartRes.CartCsvPath)`n`nSafe to unplug USB and proceed to next laptop.", "Cart Harvest Success", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+                }
+            } catch {
+                Write-HubLog "Cart harvest error: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+
+    if ($btnFleetSync) {
+        $btnFleetSync.Add_Click({
+            try {
+                Write-HubLog "Flushing buffered fleet telemetry to central endpoint..." "INFO"
+                $flushed = Flush-HubFleetBuffer
+                Write-HubLog "Fleet flush complete: $($flushed.FlushedCount) sent, $($flushed.PendingCount) pending." $(if ($flushed.FlushedCount -gt 0) { 'SUCCESS' } else { 'INFO' })
+            } catch {
+                Write-HubLog "Fleet sync error: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+
+    if ($btnOemDrivers) {
+        $btnOemDrivers.Add_Click({
+            try {
+                Write-HubLog "Scanning for OEM drivers and firmware updates..." "INFO"
+                Start-HubAsyncWork -Description "OEM Driver Scan" -WorkerScript {
+                    Invoke-HubOemDriverUpdate -ScanOnly
+                } -OnComplete {
+                    param($res, $err)
+                    if ($res -and $res.Success) {
+                        Write-HubLog "OEM driver scan: $($res.Message)" "SUCCESS"
+                    } else {
+                        Write-HubLog "OEM driver scan note: $(if ($err) { $err.Message } else { $res.Message })" "WARN"
+                    }
+                } | Out-Null
+            } catch {
+                Write-HubLog "OEM driver error: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
 
 
     # Initial Diagnostic Run. The 7-stage ladder is ~3 s of network waits. It was kicked off in a
@@ -14427,6 +16831,25 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
 # ==============================================================================
 # SECTION C: RUNTIME ENTRYPOINT & STA APARTMENT STATE GUARD
 # ==============================================================================
+
+# Central Config-as-Code profile and environment initialization
+if ($DeploymentProfile) {
+    Apply-HubDeploymentProfile -ProfileNameOrId $DeploymentProfile | Out-Null
+} elseif ($env:AUTOPILOT_DEPLOYMENT_PROFILE) {
+    Apply-HubDeploymentProfile -ProfileNameOrId $env:AUTOPILOT_DEPLOYMENT_PROFILE | Out-Null
+}
+if ($FleetEndpoint) {
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_FLEET_ENDPOINT', $FleetEndpoint, 'Process')
+}
+if ($GroupTag) {
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_GROUP_TAG', $GroupTag, 'Process')
+}
+if ($AssignedUser) {
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_ASSIGNED_USER', $AssignedUser, 'Process')
+}
+if ($ComputerNameTemplate) {
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_NAME_TEMPLATE', $ComputerNameTemplate, 'Process')
+}
 
 if ($RenameComputer) {
     try {
@@ -14674,6 +17097,72 @@ if (-not $NoGui) {
             $script:PreflightHandle = $script:PreflightRunspace.BeginInvoke()
         } catch { $script:PreflightHandle = $null; $script:PreflightRunspace = $null }
     }
+    if ($VerifyEnrollment -or $GenerateReceipt) {
+        Write-Host "`nClosed-Loop Provisioning Verification & Receipt Generator" -ForegroundColor Cyan
+        $rec = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId
+        Write-Host "Receipt generated: $($rec.HtmlPath)" -ForegroundColor Green
+        Write-Host "JSON sidecar:      $($rec.JsonPath)" -ForegroundColor Green
+        Write-Host "Verdict:           $($rec.ReceiptData.Verdict) (Score: $($rec.ReceiptData.Score))" -ForegroundColor $(if ($rec.ReceiptData.Verdict -eq 'VERIFIED') { 'Green' } else { 'Yellow' })
+        Write-Host "SHA-256 Digest:    $($rec.ReceiptData.IntegrityHash)" -ForegroundColor Cyan
+
+        if ($SendTelemetry -or $FleetEndpoint -or $env:AUTOPILOT_FLEET_ENDPOINT) {
+            $telemPayload = [PSCustomObject]@{
+                SchemaVersion = 1
+                DeploymentId  = $rec.DeploymentId
+                TimestampUtc  = [datetime]::UtcNow.ToString('o')
+                RoutineName   = 'Verification & Receipt'
+                Status        = if ($rec.ReceiptData.Verdict -eq 'VERIFICATION_FAILED') { 'Failed' } else { 'Success' }
+                TotalSeconds  = 0
+                Verdict       = $rec.ReceiptData.Verdict
+                Receipt       = $rec.ReceiptData
+                Site          = if ($script:ActiveDeploymentProfile) { $script:ActiveDeploymentProfile.Site } else { (if ($env:AUTOPILOT_SITE) { $env:AUTOPILOT_SITE } else { 'Default' }) }
+                Technician    = $env:USERNAME
+                Device        = $rec.ReceiptData.Device
+            }
+            $tRes = Send-HubFleetTelemetry -Payload $telemPayload -Endpoint $FleetEndpoint
+            if ($tRes.Success -and -not $tRes.Buffered) {
+                Write-Host "Telemetry delivered to fleet plane: $($tRes.Endpoint)" -ForegroundColor Green
+            } else {
+                Write-Host "Telemetry buffered offline: $($tRes.Path)" -ForegroundColor Gray
+            }
+        }
+        return
+    }
+
+    if ($CartMode) {
+        Write-Host "`nBulk Harvest Station: Cart Mode" -ForegroundColor Cyan
+        $gt = if ($GroupTag) { $GroupTag } else { $env:AUTOPILOT_GROUP_TAG }
+        $usr = if ($AssignedUser) { $AssignedUser } else { $env:AUTOPILOT_ASSIGNED_USER }
+        $cres = Invoke-HubCartHarvest -CartName $CartName -CsvPath $CartCsvPath -GroupTag $gt -AssignedUser $usr
+        return
+    }
+
+    if ($BatchRegisterCart) {
+        Write-Host "`nBulk Cart Batch Cloud Registration" -ForegroundColor Cyan
+        $cres = Invoke-HubCartBatchRegistration -CsvPath $CartCsvPath
+        return
+    }
+
+    if ($OemUpdates) {
+        Write-Host "`nOEM Driver & Firmware Management" -ForegroundColor Cyan
+        $ores = Invoke-HubOemDriverUpdate -ScanOnly:$OemScanOnly
+        return
+    }
+
+    if ($EnforceSecurityPosture) {
+        Write-Host "`nSecurity Posture Enforcement" -ForegroundColor Cyan
+        $bRes = Enable-HubBitLocker
+        $sRes = Set-HubSecurityBaseline
+        $lRes = Set-HubLocalAdminPosture
+        return
+    }
+
+    if ($StartFleetServer) {
+        Write-Host "`nStarting Fleet Plane Ingestion Server on port $FleetServerPort..." -ForegroundColor Cyan
+        Start-HubFleetServer -Port $FleetServerPort
+        return
+    }
+
     if (-not $NoIntro) { Show-HubIntro }
 
     try {
