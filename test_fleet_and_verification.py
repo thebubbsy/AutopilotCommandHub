@@ -58,7 +58,7 @@ def test_closed_loop_verification_and_receipt():
     with open(html_path, 'r', encoding='utf-8') as f:
         html_content = f.read()
     assert "Autopilot Provisioning Receipt" in html_content
-    assert "Tamper-Evident SHA-256 Digital Integrity Seal" in html_content
+    assert "Integrity Seal (" in html_content  # honest label: HMAC-SHA256 when keyed, else SHA-256 checksum
     assert dep_id in html_content
 
     # Verify cryptographic seal using Test-HubProvisioningReceipt

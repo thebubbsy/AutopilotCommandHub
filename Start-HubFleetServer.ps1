@@ -25,6 +25,13 @@
 param(
     [int]$Port = 8443,
     [string]$DataDir = 'C:\AutopilotLogs\FleetData',
+    # Interface to bind. Default 'localhost' is safe and needs no admin, but ONLY accepts connections from
+    # this machine. For real multi-bench ingestion, pass the server's LAN IP or '+' (all interfaces) -
+    # that needs an elevated shell or a one-time 'netsh http add urlacl', and you should set -AuthToken too.
+    [string]$BindAddress = 'localhost',
+    # Shared secret required in the X-Hub-Token header on every request when set (else defaults to
+    # $env:HUB_FLEET_TOKEN). Strongly recommended whenever BindAddress is not localhost.
+    [string]$AuthToken = $env:HUB_FLEET_TOKEN,
     [switch]$OpenBrowser
 )
 
@@ -183,8 +190,13 @@ try {
 }
 
 $listener = [System.Net.HttpListener]::new()
-$prefix = "http://localhost:${Port}/"
+$prefix = "http://${BindAddress}:${Port}/"
 $listener.Prefixes.Add($prefix)
+if ($BindAddress -ne 'localhost' -and $BindAddress -ne '127.0.0.1') {
+    if ([string]::IsNullOrWhiteSpace($AuthToken)) {
+        Write-Host "[WARN] Server is bound to '$BindAddress' (network-reachable) with NO -AuthToken. Anyone who can reach this port can post telemetry and read the dashboard. Set -AuthToken or `$env:HUB_FLEET_TOKEN." -ForegroundColor Yellow
+    }
+}
 
 try {
     $listener.Start()
@@ -377,6 +389,20 @@ while ($listener.IsListening) {
 
         $path = $req.Url.AbsolutePath
         $method = $req.HttpMethod
+
+        if (-not [string]::IsNullOrWhiteSpace($AuthToken)) {
+            $provided = $req.Headers['X-Hub-Token']
+            if ($provided -ne $AuthToken) {
+                $den = [System.Text.Encoding]::UTF8.GetBytes('{"error":"unauthorized"}')
+                $res.StatusCode = 401
+                $res.ContentType = 'application/json'
+                $res.ContentLength64 = $den.Length
+                $res.OutputStream.Write($den, 0, $den.Length)
+                $res.Close()
+                Write-Host "[AUTH] Rejected $method $path from $($req.RemoteEndPoint) (bad/missing X-Hub-Token)" -ForegroundColor DarkYellow
+                continue
+            }
+        }
 
         if ($method -eq 'POST' -and $path -match '^/api/(telemetry|ingest)') {
             $reader = [System.IO.StreamReader]::new($req.InputStream, [System.Text.Encoding]::UTF8)

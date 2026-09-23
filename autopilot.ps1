@@ -4750,7 +4750,26 @@ function Test-HubClosedLoopVerification {
     }
 }
 
-# --- Function: Export-HubProvisioningReceipt (Tamper-Evident Provisioning Receipt Exporter) ---
+# --- Function: Get-HubReceiptSeal (integrity seal for provisioning receipts) ---
+# HMAC-SHA256 keyed by $env:HUB_RECEIPT_KEY is genuinely tamper-evident: a receipt cannot be forged
+# (e.g. flipping a FAIL verdict to PASS) without the site key. With no key configured it degrades to a
+# plain SHA-256 checksum, which detects accidental corruption but is NOT forge-proof - and is labelled
+# as such, rather than being passed off as a tamper-proof seal.
+function Get-HubReceiptSeal {
+    param([string]$JsonText)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($JsonText)
+    $key = $env:HUB_RECEIPT_KEY
+    if (-not [string]::IsNullOrWhiteSpace($key)) {
+        $mac = [System.Security.Cryptography.HMACSHA256]::new([System.Text.Encoding]::UTF8.GetBytes($key))
+        try { $h = $mac.ComputeHash($bytes) } finally { $mac.Dispose() }
+        return [PSCustomObject]@{ Mode = 'HMAC-SHA256'; Digest = (-join ($h | ForEach-Object { $_.ToString('X2') })) }
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $h = $sha.ComputeHash($bytes) } finally { $sha.Dispose() }
+    return [PSCustomObject]@{ Mode = 'SHA-256'; Digest = (-join ($h | ForEach-Object { $_.ToString('X2') })) }
+}
+
+# --- Function: Export-HubProvisioningReceipt (Provisioning Receipt Exporter) ---
 function Export-HubProvisioningReceipt {
     [CmdletBinding()]
     param(
@@ -4821,12 +4840,16 @@ function Export-HubProvisioningReceipt {
         } else { $null }
     }
 
-    # Compute Tamper-Evident SHA-256 Digest over canonical JSON
-    $jsonForHash = ($receiptData | ConvertTo-Json -Depth 6)
-    $sha256 = [System.Security.Cryptography.SHA256]::Create()
-    $hashBytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($jsonForHash))
-    $digestHex = -join ($hashBytes | ForEach-Object { $_.ToString('X2') })
+    # Integrity seal over canonical JSON (HMAC-SHA256 when HUB_RECEIPT_KEY is set, else SHA-256 checksum).
+    # Round-trip through ConvertFrom-Json first so the bytes hashed here match exactly what the verifier
+    # reconstructs from the saved file (an ordered hashtable and a parsed PSCustomObject serialize
+    # differently for nested values; hashing the parsed shape makes export and verify symmetric).
+    $jsonForHash = (($receiptData | ConvertTo-Json -Depth 6) | ConvertFrom-Json | ConvertTo-Json -Depth 6)
+    $seal = Get-HubReceiptSeal -JsonText $jsonForHash
+    $digestHex = $seal.Digest
+    $sealMode = $seal.Mode
     $receiptData['IntegrityHash'] = $digestHex
+    $receiptData['SealMode'] = $sealMode
 
     # Write JSON receipt
     $fullJson = ($receiptData | ConvertTo-Json -Depth 6)
@@ -4905,9 +4928,9 @@ $checkRows
 </table>
 
 <div class='seal-box'>
-<div class='seal-title'>[#] Tamper-Evident SHA-256 Digital Integrity Seal</div>
+<div class='seal-title'>[#] Integrity Seal ($sealMode)</div>
 <div>Digest: <span class='seal-hash'>$digestHex</span></div>
-<div style='margin-top:4px;color:#64748b;font-size:10.5px;'>This cryptographic digest binds the device serial, hardware state, verification outcomes, and deployment telemetry into an immutable record.</div>
+<div style='margin-top:4px;color:#64748b;font-size:10.5px;'>$(if ($sealMode -eq 'HMAC-SHA256') { "Keyed HMAC-SHA256 seal - tamper-evident: this receipt cannot be altered without the site receipt key." } else { "SHA-256 checksum - detects accidental corruption only. Set HUB_RECEIPT_KEY before provisioning for a keyed, tamper-evident seal." })</div>
 </div>
 
 <div class='receipt-ftr'>
@@ -4954,26 +4977,55 @@ function Test-HubProvisioningReceipt {
 
     $storedHash = [string]$receiptObj.IntegrityHash
 
+    $sealMode = if ($receiptObj.SealMode) { [string]$receiptObj.SealMode } else { 'SHA-256' }
+
     $cleanData = [ordered]@{}
     foreach ($prop in $receiptObj.PSObject.Properties) {
-        if ($prop.Name -ne 'IntegrityHash') {
+        if ($prop.Name -ne 'IntegrityHash' -and $prop.Name -ne 'SealMode') {
             $cleanData[$prop.Name] = $prop.Value
         }
     }
-
     $jsonForHash = ($cleanData | ConvertTo-Json -Depth 6)
-    $sha256 = [System.Security.Cryptography.SHA256]::Create()
-    $computedBytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($jsonForHash))
+
+    # A keyed (HMAC) seal cannot be validated without the site key - say so rather than pass/fail blindly.
+    if ($sealMode -eq 'HMAC-SHA256' -and [string]::IsNullOrWhiteSpace($env:HUB_RECEIPT_KEY)) {
+        return [PSCustomObject]@{
+            IsValid = $false; Indeterminate = $true; DeploymentId = $receiptObj.DeploymentId; Verdict = $receiptObj.Verdict
+            StoredHash = $storedHash; ComputedHash = ''; SealMode = $sealMode
+            Reason = "Receipt carries a keyed HMAC-SHA256 seal; set HUB_RECEIPT_KEY to the site key to verify it."
+        }
+    }
+    # Downgrade guard: under a keyed policy, an unkeyed (SHA-256) receipt is untrustworthy - a tamperer
+    # could strip the key by re-sealing with a plain hash. Reject rather than accept with a caveat.
+    if ($sealMode -ne 'HMAC-SHA256' -and -not [string]::IsNullOrWhiteSpace($env:HUB_RECEIPT_KEY)) {
+        return [PSCustomObject]@{
+            IsValid = $false; DeploymentId = $receiptObj.DeploymentId; Verdict = $receiptObj.Verdict
+            StoredHash = $storedHash; ComputedHash = ''; SealMode = $sealMode
+            Reason = "Receipt is only SHA-256 checksummed but this site uses keyed seals (HUB_RECEIPT_KEY set) - rejected as untrusted/possible downgrade."
+        }
+    }
+
+    if ($sealMode -eq 'HMAC-SHA256') {
+        $mac = [System.Security.Cryptography.HMACSHA256]::new([System.Text.Encoding]::UTF8.GetBytes($env:HUB_RECEIPT_KEY))
+        try { $computedBytes = $mac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($jsonForHash)) } finally { $mac.Dispose() }
+    } else {
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try { $computedBytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($jsonForHash)) } finally { $sha256.Dispose() }
+    }
     $computedHash = -join ($computedBytes | ForEach-Object { $_.ToString('X2') })
 
     $isValid = ($storedHash -eq $computedHash)
+    $reason = if (-not $isValid) { "Integrity seal mismatch: the receipt has been modified since it was issued." }
+              elseif ($sealMode -eq 'HMAC-SHA256') { "Tamper-evident HMAC-SHA256 seal verified against the site key." }
+              else { "SHA-256 checksum matches (detects corruption only; not forge-proof - no site key was used when issued)." }
     return [PSCustomObject]@{
         IsValid      = $isValid
         DeploymentId = $receiptObj.DeploymentId
         Verdict      = $receiptObj.Verdict
         StoredHash   = $storedHash
         ComputedHash = $computedHash
-        Reason       = if ($isValid) { "Cryptographic integrity seal verified (SHA-256 match)" } else { "Integrity seal mismatch: payload has been modified" }
+        SealMode     = $sealMode
+        Reason       = $reason
     }
 }
 
@@ -5093,6 +5145,8 @@ function Send-HubFleetTelemetry {
         $req.ContentType = 'application/json; charset=utf-8'
         $req.Timeout = 6000
         $req.UserAgent = "AutopilotCommandHub/FleetClient ($deploymentId)"
+        $fleetToken = $env:HUB_FLEET_TOKEN
+        if (-not [string]::IsNullOrWhiteSpace($fleetToken)) { $req.Headers.Add('X-Hub-Token', $fleetToken) }
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
         $req.ContentLength = $bytes.Length
 
