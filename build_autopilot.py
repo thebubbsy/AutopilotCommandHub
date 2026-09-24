@@ -94,7 +94,11 @@ param(
     [switch]$OemScanOnly,
     [switch]$EnforceSecurityPosture,
     [switch]$StartFleetServer,
-    [int]$FleetServerPort = 8443
+    [int]$FleetServerPort = 8443,
+    [switch]$ClearTraces,
+    [switch]$RemoveTraces,
+    [switch]$SaveReceipt,
+    [string]$ExportPath = ''
 )
 
 # 0. Central Environment & Configuration Engine (.env)
@@ -324,7 +328,117 @@ $script:HubDeploymentId = "HUB-{0}-{1}" -f (Get-Date -Format 'yyyyMMdd'), ([guid
 $script:ActiveDeploymentProfile = $null
 $script:LastProvisioningReceipt = $null
 $script:LastProvisioningReceiptPath = $null
-$script:FleetBufferDir = 'C:\AutopilotLogs\FleetBuffer'
+$script:LastProvisioningReceiptHtml = $null
+$script:LastDeploymentMetrics = $null
+$script:LastDeploymentReportPath = $null
+$script:LastDeploymentReportHtml = $null
+$script:InMemoryStoredBaseline = $null
+$script:InMemoryPatchCascadeState = $null
+$script:FleetBufferDir = $null
+$script:FleetBuffer = [System.Collections.Generic.List[object]]::new()
+$script:HubLogEntries = [System.Collections.Generic.List[object]]::new()
+$script:PlaybookLogEntries = [System.Collections.Generic.List[object]]::new()
+$script:LastPlaybookExecutionRecords = [System.Collections.Generic.List[object]]::new()
+$script:LastPlaybookRoutineName = $null
+$script:HubCartEntries = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[PSCustomObject]]]::new()
+
+# --- Function: Remove-HubTraces (Alias: Clear-HubTraces) ---
+function Remove-HubTraces {
+    [CmdletBinding()]
+    param([switch]$Quiet)
+
+    $purgedItems = [System.Collections.Generic.List[string]]::new()
+
+    # 1. Directories to eradicate
+    $targetDirs = @(
+        'C:\AutopilotLogs',
+        (Join-Path $env:ProgramData 'AutopilotCommandHub'),
+        (Join-Path ([System.IO.Path]::GetTempPath()) 'AutopilotCommandHub'),
+        (Join-Path ([System.IO.Path]::GetTempPath()) 'AutopilotLogs'),
+        (Join-Path ([System.IO.Path]::GetTempPath()) 'AutopilotFleetBuffer'),
+        (Join-Path ([System.IO.Path]::GetTempPath()) 'AutopilotFleetData'),
+        'C:\Autopilot_Playbooks',
+        'C:\Autopilot_Carts'
+    )
+
+    foreach ($d in $targetDirs) {
+        if (Test-Path -LiteralPath $d) {
+            try {
+                Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+                $purgedItems.Add("Directory: $d")
+            } catch { }
+        }
+    }
+
+    # 2. Specific trace files in Temp
+    $tempPath = [System.IO.Path]::GetTempPath()
+    $tempFilters = @(
+        'AutopilotCommandHub.pid',
+        'hub.pid',
+        'AutopilotHub-*.log',
+        'Receipt_*.json',
+        'Receipt_*.html',
+        'Playbook_*.csv',
+        'DeploymentReport_*.html',
+        'DeploymentReport_*.json',
+        'TestCartBatchMulti.csv',
+        'TestDellWarranty.csv',
+        'DellWarranty-*.csv',
+        'test_custom.env',
+        'GraphTokenCache.json',
+        'HubDiag_*',
+        'FleetDashboard.html',
+        'Telemetry_*.json'
+    )
+
+    foreach ($pattern in $tempFilters) {
+        try {
+            $files = Get-ChildItem -Path $tempPath -Filter $pattern -ErrorAction SilentlyContinue
+            if ($files) {
+                foreach ($f in $files) {
+                    try {
+                        Remove-Item -LiteralPath $f.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                        $purgedItems.Add("File: $($f.FullName)")
+                    } catch { }
+                }
+            }
+        } catch { }
+    }
+
+    # 3. Clean any legacy LAPS registry keys
+    $lapsConfigKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS\Config'
+    if (Test-Path $lapsConfigKey) {
+        try {
+            Remove-Item -Path $lapsConfigKey -Recurse -Force -ErrorAction SilentlyContinue
+            $purgedItems.Add("Registry: $lapsConfigKey")
+        } catch { }
+    }
+
+    # Reset in-memory buffers
+    if ($script:FleetBuffer) { $script:FleetBuffer.Clear() }
+    if ($script:HubLogEntries) { $script:HubLogEntries.Clear() }
+    if ($script:PlaybookLogEntries) { $script:PlaybookLogEntries.Clear() }
+    if ($script:LastPlaybookExecutionRecords) { $script:LastPlaybookExecutionRecords.Clear() }
+    $script:InMemoryStoredBaseline = $null
+    $script:InMemoryPatchCascadeState = $null
+    $script:LastProvisioningReceipt = $null
+    $script:LastDeploymentMetrics = $null
+
+    $msg = "Purged $($purgedItems.Count) lingering trace item(s) from disk."
+    if (-not $Quiet) {
+        Write-Host "[ZERO-TRACE] $msg" -ForegroundColor Cyan
+    }
+    return [PSCustomObject]@{
+        Success     = $true
+        PurgedCount = $purgedItems.Count
+        PurgedItems = $purgedItems.ToArray()
+        Message     = $msg
+    }
+}
+Set-Alias -Name Clear-HubTraces -Value Remove-HubTraces -ErrorAction SilentlyContinue
+
+# Auto-purge disk traces on initialization
+$null = Remove-HubTraces -Quiet
 
 # 5. Self-Source Capture. Under `irm <url> | iex` there is no $PSCommandPath, but the script block that is
 #    executing still carries the full source - that is what makes an elevated relaunch and the post-restart
@@ -538,6 +652,7 @@ function Close-ExistingHubInstances {
                 if ([int]::TryParse($raw, [ref]$val) -and $val -gt 0 -and $val -ne $currentPid) {
                     [void]$targetPids.Add($val)
                 }
+                Remove-Item -Path $pPath -Force -ErrorAction SilentlyContinue
             } catch { }
         }
     }
@@ -4379,10 +4494,11 @@ function Get-HubSystemBaseline {
     return [PSCustomObject]$b
 }
 
-# --- Per-machine rolling baseline store (also the JSON a fleet platform aggregates) ---
+# --- Per-machine rolling baseline store (In-Memory First) ---
 $script:DeploymentBaselineFile = Join-Path $script:PersistRoot 'deployment_baseline.json'
 
 function Get-HubStoredBaseline {
+    if ($script:InMemoryStoredBaseline) { return $script:InMemoryStoredBaseline }
     foreach ($fp in @($script:DeploymentBaselineFile, (Join-Path $env:ProgramData 'AutopilotCommandHub\deployment_baseline.json'))) {
         if (Test-Path $fp) {
             try { return (Get-Content $fp -Raw -ErrorAction Stop | ConvertFrom-Json) } catch { }
@@ -4392,7 +4508,7 @@ function Get-HubStoredBaseline {
 }
 
 function Update-HubStoredBaseline {
-    param([Parameter(Mandatory)] $Metrics)
+    param([Parameter(Mandatory)] $Metrics, [switch]$SaveToDisk)
     # Keep a simple exponential-moving-average baseline of the headline numbers so a single run
     # cannot yank the baseline around, yet it still tracks genuine drift over re-deploys.
     try {
@@ -4411,9 +4527,14 @@ function Update-HubStoredBaseline {
             PeakWriteMBps    = _ema ($prev.PeakWriteMBps)    $Metrics.Disk.PeakWriteMBps
             PeakIops         = _ema ($prev.PeakIops)         $Metrics.Disk.PeakIops
         }
-        $dir = Split-Path $script:DeploymentBaselineFile -Parent
-        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        ($bl | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $script:DeploymentBaselineFile -Encoding UTF8
+        $script:InMemoryStoredBaseline = $bl
+        if ($SaveToDisk) {
+            try {
+                $dir = Split-Path $script:DeploymentBaselineFile -Parent
+                if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+                ($bl | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $script:DeploymentBaselineFile -Encoding UTF8
+            } catch { }
+        }
         return $bl
     } catch { return $null }
 }
@@ -4450,16 +4571,12 @@ function Get-HubBaselineComparison {
 function Export-HubDeploymentReport {
     param(
         [Parameter(Mandatory)] $Metrics,   # the accumulated deployment-metrics object (see sample below)
-        [string]$Path = ''
+        [string]$Path = '',
+        [switch]$SaveToDisk
     )
     $m = $Metrics
     $bl = $m.Baseline
     $serial = if ($bl.SerialNumber) { $bl.SerialNumber } else { $env:COMPUTERNAME }
-    if ([string]::IsNullOrWhiteSpace($Path)) {
-        $dir = 'C:\AutopilotLogs\Reports'
-        try { if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null } } catch { $dir = $env:TEMP }
-        $Path = Join-Path $dir ("DeploymentReport_{0}_{1}.html" -f $serial, ([datetime]::Now.ToString('yyyyMMdd_HHmmss')))
-    }
 
     # ---- tiles ----
     function Tile($label, $value, $sub) {
@@ -4552,15 +4669,35 @@ footer{color:#94a3b8;font-size:11px;margin-top:20px;text-align:center}
 <footer>Autopilot Command Hub &middot; deployment telemetry &middot; JSON sidecar written next to this file for fleet ingestion</footer>
 </div></body></html>
 "@
+    $shouldWriteDisk = $SaveToDisk -or -not [string]::IsNullOrWhiteSpace($Path)
+    if (-not $shouldWriteDisk) {
+        return [pscustomobject]@{
+            Success     = $true
+            InMemory    = $true
+            Path        = $null
+            JsonPath    = $null
+            HtmlContent = $html
+            Metrics     = $m
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        $dir = if ($desktop -and (Test-Path $desktop)) { $desktop } else { $env:TEMP }
+        $Path = Join-Path $dir ("DeploymentReport_{0}_{1}.html" -f $serial, ([datetime]::Now.ToString('yyyyMMdd_HHmmss')))
+    }
+
     try {
         $targetDir = Split-Path -Path $Path -Parent
-        if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+        if (-not [string]::IsNullOrWhiteSpace($targetDir) -and -not (Test-Path $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        }
         [System.IO.File]::WriteAllText($Path, $html, [System.Text.UTF8Encoding]::new($false))
         $jsonPath = [System.IO.Path]::ChangeExtension($Path, '.json')
         ($m | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $jsonPath -Encoding UTF8
-        return [pscustomobject]@{ Success = $true; Path = $Path; JsonPath = $jsonPath }
+        return [pscustomobject]@{ Success = $true; InMemory = $false; Path = $Path; JsonPath = $jsonPath; HtmlContent = $html; Metrics = $m }
     } catch {
-        return [pscustomobject]@{ Success = $false; Message = $_.Exception.Message }
+        return [pscustomobject]@{ Success = $false; InMemory = $false; Message = $_.Exception.Message }
     }
 }
 
@@ -4660,7 +4797,7 @@ function Test-HubClosedLoopVerification {
                 $apDetail = "Tenant mismatch: assigned $foundTenant, expected $ExpectedTenantId"
             } else {
                 $apOk = $true
-                $apDetail = "Assigned Tenant: $foundTenant" + (if ($foundCorrel) { " (Correlation: $foundCorrel)" } else { "" })
+                $apDetail = "Assigned Tenant: $foundTenant" + $(if ($foundCorrel) { " (Correlation: $foundCorrel)" } else { "" })
             }
         } else {
             $apDetail = "No cached Autopilot profile found in Provisioning or Registry"
@@ -4781,7 +4918,8 @@ function Export-HubProvisioningReceipt {
     param(
         [string]$DeploymentId = '',
         $Metrics = $null,
-        [string]$OutputDir = ''
+        [string]$OutputDir = '',
+        [switch]$SaveToDisk
     )
 
     if ([string]::IsNullOrWhiteSpace($DeploymentId)) {
@@ -4794,7 +4932,7 @@ function Export-HubProvisioningReceipt {
     }
 
     $expTenant = if ($env:AZURE_TENANT_ID) { $env:AZURE_TENANT_ID } else { '' }
-    $expGt = if ($script:ActiveDeploymentProfile -and $script:ActiveDeploymentProfile.GroupTag) { $script:ActiveDeploymentProfile.GroupTag } else { (if ($env:AUTOPILOT_GROUP_TAG) { $env:AUTOPILOT_GROUP_TAG } else { '' }) }
+    $expGt = if ($script:ActiveDeploymentProfile -and $script:ActiveDeploymentProfile.GroupTag) { $script:ActiveDeploymentProfile.GroupTag } elseif ($env:AUTOPILOT_GROUP_TAG) { $env:AUTOPILOT_GROUP_TAG } else { '' }
     $verification = Test-HubClosedLoopVerification -ExpectedTenantId $expTenant -ExpectedGroupTag $expGt
     $serial = try { if ($script:DeviceState -and $script:DeviceState.SerialNumber) { $script:DeviceState.SerialNumber } else { (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber } } catch { 'UNKNOWN' }
     if ([string]::IsNullOrWhiteSpace($serial)) { $serial = $env:COMPUTERNAME }
@@ -4803,15 +4941,10 @@ function Export-HubProvisioningReceipt {
     $os = try { (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption } catch { 'Windows' }
     $build = try { (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).BuildNumber } catch { '' }
 
-    if ([string]::IsNullOrWhiteSpace($OutputDir)) {
-        $OutputDir = 'C:\AutopilotLogs\Receipts'
-        try { if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null } } catch { $OutputDir = $env:TEMP }
-    }
+    $jsonPath = $null
+    $htmlPath = $null
 
-    $jsonPath = Join-Path $OutputDir "Receipt_${serial}_${DeploymentId}.json"
-    $htmlPath = Join-Path $OutputDir "Receipt_${serial}_${DeploymentId}.html"
-
-    $site = if ($script:ActiveDeploymentProfile -and $script:ActiveDeploymentProfile.Site) { $script:ActiveDeploymentProfile.Site } else { (if ($env:AUTOPILOT_SITE) { $env:AUTOPILOT_SITE } else { 'Default' }) }
+    $site = if ($script:ActiveDeploymentProfile -and $script:ActiveDeploymentProfile.Site) { $script:ActiveDeploymentProfile.Site } elseif ($env:AUTOPILOT_SITE) { $env:AUTOPILOT_SITE } else { 'Default' }
     $profId = if ($script:ActiveDeploymentProfile) { $script:ActiveDeploymentProfile.Id } else { 'Manual' }
 
     $receiptData = [ordered]@{
@@ -4856,10 +4989,6 @@ function Export-HubProvisioningReceipt {
     $sealMode = $seal.Mode
     $receiptData['IntegrityHash'] = $digestHex
     $receiptData['SealMode'] = $sealMode
-
-    # Write JSON receipt
-    $fullJson = ($receiptData | ConvertTo-Json -Depth 6)
-    [System.IO.File]::WriteAllText($jsonPath, $fullJson, [System.Text.UTF8Encoding]::new($false))
 
     # HTML Receipt Generation
     $verdictClass = switch ($verification.Verdict) {
@@ -4946,13 +5075,53 @@ Autopilot Command Hub &middot; Enterprise Endpoint Provisioning Platform &middot
 </body></html>
 "@
 
-    [System.IO.File]::WriteAllText($htmlPath, $htmlContent, [System.Text.UTF8Encoding]::new($false))
-    return [PSCustomObject]@{
-        Success      = $true
-        DeploymentId = $DeploymentId
-        HtmlPath     = $htmlPath
-        JsonPath     = $jsonPath
-        ReceiptData  = $receiptData
+    $script:LastProvisioningReceipt = $receiptData
+    $script:LastProvisioningReceiptHtml = $htmlContent
+
+    $shouldWriteDisk = $SaveToDisk -or -not [string]::IsNullOrWhiteSpace($OutputDir)
+    if (-not $shouldWriteDisk) {
+        return [PSCustomObject]@{
+            Success      = $true
+            DeploymentId = $DeploymentId
+            HtmlPath     = $null
+            JsonPath     = $null
+            ReceiptData  = $receiptData
+            HtmlContent  = $htmlContent
+            InMemory     = $true
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        $OutputDir = if ($desktop -and (Test-Path $desktop)) { $desktop } else { $env:TEMP }
+    }
+
+    try {
+        if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
+        $jsonPath = Join-Path $OutputDir "Receipt_${serial}_${DeploymentId}.json"
+        $htmlPath = Join-Path $OutputDir "Receipt_${serial}_${DeploymentId}.html"
+
+        $fullJson = ($receiptData | ConvertTo-Json -Depth 6)
+        [System.IO.File]::WriteAllText($jsonPath, $fullJson, [System.Text.UTF8Encoding]::new($false))
+        [System.IO.File]::WriteAllText($htmlPath, $htmlContent, [System.Text.UTF8Encoding]::new($false))
+
+        return [PSCustomObject]@{
+            Success      = $true
+            DeploymentId = $DeploymentId
+            HtmlPath     = $htmlPath
+            JsonPath     = $jsonPath
+            ReceiptData  = $receiptData
+            HtmlContent  = $htmlContent
+            InMemory     = $false
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Success      = $false
+            DeploymentId = $DeploymentId
+            Message      = $_.Exception.Message
+            ReceiptData  = $receiptData
+            InMemory     = $false
+        }
     }
 }
 
@@ -4974,7 +5143,11 @@ function Test-HubProvisioningReceipt {
             return [PSCustomObject]@{ IsValid = $false; Reason = "Invalid JSON: $($_.Exception.Message)" }
         }
     } else {
-        $receiptObj = $ReceiptPathOrObject
+        try {
+            $receiptObj = ($ReceiptPathOrObject | ConvertTo-Json -Depth 6 | ConvertFrom-Json)
+        } catch {
+            $receiptObj = $ReceiptPathOrObject
+        }
     }
 
     if (-not $receiptObj -or -not $receiptObj.IntegrityHash) {
@@ -5040,67 +5213,116 @@ function Buffer-HubFleetTelemetry {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$PayloadJson,
-        [string]$DeploymentId = ''
+        [string]$DeploymentId = '',
+        [string]$BufferDir = ''
     )
-
-    $bufDir = if ($script:FleetBufferDir) { $script:FleetBufferDir } else { 'C:\AutopilotLogs\FleetBuffer' }
-    try {
-        if (-not (Test-Path $bufDir)) { New-Item -ItemType Directory -Path $bufDir -Force | Out-Null }
-    } catch {
-        $bufDir = Join-Path $env:TEMP 'AutopilotFleetBuffer'
-        if (-not (Test-Path $bufDir)) { New-Item -ItemType Directory -Path $bufDir -Force | Out-Null }
-    }
 
     $idSafe = if ($DeploymentId) { $DeploymentId } else { [guid]::NewGuid().ToString('N') }
     $ts = [datetime]::UtcNow.ToString('yyyyMMdd_HHmmss')
-    $filePath = Join-Path $bufDir "Telemetry_${idSafe}_${ts}.json"
-    [System.IO.File]::WriteAllText($filePath, $PayloadJson, [System.Text.UTF8Encoding]::new($false))
-    return $filePath
+
+    # If BufferDir or $script:FleetBufferDir is explicitly specified, write to disk
+    $targetDir = if ($BufferDir) { $BufferDir } elseif ($script:FleetBufferDir) { $script:FleetBufferDir } else { '' }
+
+    if (-not [string]::IsNullOrWhiteSpace($targetDir)) {
+        try {
+            if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+            $filePath = Join-Path $targetDir "Telemetry_${idSafe}_${ts}.json"
+            [System.IO.File]::WriteAllText($filePath, $PayloadJson, [System.Text.UTF8Encoding]::new($false))
+            return $filePath
+        } catch { }
+    }
+
+    # Zero-trace: buffer strictly in-memory (RAM)
+    if (-not $script:FleetBuffer) {
+        $script:FleetBuffer = [System.Collections.Generic.List[object]]::new()
+    }
+    $bufItem = [PSCustomObject]@{
+        Id           = $idSafe
+        Timestamp    = $ts
+        PayloadJson  = $PayloadJson
+        DeploymentId = $idSafe
+    }
+    $script:FleetBuffer.Add($bufItem)
+    return "memory://FleetBuffer/$idSafe"
 }
 
 # --- Function: Flush-HubFleetBuffer (Outbound Buffer Drain Engine) ---
 function Flush-HubFleetBuffer {
     [CmdletBinding()]
-    param([string]$Endpoint = '')
+    param(
+        [string]$Endpoint = '',
+        [string]$BufferDir = ''
+    )
 
     if ([string]::IsNullOrWhiteSpace($Endpoint)) {
         $Endpoint = if ($env:AUTOPILOT_FLEET_ENDPOINT) { $env:AUTOPILOT_FLEET_ENDPOINT } else { $env:HUB_FLEET_ENDPOINT }
     }
-    if ([string]::IsNullOrWhiteSpace($Endpoint)) {
-        return [PSCustomObject]@{ Success = $false; FlushedCount = 0; PendingCount = 0; Message = 'No fleet endpoint configured' }
-    }
-
-    $bufDir = if ($script:FleetBufferDir) { $script:FleetBufferDir } else { 'C:\AutopilotLogs\FleetBuffer' }
-    if (-not (Test-Path $bufDir)) {
-        return [PSCustomObject]@{ Success = $true; FlushedCount = 0; PendingCount = 0; Message = 'Buffer directory empty' }
-    }
-
-    $files = Get-ChildItem -Path $bufDir -Filter "Telemetry_*.json" -ErrorAction SilentlyContinue
-    if (-not $files -or $files.Count -eq 0) {
-        return [PSCustomObject]@{ Success = $true; FlushedCount = 0; PendingCount = 0; Message = 'Zero pending telemetry payloads' }
-    }
 
     $flushed = 0
     $failed = 0
-    foreach ($f in $files) {
-        try {
-            $json = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
-            $uri = [System.Uri]::new($Endpoint)
-            $req = [System.Net.HttpWebRequest]::Create($uri)
-            $req.Method = 'POST'
-            $req.ContentType = 'application/json; charset=utf-8'
-            $req.Timeout = 6000
-            $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-            $req.ContentLength = $bytes.Length
-            $s = $req.GetRequestStream()
-            $s.Write($bytes, 0, $bytes.Length)
-            $s.Close()
-            $resp = $req.GetResponse()
-            $resp.Close()
-            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
-            $flushed++
-        } catch {
-            $failed++
+
+    # 1. Drain in-memory buffer
+    if ($script:FleetBuffer -and $script:FleetBuffer.Count -gt 0) {
+        if ([string]::IsNullOrWhiteSpace($Endpoint)) {
+            return [PSCustomObject]@{
+                Success      = $true
+                FlushedCount = 0
+                PendingCount = $script:FleetBuffer.Count
+                InMemory     = $true
+                Message      = "In-memory buffer holds $($script:FleetBuffer.Count) telemetry payload(s)"
+            }
+        }
+        $remaining = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $script:FleetBuffer) {
+            try {
+                $uri = [System.Uri]::new($Endpoint)
+                $req = [System.Net.HttpWebRequest]::Create($uri)
+                $req.Method = 'POST'
+                $req.ContentType = 'application/json; charset=utf-8'
+                $req.Timeout = 6000
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes($item.PayloadJson)
+                $req.ContentLength = $bytes.Length
+                $s = $req.GetRequestStream()
+                $s.Write($bytes, 0, $bytes.Length)
+                $s.Close()
+                $resp = $req.GetResponse()
+                $resp.Close()
+                $flushed++
+            } catch {
+                $failed++
+                $remaining.Add($item)
+            }
+        }
+        $script:FleetBuffer = $remaining
+    }
+
+    # 2. Drain any disk buffer if explicitly configured
+    $targetDir = if ($BufferDir) { $BufferDir } elseif ($script:FleetBufferDir) { $script:FleetBufferDir } else { '' }
+    if (-not [string]::IsNullOrWhiteSpace($targetDir) -and (Test-Path $targetDir)) {
+        $files = Get-ChildItem -Path $targetDir -Filter "Telemetry_*.json" -ErrorAction SilentlyContinue
+        if ($files) {
+            foreach ($f in $files) {
+                if ([string]::IsNullOrWhiteSpace($Endpoint)) { break }
+                try {
+                    $json = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
+                    $uri = [System.Uri]::new($Endpoint)
+                    $req = [System.Net.HttpWebRequest]::Create($uri)
+                    $req.Method = 'POST'
+                    $req.ContentType = 'application/json; charset=utf-8'
+                    $req.Timeout = 6000
+                    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                    $req.ContentLength = $bytes.Length
+                    $s = $req.GetRequestStream()
+                    $s.Write($bytes, 0, $bytes.Length)
+                    $s.Close()
+                    $resp = $req.GetResponse()
+                    $resp.Close()
+                    Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+                    $flushed++
+                } catch {
+                    $failed++
+                }
+            }
         }
     }
 
@@ -5117,7 +5339,8 @@ function Send-HubFleetTelemetry {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]$Payload,
-        [string]$Endpoint = ''
+        [string]$Endpoint = '',
+        [string]$BufferDir = ''
     )
 
     if ([string]::IsNullOrWhiteSpace($Endpoint)) {
@@ -5134,13 +5357,15 @@ function Send-HubFleetTelemetry {
     }
 
     if ([string]::IsNullOrWhiteSpace($Endpoint)) {
-        $bufPath = Buffer-HubFleetTelemetry -PayloadJson $json -DeploymentId $deploymentId
+        $bufPath = Buffer-HubFleetTelemetry -PayloadJson $json -DeploymentId $deploymentId -BufferDir $BufferDir
+        $isMem = ($bufPath -like 'memory://*')
         return [PSCustomObject]@{
             Success  = $true
             Buffered = $true
+            InMemory = $isMem
             Endpoint = ''
             Path     = $bufPath
-            Message  = "Telemetry buffered locally (no endpoint configured): $bufPath"
+            Message  = if ($isMem) { "Telemetry buffered in memory (zero disk trace)" } else { "Telemetry buffered locally: $bufPath" }
         }
     }
 
@@ -5168,23 +5393,26 @@ function Send-HubFleetTelemetry {
         $resp.Close()
 
         # Opportunistic flush of buffer
-        try { Flush-HubFleetBuffer -Endpoint $Endpoint | Out-Null } catch { }
+        try { Flush-HubFleetBuffer -Endpoint $Endpoint -BufferDir $BufferDir | Out-Null } catch { }
 
         return [PSCustomObject]@{
             Success  = $true
             Buffered = $false
+            InMemory = $false
             Endpoint = $Endpoint
             Message  = "Delivered to $Endpoint (HTTP 200)"
             Response = $respText
         }
     } catch {
-        $bufPath = Buffer-HubFleetTelemetry -PayloadJson $json -DeploymentId $deploymentId
+        $bufPath = Buffer-HubFleetTelemetry -PayloadJson $json -DeploymentId $deploymentId -BufferDir $BufferDir
+        $isMem = ($bufPath -like 'memory://*')
         return [PSCustomObject]@{
             Success  = $false
             Buffered = $true
+            InMemory = $isMem
             Endpoint = $Endpoint
             Path     = $bufPath
-            Message  = "Delivery error ($($_.Exception.Message)). Buffered to: $bufPath"
+            Message  = "Delivery error ($($_.Exception.Message)). Buffered $(if ($isMem) { 'in memory' } else { 'to: ' + $bufPath })"
         }
     }
 }
@@ -5344,15 +5572,16 @@ function Export-HubFleetDashboardHtml {
     [CmdletBinding()]
     param(
         [array]$Deployments = @(),
-        [string]$OutputPath = ''
+        [string]$OutputPath = '',
+        [switch]$SaveToDisk
     )
 
-    if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-        $OutputPath = 'C:\AutopilotLogs\FleetDashboard.html'
-        try {
-            $dir = Split-Path $OutputPath -Parent
-            if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        } catch { $OutputPath = Join-Path $env:TEMP 'FleetDashboard.html' }
+    if (-not $SaveToDisk -and [string]::IsNullOrWhiteSpace($OutputPath)) {
+        # Generate and return HTML in memory without disk writing
+    } elseif ([string]::IsNullOrWhiteSpace($OutputPath)) {
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        $dir = if ($desktop -and (Test-Path $desktop)) { $desktop } else { $env:TEMP }
+        $OutputPath = Join-Path $dir 'FleetDashboard.html'
     }
 
     $totalDep = $Deployments.Count
@@ -5487,8 +5716,19 @@ $outlierSection
 </div></body></html>
 "@
 
-    [System.IO.File]::WriteAllText($OutputPath, $html, [System.Text.UTF8Encoding]::new($false))
-    return $OutputPath
+    if (-not $SaveToDisk -and [string]::IsNullOrWhiteSpace($OutputPath)) {
+        return $html
+    }
+    try {
+        $dir = Split-Path $OutputPath -Parent
+        if (-not [string]::IsNullOrWhiteSpace($dir) -and -not (Test-Path $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        [System.IO.File]::WriteAllText($OutputPath, $html, [System.Text.UTF8Encoding]::new($false))
+        return $OutputPath
+    } catch {
+        return $html
+    }
 }
 
 # --- Function: Start-HubFleetServer (Lightweight Fleet Plane HTTP Ingestion Server) ---
@@ -5496,14 +5736,19 @@ function Start-HubFleetServer {
     [CmdletBinding()]
     param(
         [int]$Port = 8443,
-        [string]$DataDir = 'C:\AutopilotLogs\FleetData'
+        [string]$DataDir = ''
     )
 
-    try {
-        if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
-        $depDir = Join-Path $DataDir 'deployments'
-        if (-not (Test-Path $depDir)) { New-Item -ItemType Directory -Path $depDir -Force | Out-Null }
-    } catch { }
+    $inMemoryServer = [string]::IsNullOrWhiteSpace($DataDir)
+    if (-not $inMemoryServer) {
+        try {
+            if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
+            $depDir = Join-Path $DataDir 'deployments'
+            if (-not (Test-Path $depDir)) { New-Item -ItemType Directory -Path $depDir -Force | Out-Null }
+        } catch { }
+    }
+
+    $inMemoryDeployments = [System.Collections.Generic.List[object]]::new()
 
     $listener = [System.Net.HttpListener]::new()
     $prefix = "http://localhost:${Port}/"
@@ -5521,7 +5766,7 @@ function Start-HubFleetServer {
     Write-Host " Endpoint: $prefix" -ForegroundColor White
     Write-Host " Telemetry Ingest: POST ${prefix}api/telemetry" -ForegroundColor White
     Write-Host " Dashboard View:   GET  $prefix" -ForegroundColor White
-    Write-Host " Data Directory:   $DataDir" -ForegroundColor White
+    Write-Host " Storage Mode:     $(if ($inMemoryServer) { '100% In-Memory (Zero Disk Trace)' } else { $DataDir })" -ForegroundColor White
     Write-Host " Press CTRL+C or ESC to stop server." -ForegroundColor Yellow
     Write-Host "==========================================================================`n" -ForegroundColor Cyan
 
@@ -5542,8 +5787,13 @@ function Start-HubFleetServer {
                 $parsed = $null
                 try { $parsed = $body | ConvertFrom-Json } catch { }
                 $depId = if ($parsed -and $parsed.DeploymentId) { $parsed.DeploymentId } else { "DEP-$([guid]::NewGuid().ToString('N').Substring(0,8))" }
-                $savePath = Join-Path $depDir "Deployment_${depId}.json"
-                [System.IO.File]::WriteAllText($savePath, $body, [System.Text.UTF8Encoding]::new($false))
+
+                if ($inMemoryServer) {
+                    if ($parsed) { $inMemoryDeployments.Add($parsed) }
+                } else {
+                    $savePath = Join-Path $depDir "Deployment_${depId}.json"
+                    [System.IO.File]::WriteAllText($savePath, $body, [System.Text.UTF8Encoding]::new($false))
+                }
 
                 $respObj = [PSCustomObject]@{ status = 'ok'; deploymentId = $depId; receivedUtc = [datetime]::UtcNow.ToString('o') }
                 $respBytes = [System.Text.Encoding]::UTF8.GetBytes(($respObj | ConvertTo-Json))
@@ -5554,12 +5804,17 @@ function Start-HubFleetServer {
                 $response.Close()
                 Write-Host "[INGEST] Received telemetry for Deployment: $depId" -ForegroundColor Green
             } elseif ($method -eq 'GET' -and $urlPath -eq '/api/deployments') {
-                $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
-                $list = [System.Collections.Generic.List[object]]::new()
-                if ($files) {
-                    foreach ($f in $files) {
-                        try { $list.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                $list = if ($inMemoryServer) {
+                    @($inMemoryDeployments)
+                } else {
+                    $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                    $l = [System.Collections.Generic.List[object]]::new()
+                    if ($files) {
+                        foreach ($f in $files) {
+                            try { $l.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                        }
                     }
+                    @($l)
                 }
                 $j = if ($list -and $list.Count -gt 0) { ($list | ConvertTo-Json -Depth 6) } else { '[]' }
                 $respBytes = [System.Text.Encoding]::UTF8.GetBytes($j)
@@ -5569,12 +5824,17 @@ function Start-HubFleetServer {
                 $response.OutputStream.Write($respBytes, 0, $respBytes.Length)
                 $response.Close()
             } elseif ($method -eq 'GET' -and $urlPath -eq '/api/cohorts') {
-                $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
-                $list = [System.Collections.Generic.List[object]]::new()
-                if ($files) {
-                    foreach ($f in $files) {
-                        try { $list.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                $list = if ($inMemoryServer) {
+                    @($inMemoryDeployments)
+                } else {
+                    $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                    $l = [System.Collections.Generic.List[object]]::new()
+                    if ($files) {
+                        foreach ($f in $files) {
+                            try { $l.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                        }
                     }
+                    @($l)
                 }
                 $modelGroups = @{}
                 foreach ($d in $list) {
@@ -5595,12 +5855,17 @@ function Start-HubFleetServer {
                 $response.OutputStream.Write($respBytes, 0, $respBytes.Length)
                 $response.Close()
             } elseif ($method -eq 'GET' -and $urlPath -eq '/api/outliers') {
-                $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
-                $list = [System.Collections.Generic.List[object]]::new()
-                if ($files) {
-                    foreach ($f in $files) {
-                        try { $list.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                $list = if ($inMemoryServer) {
+                    @($inMemoryDeployments)
+                } else {
+                    $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                    $l = [System.Collections.Generic.List[object]]::new()
+                    if ($files) {
+                        foreach ($f in $files) {
+                            try { $l.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                        }
                     }
+                    @($l)
                 }
                 $modelGroups = @{}
                 foreach ($d in $list) {
@@ -5641,8 +5906,11 @@ function Start-HubFleetServer {
                 $response.OutputStream.Write($respBytes, 0, $respBytes.Length)
                 $response.Close()
             } elseif ($method -eq 'GET' -and $urlPath -eq '/api/health') {
-                $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
-                $hObj = [PSCustomObject]@{ status = 'healthy'; uptime = 'active'; deploymentsCount = if ($files) { $files.Count } else { 0 } }
+                $depCount = if ($inMemoryServer) { $inMemoryDeployments.Count } else {
+                    $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                    if ($files) { $files.Count } else { 0 }
+                }
+                $hObj = [PSCustomObject]@{ status = 'healthy'; uptime = 'active'; deploymentsCount = $depCount }
                 $respBytes = [System.Text.Encoding]::UTF8.GetBytes(($hObj | ConvertTo-Json))
                 $response.ContentType = 'application/json'
                 $response.StatusCode = 200
@@ -5651,16 +5919,20 @@ function Start-HubFleetServer {
                 $response.Close()
             } else {
                 # Serve HTML Dashboard
-                $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
-                $list = [System.Collections.Generic.List[object]]::new()
-                if ($files) {
-                    foreach ($f in $files) {
-                        try { $list.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                $list = if ($inMemoryServer) {
+                    @($inMemoryDeployments)
+                } else {
+                    $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                    $l = [System.Collections.Generic.List[object]]::new()
+                    if ($files) {
+                        foreach ($f in $files) {
+                            try { $l.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                        }
                     }
+                    @($l)
                 }
-                $dashFile = Join-Path $DataDir 'FleetDashboard.html'
-                Export-HubFleetDashboardHtml -Deployments $list -OutputPath $dashFile | Out-Null
-                $htmlBytes = [System.IO.File]::ReadAllBytes($dashFile)
+                $html = Export-HubFleetDashboardHtml -Deployments $list
+                $htmlBytes = [System.Text.Encoding]::UTF8.GetBytes($html)
                 $response.ContentType = 'text/html; charset=utf-8'
                 $response.StatusCode = 200
                 $response.ContentLength64 = $htmlBytes.Length
@@ -5699,6 +5971,7 @@ function Export-HubPlaybookCsv {
         [Parameter(Mandatory = $true)]
         [array]$Records,
         [string]$RoutineName = 'Playbook',
+        [Alias('TargetPath')]
         [string]$Path = '',
         [switch]$AutoDetectUsb
     )
@@ -5723,7 +5996,7 @@ function Export-HubPlaybookCsv {
     $targetPath = $Path
 
     # Priority 1: Check detected USB flash drive
-    if ([string]::IsNullOrWhiteSpace($targetPath) -or $AutoDetectUsb) {
+    if ([string]::IsNullOrWhiteSpace($targetPath) -and $AutoDetectUsb) {
         try {
             $usbDrives = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType = 2" -ErrorAction SilentlyContinue
             foreach ($d in $usbDrives) {
@@ -5737,19 +6010,13 @@ function Export-HubPlaybookCsv {
         } catch { }
     }
 
-    # Priority 2: Check local AutopilotLogs path, Desktop, or Temp
+    # Priority 2: Check Desktop or Temp (Zero-trace default: no C:\AutopilotLogs)
     if ([string]::IsNullOrWhiteSpace($targetPath)) {
-        $logDir = "C:\AutopilotLogs\Playbooks"
-        try {
-            if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
-            $targetPath = Join-Path -Path $logDir -ChildPath $csvFileName
-        } catch {
-            $desktop = [Environment]::GetFolderPath('Desktop')
-            if ($desktop -and (Test-Path $desktop)) {
-                $targetPath = Join-Path -Path $desktop -ChildPath $csvFileName
-            } else {
-                $targetPath = Join-Path -Path $env:TEMP -ChildPath $csvFileName
-            }
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        if ($desktop -and (Test-Path $desktop)) {
+            $targetPath = Join-Path -Path $desktop -ChildPath $csvFileName
+        } else {
+            $targetPath = Join-Path -Path $env:TEMP -ChildPath $csvFileName
         }
     }
 
@@ -7872,23 +8139,13 @@ function Enable-HubBitLocker {
     }
 }
 
-# --- Function: Set-HubLocalAdminPosture (Local Admin Randomization & LAPS Readiness) ---
+# --- Function: Set-HubLocalAdminPosture (Local Admin Randomization - Zero Registry Footprint) ---
 function Set-HubLocalAdminPosture {
     [CmdletBinding()]
     param()
 
-    Write-Host "`nEnforcing Local Administrator & LAPS Security Posture..." -ForegroundColor Cyan
+    Write-Host "`nEnforcing Local Administrator Security Posture (RAM-Only)..." -ForegroundColor Cyan
     try {
-        $lapsKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS\Config'
-        $hasLaps = Test-Path $lapsKey
-        try {
-            if (-not $hasLaps) { New-Item -ItemType Directory -Path $lapsKey -Force -ErrorAction SilentlyContinue | Out-Null }
-            Set-ItemProperty -Path $lapsKey -Name 'BackupDirectory' -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
-            Set-ItemProperty -Path $lapsKey -Name 'PasswordLength' -Value 20 -Type DWord -Force -ErrorAction SilentlyContinue
-            Set-ItemProperty -Path $lapsKey -Name 'PasswordAgeDays' -Value 30 -Type DWord -Force -ErrorAction SilentlyContinue
-            $hasLaps = $true
-        } catch { }
-
         # Generate cryptographically random 20-character password
         $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
         $charPool = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%^&*"
@@ -7912,12 +8169,12 @@ function Set-HubLocalAdminPosture {
             if ($guest) { Disable-LocalUser -Name $guest.Name -ErrorAction SilentlyContinue }
         } catch { }
 
+        # Zero registry footprint: LAPS policy and keys are managed by Intune / Group Policy
         return [PSCustomObject]@{
             Success         = $true
             AdminAccount    = if ($adminAccount) { $adminAccount.Name } else { 'Administrator' }
             PasswordRotated = [bool]($adminAccount -ne $null)
-            LapsReady       = $hasLaps
-            Message         = "Local admin rotated and default inactive accounts disabled"
+            Message         = "Local admin rotated and default inactive accounts disabled (in-memory posture, zero registry keys written)"
         }
     } catch {
         Write-Host "Local admin posture note: $($_.Exception.Message)" -ForegroundColor Yellow
@@ -8022,12 +8279,55 @@ function Invoke-HubCartHarvest {
             }
         }
     }
+
+    $newEntry = [PSCustomObject]@{
+        'Device Serial Number' = $hashObj.SerialNumber
+        'Windows Product ID'   = $hashObj.WindowsProductId
+        'Hardware Hash'        = $hashObj.HardwareHash
+        'Group Tag'            = if ($GroupTag) { $GroupTag } else { $hashObj.GroupTag }
+        'Assigned User'        = if ($AssignedUser) { $AssignedUser } else { $hashObj.AssignedUser }
+        'Model'                = $hashObj.Model
+        'Manufacturer'         = $hashObj.Manufacturer
+        'HarvestTimestamp'     = [datetime]::UtcNow.ToString('yyyy-MM-dd HH:mm:ss')
+        'CartName'             = $CartName
+    }
+
     if ([string]::IsNullOrWhiteSpace($targetCsv)) {
-        $cartDir = "C:\AutopilotLogs\Carts"
-        if (-not (Test-Path $cartDir)) { New-Item -ItemType Directory -Path $cartDir -Force | Out-Null }
-        $cleanCart = ($CartName -replace '[^\w\-]', '_').Trim('_')
-        $dateStr = [datetime]::Now.ToString('yyyyMMdd')
-        $targetCsv = Join-Path $cartDir "AutopilotCart_${cleanCart}_${dateStr}.csv"
+        # In-Memory Cart Harvest Accumulation (Zero disk trace)
+        if (-not $script:HubCartEntries.ContainsKey($CartName)) {
+            $script:HubCartEntries[$CartName] = [System.Collections.Generic.List[PSCustomObject]]::new()
+        }
+        $cartList = $script:HubCartEntries[$CartName]
+        $existingIdx = -1
+        for ($k = 0; $k -lt $cartList.Count; $k++) {
+            if ($cartList[$k].'Device Serial Number' -eq $hashObj.SerialNumber) {
+                $existingIdx = $k
+                break
+            }
+        }
+        if ($existingIdx -ge 0) {
+            $cartList[$existingIdx] = $newEntry
+        } else {
+            $cartList.Add($newEntry)
+        }
+        $totalInCart = $cartList.Count
+        Play-HubAudio -Type Success
+
+        Write-Host "`n==========================================================================" -ForegroundColor Green
+        Write-Host " CART HARVEST SUCCESS: DEVICE CAPTURED INTO BATCH (IN-MEMORY)" -ForegroundColor Green
+        Write-Host " Device Serial: $($hashObj.SerialNumber) ($($hashObj.Manufacturer) $($hashObj.Model))" -ForegroundColor White
+        Write-Host " Total Devices in Cart Batch: $totalInCart" -ForegroundColor White
+        Write-Host " Storage Mode: 100% In-Memory (Zero Disk Trace)" -ForegroundColor White
+        Write-Host "==========================================================================`n" -ForegroundColor Green
+
+        return [PSCustomObject]@{
+            Success      = $true
+            CartCsvPath  = 'In-Memory'
+            TotalUnits   = $totalInCart
+            SerialNumber = $hashObj.SerialNumber
+            Model        = $hashObj.Model
+            InMemory     = $true
+        }
     }
 
     $existingEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -8043,21 +8343,13 @@ function Invoke-HubCartHarvest {
             }
         } catch { }
     }
-
-    $newEntry = [PSCustomObject]@{
-        'Device Serial Number' = $hashObj.SerialNumber
-        'Windows Product ID'   = $hashObj.WindowsProductId
-        'Hardware Hash'        = $hashObj.HardwareHash
-        'Group Tag'            = if ($GroupTag) { $GroupTag } else { $hashObj.GroupTag }
-        'Assigned User'        = if ($AssignedUser) { $AssignedUser } else { $hashObj.AssignedUser }
-        'Model'                = $hashObj.Model
-        'Manufacturer'         = $hashObj.Manufacturer
-        'HarvestTimestamp'     = [datetime]::UtcNow.ToString('yyyy-MM-dd HH:mm:ss')
-        'CartName'             = $CartName
-    }
     $existingEntries.Add($newEntry)
 
     $safeEntries = Protect-HubCsvRecords -Records $existingEntries
+    $targetDir = Split-Path -Path $targetCsv -Parent
+    if (-not [string]::IsNullOrWhiteSpace($targetDir) -and -not (Test-Path $targetDir)) {
+        New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+    }
     $safeEntries | Export-Csv -LiteralPath $targetCsv -NoTypeInformation -Encoding UTF8
 
     $totalInCart = $existingEntries.Count
@@ -8077,6 +8369,7 @@ function Invoke-HubCartHarvest {
         TotalUnits   = $totalInCart
         SerialNumber = $hashObj.SerialNumber
         Model        = $hashObj.Model
+        InMemory     = $false
     }
 }
 
@@ -8456,6 +8749,7 @@ function Get-HubPatchCascadeState {
     [CmdletBinding()]
     param()
 
+    if ($script:InMemoryPatchCascadeState) { return $script:InMemoryPatchCascadeState }
     foreach ($statePath in @($script:CascadeStateFile, (Join-Path $env:ProgramData 'AutopilotCommandHub\patch_cascade.json'))) {
         if (Test-Path $statePath) {
             try {
@@ -8474,33 +8768,39 @@ function Set-HubPatchCascadeState {
         [int]$CurrentPass = 1,
         [int]$MaxPasses = 5,
         [bool]$IncludeDrivers = $true,
-        [int]$TotalInstalled = 0
+        [int]$TotalInstalled = 0,
+        [switch]$SaveToDisk
     )
 
-    try {
-        $dir = Split-Path $script:CascadeStateFile -Parent
-        if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
-        $state = [PSCustomObject]@{
-            Active         = $true
-            CurrentPass    = $CurrentPass
-            MaxPasses      = $MaxPasses
-            IncludeDrivers = $IncludeDrivers
-            TotalInstalled = $TotalInstalled
-            Timestamp      = [datetime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
-        }
-        $json = ConvertTo-Json $state -Compress
-        Set-Content -Path $script:CascadeStateFile -Value $json -Force -ErrorAction Stop
-        return $true
-    } catch {
-        Write-Warning "Failed to save patch cascade state: $($_.Exception.Message)"
-        return $false
+    $state = [PSCustomObject]@{
+        Active         = $true
+        CurrentPass    = $CurrentPass
+        MaxPasses      = $MaxPasses
+        IncludeDrivers = $IncludeDrivers
+        TotalInstalled = $TotalInstalled
+        Timestamp      = [datetime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
     }
+    $script:InMemoryPatchCascadeState = $state
+
+    if ($SaveToDisk) {
+        try {
+            $dir = Split-Path $script:CascadeStateFile -Parent
+            if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+            $json = ConvertTo-Json $state -Compress
+            Set-Content -Path $script:CascadeStateFile -Value $json -Force -ErrorAction Stop
+        } catch {
+            Write-Warning "Failed to save patch cascade state: $($_.Exception.Message)"
+            return $false
+        }
+    }
+    return $true
 }
 
 function Clear-HubPatchCascadeState {
     [CmdletBinding()]
     param()
 
+    $script:InMemoryPatchCascadeState = $null
     foreach ($statePath in @($script:CascadeStateFile, (Join-Path $env:ProgramData 'AutopilotCommandHub\patch_cascade.json'))) {
         if (Test-Path $statePath) {
             try { Remove-Item -Path $statePath -Force -ErrorAction SilentlyContinue } catch { }
@@ -8601,7 +8901,14 @@ function Start-HubAutonomousPatchCascade {
 
 # --- Function: Invoke-HeadlessActionRoutine (Automated Click-Through CLI Playbooks) ---
 function Invoke-HeadlessActionRoutine {
-    param([string]$RoutineName)
+    param(
+        [string]$RoutineName,
+        [switch]$ExportCsv,
+        [string]$CsvPath = '',
+        [string]$ExportPath = '',
+        [switch]$SaveReceipt,
+        [switch]$GenerateReceipt
+    )
 
     Write-Host "`n==========================================================================" -ForegroundColor Cyan
     Write-Host " EXECUTING HEADLESS ACTION PLAYBOOK: $RoutineName" -ForegroundColor Cyan
@@ -8908,11 +9215,21 @@ function Invoke-HeadlessActionRoutine {
     }
     Write-Host "`n[DONE] Playbook '$RoutineName' completed successfully across all 9 tabs!" -ForegroundColor Green
     if ($headlessLogEntries -and $headlessLogEntries.Count -gt 0) {
-        $exportRes = Export-HubPlaybookCsv -Records $headlessLogEntries -RoutineName $RoutineName -AutoDetectUsb
-        if ($exportRes.Success) {
-            Write-Host "[PLAYBOOK CSV] Audit report exported to: $($exportRes.Path)" -ForegroundColor Green
+        $script:LastPlaybookExecutionRecords = $headlessLogEntries
+        $script:PlaybookLogEntries = $headlessLogEntries
+        $script:LastPlaybookRoutineName = $RoutineName
+
+        $shouldExportCsv = $ExportCsv -or -not [string]::IsNullOrWhiteSpace($CsvPath) -or -not [string]::IsNullOrWhiteSpace($ExportPath)
+        if ($shouldExportCsv) {
+            $csvTarget = if (-not [string]::IsNullOrWhiteSpace($ExportPath)) { $ExportPath } elseif (-not [string]::IsNullOrWhiteSpace($CsvPath)) { $CsvPath } else { '' }
+            $exportRes = Export-HubPlaybookCsv -Records $headlessLogEntries -RoutineName $RoutineName -AutoDetectUsb -Path $csvTarget
+            if ($exportRes.Success) {
+                Write-Host "[PLAYBOOK CSV] Audit report exported to: $($exportRes.Path)" -ForegroundColor Green
+            } else {
+                Write-Host "[PLAYBOOK CSV] Export note: $($exportRes.Message)" -ForegroundColor Yellow
+            }
         } else {
-            Write-Host "[PLAYBOOK CSV] Export note: $($exportRes.Message)" -ForegroundColor Yellow
+            Write-Host "[PLAYBOOK RECORDS] Execution records held in-memory ($($headlessLogEntries.Count) steps). Zero traces written to disk." -ForegroundColor Cyan
         }
 
         # Rich deployment report, closed-loop receipt, and fleet plane telemetry in headless mode
@@ -8937,19 +9254,26 @@ function Invoke-HeadlessActionRoutine {
             $storedBaseline = Get-HubStoredBaseline
             $metrics | Add-Member -NotePropertyName BaselineComparison -NotePropertyValue (Get-HubBaselineComparison -Metrics $metrics -Baseline $storedBaseline)
 
-            $repRes = Export-HubDeploymentReport -Metrics $metrics
-            if ($repRes.Success) {
-                Write-Host "[DEPLOYMENT REPORT] Report generated: $($repRes.Path)" -ForegroundColor Green
-                Update-HubStoredBaseline -Metrics $metrics | Out-Null
-            }
+            Update-HubStoredBaseline -Metrics $metrics | Out-Null
 
             $receipt = $null
-            $receiptRes = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId -Metrics $metrics
-            if ($receiptRes.Success) {
-                $receipt = $receiptRes.ReceiptData
-                Write-Host "[PROVISIONING RECEIPT] Receipt generated: $($receiptRes.HtmlPath)" -ForegroundColor Green
-                Write-Host "  Verdict: $($receipt.Verdict) (Score: $($receipt.Score))" -ForegroundColor $(if ($receipt.Verdict -eq 'VERIFIED') { 'Green' } else { 'Yellow' })
-                Write-Host "  Integrity Seal: $($receipt.IntegrityHash)" -ForegroundColor Cyan
+            $shouldSaveReceipt = $SaveReceipt -or $GenerateReceipt
+            if ($shouldSaveReceipt) {
+                $receiptRes = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId -Metrics $metrics -SaveToDisk
+                if ($receiptRes.Success) {
+                    $receipt = $receiptRes.ReceiptData
+                    Write-Host "[PROVISIONING RECEIPT] Receipt exported to disk: $($receiptRes.HtmlPath)" -ForegroundColor Green
+                    Write-Host "  Verdict: $($receipt.Verdict) (Score: $($receipt.Score))" -ForegroundColor $(if ($receipt.Verdict -eq 'VERIFIED') { 'Green' } else { 'Yellow' })
+                    Write-Host "  Integrity Seal: $($receipt.IntegrityHash)" -ForegroundColor Cyan
+                }
+            } else {
+                $receiptRes = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId -Metrics $metrics
+                if ($receiptRes.Success) {
+                    $receipt = $receiptRes.ReceiptData
+                    $script:LastProvisioningReceipt = $receiptRes
+                    Write-Host "[PROVISIONING RECEIPT] Provisioning receipt held in-memory (Verdict: $($receipt.Verdict), Score: $($receipt.Score))" -ForegroundColor Green
+                    Write-Host "  Integrity Seal ($($receipt.SealMode)): $($receipt.IntegrityHash)" -ForegroundColor Cyan
+                }
             }
 
             $telemPayload = [PSCustomObject]@{
@@ -8961,7 +9285,7 @@ function Invoke-HeadlessActionRoutine {
                 TotalSeconds  = $totalSec
                 Metrics       = $metrics
                 Receipt       = $receipt
-                Site          = if ($script:ActiveDeploymentProfile -and $script:ActiveDeploymentProfile.Site) { $script:ActiveDeploymentProfile.Site } else { (if ($env:AUTOPILOT_SITE) { $env:AUTOPILOT_SITE } else { 'Default' }) }
+                Site          = if ($script:ActiveDeploymentProfile -and $script:ActiveDeploymentProfile.Site) { $script:ActiveDeploymentProfile.Site } elseif ($env:AUTOPILOT_SITE) { $env:AUTOPILOT_SITE } else { 'Default' }
                 Technician    = $env:USERNAME
                 Device        = [PSCustomObject]@{
                     SerialNumber = $firstEntry.SerialNumber
@@ -8973,6 +9297,8 @@ function Invoke-HeadlessActionRoutine {
             $telemRes = Send-HubFleetTelemetry -Payload $telemPayload
             if ($telemRes.Success -and -not $telemRes.Buffered) {
                 Write-Host "[FLEET TELEMETRY] Telemetry delivered to $($telemRes.Endpoint)" -ForegroundColor Green
+            } elseif ($telemRes.InMemory) {
+                Write-Host "[FLEET TELEMETRY] Telemetry buffered in-memory (zero disk traces)" -ForegroundColor Cyan
             } else {
                 Write-Host "[FLEET TELEMETRY] Telemetry buffered offline: $($telemRes.Path)" -ForegroundColor Gray
             }
@@ -11030,7 +11356,8 @@ function Start-AutopilotHubGui {
                     <StackPanel Grid.Column="2" Orientation="Horizontal">
                         <Button Name="BtnCopyLog" Content="Copy Log" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnClearLog" Content="Clear" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
-                        <Button Name="BtnSaveLog" Content="Save Log..." FontSize="10" Padding="6,2"/>
+                        <Button Name="BtnSaveLog" Content="Save Log..." FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
+                        <Button Name="BtnClearTraces" Content="Purge Traces" FontSize="10" Padding="6,2" ToolTip="Purge all trace directories and temporary files from the system"/>
                     </StackPanel>
                 </Grid>
 
@@ -11437,6 +11764,7 @@ function Start-AutopilotHubGui {
     $btnCopyLog        = $window.FindName('BtnCopyLog')
     $btnClearLog       = $window.FindName('BtnClearLog')
     $btnSaveLog        = $window.FindName('BtnSaveLog')
+    $btnClearTraces    = $window.FindName('BtnClearTraces')
     $btnQuickCmd       = if ($window.FindName('BtnQuickCmd')) { $window.FindName('BtnQuickCmd') } else { $menuQuickCmd }
     $btnTimeSync       = if ($window.FindName('BtnTimeSync')) { $window.FindName('BtnTimeSync') } else { $menuTimeSync }
     $btnReboot         = if ($window.FindName('BtnReboot')) { $window.FindName('BtnReboot') } else { $menuReboot }
@@ -11656,6 +11984,8 @@ function Start-AutopilotHubGui {
         param([string]$Message, [string]$Level = 'INFO')
         $timestamp = (Get-Date).ToString('HH:mm:ss')
         $line = "[$timestamp] [$Level] $Message"
+        if (-not $script:HubLogEntries) { $script:HubLogEntries = [System.Collections.Generic.List[object]]::new() }
+        $script:HubLogEntries.Add([PSCustomObject]@{ Timestamp = (Get-Date); Level = $Level; Message = $Message })
         $txtHubLog.AppendText("$line`r`n")
         $txtHubLog.ScrollToEnd()
         Update-WpfUI
@@ -12129,6 +12459,10 @@ function Start-AutopilotHubGui {
 
     # --- ACTION: Export CSV ---
     $btnExportCsv.Add_Click({
+        if ($script:PlaybookRunning) {
+            Write-HubLog "Playbook step: Device record staged in-memory for Intune CSV export (Zero disk trace)." "INFO"
+            return
+        }
         Write-HubLog "Exporting device record to Microsoft Intune CSV format..."
         $gt = $cmbGroupTag.Text
         $usr = $txtAssignedUser.Text
@@ -13191,11 +13525,26 @@ function Start-AutopilotHubGui {
     })
 
     $btnSaveLog.Add_Click({
-        $savePath = "$env:TEMP\AutopilotHub-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
-        Set-Content -Path $savePath -Value $txtHubLog.Text -Encoding UTF8 -Force
-        Write-HubLog "Log saved to: $savePath" "SUCCESS"
-        if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Log saved to:`n$savePath", "Log Saved", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null }
+        $sfd = [Microsoft.Win32.SaveFileDialog]::new()
+        $sfd.Title = "Save In-Memory Logs"
+        $sfd.Filter = "Log Files (*.log)|*.log|Text Files (*.txt)|*.txt|All Files (*.*)|*.*"
+        $sfd.FileName = "AutopilotHub-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+        if ($sfd.ShowDialog($window) -eq $true) {
+            Set-Content -LiteralPath $sfd.FileName -Value $txtHubLog.Text -Encoding UTF8 -Force
+            Write-HubLog "Log exported to: $($sfd.FileName)" "SUCCESS"
+            if (-not $script:PlaybookRunning) {
+                [System.Windows.MessageBox]::Show("Log saved to:`n$($sfd.FileName)", "Log Saved", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+            }
+        }
     })
+
+    if ($btnClearTraces) {
+        $btnClearTraces.Add_Click({
+            $res = Remove-HubTraces
+            Write-HubLog "Zero-Trace purge complete: $($res.PurgedCount) trace item(s) removed from disk." "SUCCESS"
+            [System.Windows.MessageBox]::Show("Zero-Trace Purge Complete.`nPurged $($res.PurgedCount) trace item(s) from disk.", "Traces Purged", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+        })
+    }
 
     # --- ACTION: Dell Warranty & Hardware Refresh Assessment ---
     $script:CurrentDellReport = $null
@@ -13348,6 +13697,10 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     })
 
     $btnExportDellCsv.Add_Click({
+        if ($script:PlaybookRunning) {
+            Write-HubLog "Playbook step: Dell warranty data held in-memory (Zero disk trace)." "INFO"
+            return
+        }
         if (-not $script:CurrentDellReport) {
             if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Please perform a Dell Warranty check first before exporting CSV.", "No Report Available", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null }
             return
@@ -13488,6 +13841,10 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
 
     if ($btnExportOfflineJson) {
         $btnExportOfflineJson.Add_Click({
+            if ($script:PlaybookRunning) {
+                Write-HubLog "Playbook step: Offline Autopilot JSON profile prepared in-memory (Zero disk trace)." "INFO"
+                return
+            }
             try {
                 $tenant = if ($script:GraphAuthContext -and $script:GraphAuthContext.TenantId) { $script:GraphAuthContext.TenantId } else { '' }
                 $exported = Export-AutopilotConfigurationFile -TenantId $tenant
@@ -14309,6 +14666,10 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
 
     if ($btnExportMdmCab) {
         $btnExportMdmCab.Add_Click({
+            if ($script:PlaybookRunning) {
+                Write-HubLog "Playbook step: MDM diagnostics gathered in-memory (Zero disk trace)." "INFO"
+                return
+            }
             if (-not $script:RuntimeContext.MeetsPreferred) {
                 if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("mdmdiagnosticstool requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null }
                 return
@@ -16377,15 +16738,14 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
             if ($stepLogEntries -and $stepLogEntries.Count -gt 0) {
                 $script:LastPlaybookExecutionRecords = $stepLogEntries
                 $script:LastPlaybookRoutineName = $RoutineName
-                $exportRes = Export-HubPlaybookCsv -Records $stepLogEntries -RoutineName $RoutineName -AutoDetectUsb
-                if ($exportRes.Success) {
-                    $script:LastPlaybookCsvPath = $exportRes.Path
-                    $btnPlaybookDownloadCsv.IsEnabled = $true
-                    $btnPlaybookDownloadCsv.ToolTip = "Download or export the playbook audit CSV (Auto-saved to: $($exportRes.Path))"
-                    Write-HubLog "Playbook CSV audit log saved to: $($exportRes.Path)" "SUCCESS"
-                }
 
-                # ---- Rich deployment report (HTML with charts + JSON sidecar) ----
+                # In-memory first: Enable the Download CSV button so the technician can choose to export
+                $btnPlaybookDownloadCsv.IsEnabled = $true
+                $btnPlaybookDownloadCsv.ToolTip = "Download or export the playbook audit CSV (Held in-memory)"
+                Write-HubLog "Playbook execution records held in-memory ($($stepLogEntries.Count) steps). Zero traces on disk." "SUCCESS"
+                Write-HubLog "Click '[v] Download CSV' to save audit report if desired." "INFO"
+
+                # ---- Rich deployment report (HTML with charts + JSON sidecar) held in-memory ----
                 try {
                     $samples = @($script:HubDiskSamples)
                     $reads  = @($samples | ForEach-Object { $_.ReadMBps })
@@ -16416,34 +16776,35 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                     }
                     $storedBaseline = Get-HubStoredBaseline
                     $metrics | Add-Member -NotePropertyName BaselineComparison -NotePropertyValue (Get-HubBaselineComparison -Metrics $metrics -Baseline $storedBaseline)
+                    $script:LastDeploymentMetrics = $metrics
+                    Update-HubStoredBaseline -Metrics $metrics | Out-Null
+
                     $repRes = Export-HubDeploymentReport -Metrics $metrics
                     if ($repRes.Success) {
-                        $script:LastDeploymentReportPath = $repRes.Path
+                        $script:LastDeploymentReportHtml = $repRes.HtmlContent
                         if ($btnPlaybookReport) {
                             $btnPlaybookReport.IsEnabled = $true
-                            $btnPlaybookReport.ToolTip = "Open the rich deployment report (auto-saved to: $($repRes.Path))"
+                            $btnPlaybookReport.ToolTip = "View or export rich deployment report (Held in-memory)"
                         }
-                        Write-HubLog "Deployment report (HTML + JSON) saved to: $($repRes.Path)" "SUCCESS"
-                        Update-HubStoredBaseline -Metrics $metrics | Out-Null
                     }
 
-                    # Post-enrollment Closed-Loop Verification & Tamper-Evident Receipt
+                    # Post-enrollment Closed-Loop Verification & Tamper-Evident Receipt in-memory
                     try {
                         $receiptRes = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId -Metrics $metrics
                         if ($receiptRes.Success) {
                             $script:LastProvisioningReceipt = $receiptRes
-                            $script:LastProvisioningReceiptPath = $receiptRes.HtmlPath
+                            $script:LastProvisioningReceiptHtml = $receiptRes.HtmlContent
                             if ($btnPlaybookReceipt) {
                                 $btnPlaybookReceipt.IsEnabled = $true
-                                $btnPlaybookReceipt.ToolTip = "Open tamper-evident provisioning receipt: $($receiptRes.HtmlPath)"
+                                $btnPlaybookReceipt.ToolTip = "View or export tamper-evident provisioning receipt (Held in-memory)"
                             }
-                            Write-HubLog "Provisioning receipt generated (ID: $($script:HubDeploymentId)): $($receiptRes.HtmlPath)" "SUCCESS"
+                            Write-HubLog "Provisioning receipt verified in-memory (Verdict: $($receiptRes.ReceiptData.Verdict), Score: $($receiptRes.ReceiptData.Score))" "SUCCESS"
                         }
                     } catch {
                         Write-HubLog "Receipt generation note: $($_.Exception.Message)" "WARN"
                     }
 
-                    # Outbound Fleet Plane Telemetry
+                    # Outbound Fleet Plane Telemetry (in-memory buffering if offline)
                     try {
                         $telemetryPayload = [PSCustomObject]@{
                             SchemaVersion = 1
@@ -16454,7 +16815,7 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                             TotalSeconds  = $totalSec
                             Metrics       = $metrics
                             Receipt       = if ($script:LastProvisioningReceipt) { $script:LastProvisioningReceipt.ReceiptData } else { $null }
-                            Site          = if ($script:ActiveDeploymentProfile -and $script:ActiveDeploymentProfile.Site) { $script:ActiveDeploymentProfile.Site } else { (if ($env:AUTOPILOT_SITE) { $env:AUTOPILOT_SITE } else { 'Default' }) }
+                            Site          = if ($script:ActiveDeploymentProfile -and $script:ActiveDeploymentProfile.Site) { $script:ActiveDeploymentProfile.Site } elseif ($env:AUTOPILOT_SITE) { $env:AUTOPILOT_SITE } else { 'Default' }
                             Technician    = $env:USERNAME
                             Device        = [PSCustomObject]@{
                                 SerialNumber = $serial
@@ -16466,6 +16827,8 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                         $telemRes = Send-HubFleetTelemetry -Payload $telemetryPayload
                         if ($telemRes.Success -and -not $telemRes.Buffered) {
                             Write-HubLog "Fleet plane telemetry delivered: $($telemRes.Message)" "SUCCESS"
+                        } elseif ($telemRes.InMemory) {
+                            Write-HubLog "Fleet plane telemetry buffered in-memory (zero disk trace)" "INFO"
                         } else {
                             Write-HubLog "Fleet plane buffered offline: $($telemRes.Message)" "INFO"
                         }
@@ -16593,33 +16956,49 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     })
 
     $btnPlaybookReport.Add_Click({
-        if ($script:LastDeploymentReportPath -and (Test-Path $script:LastDeploymentReportPath)) {
-            try { Start-Process $script:LastDeploymentReportPath } catch {
-                Write-HubLog "Could not open report: $($_.Exception.Message)" "ERROR"
+        if ($script:LastDeploymentReportHtml) {
+            $sfd = [Microsoft.Win32.SaveFileDialog]::new()
+            $sfd.Title = "Save Deployment HTML Report"
+            $sfd.Filter = "HTML Files (*.html)|*.html|All Files (*.*)|*.*"
+            $serial = try { if ($script:DeviceState -and $script:DeviceState.SerialNumber) { $script:DeviceState.SerialNumber } else { (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber } } catch { 'UNKNOWN' }
+            $sfd.FileName = "DeploymentReport_${serial}_$([datetime]::Now.ToString('yyyyMMdd_HHmmss')).html"
+            if ($sfd.ShowDialog($window) -eq $true) {
+                [System.IO.File]::WriteAllText($sfd.FileName, $script:LastDeploymentReportHtml, [System.Text.UTF8Encoding]::new($false))
+                $script:LastDeploymentReportPath = $sfd.FileName
+                Write-HubLog "Deployment report saved to: $($sfd.FileName)" "SUCCESS"
+                try { Start-Process $sfd.FileName } catch { }
             }
+        } elseif ($script:LastDeploymentReportPath -and (Test-Path $script:LastDeploymentReportPath)) {
+            try { Start-Process $script:LastDeploymentReportPath } catch { }
         } else {
-            [System.Windows.MessageBox]::Show("No deployment report yet. Run an action playbook first - a report is generated automatically when it finishes.", "No Report", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+            [System.Windows.MessageBox]::Show("No deployment report yet. Run an action playbook first - report data is held in-memory.", "No Report", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
         }
     })
 
     if ($btnPlaybookReceipt) {
         $btnPlaybookReceipt.Add_Click({
-            if ($script:LastProvisioningReceiptPath -and (Test-Path $script:LastProvisioningReceiptPath)) {
-                try { Start-Process $script:LastProvisioningReceiptPath } catch {
-                    Write-HubLog "Could not open receipt: $($_.Exception.Message)" "ERROR"
+            $rec = $script:LastProvisioningReceipt
+            if (-not $rec) {
+                $rec = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId
+                $script:LastProvisioningReceipt = $rec
+            }
+            if ($rec -and $rec.HtmlContent) {
+                $sfd = [Microsoft.Win32.SaveFileDialog]::new()
+                $sfd.Title = "Save Provisioning Receipt"
+                $sfd.Filter = "HTML Files (*.html)|*.html|JSON Files (*.json)|*.json|All Files (*.*)|*.*"
+                $serial = try { if ($rec.ReceiptData -and $rec.ReceiptData.Device -and $rec.ReceiptData.Device.SerialNumber) { $rec.ReceiptData.Device.SerialNumber } else { 'DEVICE' } } catch { 'DEVICE' }
+                $sfd.FileName = "Receipt_${serial}_$($rec.DeploymentId).html"
+                if ($sfd.ShowDialog($window) -eq $true) {
+                    $saveHtml = $sfd.FileName
+                    [System.IO.File]::WriteAllText($saveHtml, $rec.HtmlContent, [System.Text.UTF8Encoding]::new($false))
+                    $saveJson = [System.IO.Path]::ChangeExtension($saveHtml, '.json')
+                    [System.IO.File]::WriteAllText($saveJson, ($rec.ReceiptData | ConvertTo-Json -Depth 6), [System.Text.UTF8Encoding]::new($false))
+                    $script:LastProvisioningReceiptPath = $saveHtml
+                    Write-HubLog "Provisioning receipt saved to: $saveHtml" "SUCCESS"
+                    try { Start-Process $saveHtml } catch { }
                 }
-            } else {
-                try {
-                    $rec = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId
-                    if ($rec.Success) {
-                        $script:LastProvisioningReceipt = $rec
-                        $script:LastProvisioningReceiptPath = $rec.HtmlPath
-                        $btnPlaybookReceipt.IsEnabled = $true
-                        Start-Process $rec.HtmlPath
-                    }
-                } catch {
-                    [System.Windows.MessageBox]::Show("Could not generate receipt: $($_.Exception.Message)", "Receipt Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
-                }
+            } elseif ($script:LastProvisioningReceiptPath -and (Test-Path $script:LastProvisioningReceiptPath)) {
+                try { Start-Process $script:LastProvisioningReceiptPath } catch { }
             }
         })
     }
@@ -16627,14 +17006,13 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     if ($btnVerifyReceipt) {
         $btnVerifyReceipt.Add_Click({
             try {
-                Write-HubLog "Executing closed-loop post-enrollment verification..." "INFO"
+                Write-HubLog "Executing closed-loop post-enrollment verification (in-memory)..." "INFO"
                 $rec = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId
                 if ($rec.Success) {
                     $script:LastProvisioningReceipt = $rec
-                    $script:LastProvisioningReceiptPath = $rec.HtmlPath
                     if ($btnPlaybookReceipt) { $btnPlaybookReceipt.IsEnabled = $true }
-                    Write-HubLog "Verification receipt generated: $($rec.HtmlPath) (Verdict: $($rec.ReceiptData.Verdict), Score: $($rec.ReceiptData.Score))" "SUCCESS"
-                    try { Start-Process $rec.HtmlPath } catch { }
+                    Write-HubLog "Verification receipt generated in RAM (Verdict: $($rec.ReceiptData.Verdict), Score: $($rec.ReceiptData.Score), Seal: $($rec.ReceiptData.IntegrityHash))" "SUCCESS"
+                    Write-HubLog "Click 'Receipt' button if you wish to export HTML/JSON to disk." "INFO"
                 }
             } catch {
                 Write-HubLog "Verification error: $($_.Exception.Message)" "ERROR"
@@ -16954,7 +17332,7 @@ if ($ResumeAutopilot) {
 
 if (($Playbook -or $ActionRoutine) -and $NoGui) {
     $pbName = if ($Playbook) { $Playbook } else { $ActionRoutine }
-    Invoke-HeadlessActionRoutine -RoutineName $pbName
+    Invoke-HeadlessActionRoutine -RoutineName $pbName -ExportCsv:$ExportCsv -CsvPath $CsvPath -ExportPath $ExportPath -SaveReceipt:$SaveReceipt -GenerateReceipt:$GenerateReceipt
     return
 }
 
@@ -17129,11 +17507,7 @@ if (-not $NoGui) {
             }
         }
 
-        # Record this process PID for clean lifecycle tracking
-        try {
-            $pidFile = Join-Path ([System.IO.Path]::GetTempPath()) 'AutopilotCommandHub.pid'
-            [System.IO.File]::WriteAllText($pidFile, $PID.ToString())
-        } catch { }
+        # Single-instance lifecycle managed via Global\AutopilotCommandHub Mutex (RAM-only)
 
         if ($ResumeFromRestart) { Unregister-HubResumeAfterRestart | Out-Null }
     }
@@ -17169,7 +17543,7 @@ if (-not $NoGui) {
                 TotalSeconds  = 0
                 Verdict       = $rec.ReceiptData.Verdict
                 Receipt       = $rec.ReceiptData
-                Site          = if ($script:ActiveDeploymentProfile) { $script:ActiveDeploymentProfile.Site } else { (if ($env:AUTOPILOT_SITE) { $env:AUTOPILOT_SITE } else { 'Default' }) }
+                Site          = if ($script:ActiveDeploymentProfile) { $script:ActiveDeploymentProfile.Site } elseif ($env:AUTOPILOT_SITE) { $env:AUTOPILOT_SITE } else { 'Default' }
                 Technician    = $env:USERNAME
                 Device        = $rec.ReceiptData.Device
             }
@@ -17208,6 +17582,11 @@ if (-not $NoGui) {
         $bRes = Enable-HubBitLocker
         $sRes = Set-HubSecurityBaseline
         $lRes = Set-HubLocalAdminPosture
+        return
+    }
+
+    if ($ClearTraces -or $RemoveTraces) {
+        Remove-HubTraces
         return
     }
 
@@ -17277,4 +17656,3 @@ with open(raw_path, 'w', encoding='utf-8', newline='\n') as f:
 
 print(f"Successfully generated {ps1_path} ({len(script_content)} bytes)")
 print(f"Successfully generated {raw_path} ({len(script_content)} bytes)")
-

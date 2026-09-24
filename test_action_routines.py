@@ -4,6 +4,7 @@
 import os
 import sys
 import re
+import time
 import subprocess
 import xml.etree.ElementTree as ET
 
@@ -139,10 +140,23 @@ def test_headless_playbook_execution():
         res = subprocess.run(['pwsh', '-ExecutionPolicy', 'Bypass', '-Command', ps_code], capture_output=True, encoding='utf-8', errors='replace')
         assert res.returncode == 0, f"Routine '{routine}' failed with exit code {res.returncode}:\n{res.stderr}"
         assert "completed successfully across all 9 tabs" in res.stdout, f"Routine '{routine}' did not report success across all 9 tabs:\n{res.stdout}"
-        assert "[PLAYBOOK CSV] Audit report exported to:" in res.stdout, f"Routine '{routine}' missing CSV export line in output:\n{res.stdout}"
+        assert "[PLAYBOOK RECORDS] Execution records held in-memory" in res.stdout, f"Routine '{routine}' missing in-memory record notice in output:\n{res.stdout}"
+        assert not os.path.exists("C:\\AutopilotLogs"), "C:\\AutopilotLogs directory should NOT exist on disk by default!"
         for tab_num in range(1, 10):
             assert f"Tab {tab_num}/9:" in res.stdout, f"Routine '{routine}' missing Tab {tab_num}/9 in output!"
-        print(f"    [PASS] '{routine}' completed cleanly across all 9 tabs with CSV exported.")
+        print(f"    [PASS] '{routine}' completed cleanly in-memory (zero disk traces) across all 9 tabs.")
+
+    # Explicit user export with -ExportCsv
+    print("  Testing explicit user-requested CSV export with -ExportCsv...")
+    temp_csv = os.path.join(os.environ.get('TEMP', 'C:\\Temp'), f'PlaybookExport_{int(time.time())}.csv')
+    ps_code_export = f"& '{ps1_path}' -NoGui -Playbook '5. Hardware Health & Asset Intake Audit' -ExportCsv -ExportPath '{temp_csv}'"
+    res_export = subprocess.run(['pwsh', '-ExecutionPolicy', 'Bypass', '-Command', ps_code_export], capture_output=True, encoding='utf-8', errors='replace')
+    assert res_export.returncode == 0, f"Export routine failed: {res_export.stderr}"
+    assert "[PLAYBOOK CSV] Audit report exported to:" in res_export.stdout
+    assert os.path.exists(temp_csv), f"User-requested CSV export file not found: {temp_csv}"
+    if os.path.exists(temp_csv):
+        os.remove(temp_csv)
+    print("    [PASS] User-initiated CSV export verified with explicit target path.")
 
 def test_powershell51_ast():
     print("\n--- Test 4: PowerShell 5.1 AST Syntax Integrity ---")

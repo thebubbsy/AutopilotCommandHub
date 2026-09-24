@@ -24,7 +24,7 @@
 [CmdletBinding()]
 param(
     [int]$Port = 8443,
-    [string]$DataDir = 'C:\AutopilotLogs\FleetData',
+    [string]$DataDir = '',
     # Interface to bind. Default 'localhost' is safe and needs no admin, but ONLY accepts connections from
     # this machine. For real multi-bench ingestion, pass the server's LAN IP or '+' (all interfaces) -
     # that needs an elevated shell or a one-time 'netsh http add urlacl', and you should set -AuthToken too.
@@ -179,15 +179,19 @@ function Test-HubCohortOutlier {
     return @($outliers)
 }
 
-try {
-    if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
-    $depDir = Join-Path $DataDir 'deployments'
-    if (-not (Test-Path $depDir)) { New-Item -ItemType Directory -Path $depDir -Force | Out-Null }
-} catch {
-    $DataDir = Join-Path $env:TEMP 'AutopilotFleetData'
-    $depDir = Join-Path $DataDir 'deployments'
-    if (-not (Test-Path $depDir)) { New-Item -ItemType Directory -Path $depDir -Force | Out-Null }
+$inMemoryServer = [string]::IsNullOrWhiteSpace($DataDir)
+if (-not $inMemoryServer) {
+    try {
+        if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
+        $depDir = Join-Path $DataDir 'deployments'
+        if (-not (Test-Path $depDir)) { New-Item -ItemType Directory -Path $depDir -Force | Out-Null }
+    } catch {
+        $DataDir = Join-Path $env:TEMP 'AutopilotFleetData'
+        $depDir = Join-Path $DataDir 'deployments'
+        if (-not (Test-Path $depDir)) { New-Item -ItemType Directory -Path $depDir -Force | Out-Null }
+    }
 }
+$inMemoryDeployments = [System.Collections.Generic.List[object]]::new()
 
 $listener = [System.Net.HttpListener]::new()
 $prefix = "http://${BindAddress}:${Port}/"
@@ -211,7 +215,7 @@ Write-Host " AUTOPILOT FLEET PLANE INGESTION SERVER ACTIVE" -ForegroundColor Gre
 Write-Host " Listening URL:    $prefix" -ForegroundColor White
 Write-Host " Ingestion API:    POST ${prefix}api/telemetry" -ForegroundColor White
 Write-Host " Fleet Dashboard:  GET  $prefix" -ForegroundColor White
-Write-Host " Storage Root:     $DataDir" -ForegroundColor White
+Write-Host " Storage Root:     $(if ($inMemoryServer) { '100% In-Memory (Zero Disk Trace)' } else { $DataDir })" -ForegroundColor White
 Write-Host " Press CTRL+C to terminate server." -ForegroundColor Yellow
 Write-Host "==========================================================================`n" -ForegroundColor Cyan
 
@@ -412,8 +416,13 @@ while ($listener.IsListening) {
             $parsed = $null
             try { $parsed = $body | ConvertFrom-Json } catch { }
             $depId = if ($parsed -and $parsed.DeploymentId) { $parsed.DeploymentId } else { "DEP-$([guid]::NewGuid().ToString('N').Substring(0,8))" }
-            $savePath = Join-Path $depDir "Deployment_${depId}.json"
-            [System.IO.File]::WriteAllText($savePath, $body, (Get-ScriptEncoding))
+
+            if ($inMemoryServer) {
+                if ($parsed) { $inMemoryDeployments.Add($parsed) }
+            } else {
+                $savePath = Join-Path $depDir "Deployment_${depId}.json"
+                [System.IO.File]::WriteAllText($savePath, $body, (Get-ScriptEncoding))
+            }
 
             $respData = [PSCustomObject]@{ status = 'ok'; deploymentId = $depId; receivedUtc = [datetime]::UtcNow.ToString('o') }
             $buf = [System.Text.Encoding]::UTF8.GetBytes(($respData | ConvertTo-Json))
@@ -424,12 +433,17 @@ while ($listener.IsListening) {
             $res.Close()
             Write-Host "[TELEMETRY INGESTED] Deployment: $depId" -ForegroundColor Green
         } elseif ($method -eq 'GET' -and $path -eq '/api/deployments') {
-            $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
-            $records = [System.Collections.Generic.List[object]]::new()
-            if ($files) {
-                foreach ($f in $files) {
-                    try { $records.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+            $records = if ($inMemoryServer) {
+                @($inMemoryDeployments)
+            } else {
+                $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                $l = [System.Collections.Generic.List[object]]::new()
+                if ($files) {
+                    foreach ($f in $files) {
+                        try { $l.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                    }
                 }
+                @($l)
             }
             $j = if ($records -and $records.Count -gt 0) { ($records | ConvertTo-Json -Depth 6) } else { '[]' }
             $buf = [System.Text.Encoding]::UTF8.GetBytes($j)
@@ -439,12 +453,17 @@ while ($listener.IsListening) {
             $res.OutputStream.Write($buf, 0, $buf.Length)
             $res.Close()
         } elseif ($method -eq 'GET' -and $path -eq '/api/cohorts') {
-            $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
-            $records = [System.Collections.Generic.List[object]]::new()
-            if ($files) {
-                foreach ($f in $files) {
-                    try { $records.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+            $records = if ($inMemoryServer) {
+                @($inMemoryDeployments)
+            } else {
+                $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                $l = [System.Collections.Generic.List[object]]::new()
+                if ($files) {
+                    foreach ($f in $files) {
+                        try { $l.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                    }
                 }
+                @($l)
             }
             $modelGroups = @{}
             foreach ($d in $records) {
@@ -465,12 +484,17 @@ while ($listener.IsListening) {
             $res.OutputStream.Write($buf, 0, $buf.Length)
             $res.Close()
         } elseif ($method -eq 'GET' -and $path -eq '/api/outliers') {
-            $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
-            $records = [System.Collections.Generic.List[object]]::new()
-            if ($files) {
-                foreach ($f in $files) {
-                    try { $records.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+            $records = if ($inMemoryServer) {
+                @($inMemoryDeployments)
+            } else {
+                $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                $l = [System.Collections.Generic.List[object]]::new()
+                if ($files) {
+                    foreach ($f in $files) {
+                        try { $l.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                    }
                 }
+                @($l)
             }
             $modelGroups = @{}
             foreach ($d in $records) {
@@ -511,8 +535,11 @@ while ($listener.IsListening) {
             $res.OutputStream.Write($buf, 0, $buf.Length)
             $res.Close()
         } elseif ($method -eq 'GET' -and $path -eq '/api/health') {
-            $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
-            $hObj = [PSCustomObject]@{ status = 'healthy'; uptime = 'active'; deploymentsCount = if ($files) { $files.Count } else { 0 } }
+            $depCount = if ($inMemoryServer) { $inMemoryDeployments.Count } else {
+                $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                if ($files) { $files.Count } else { 0 }
+            }
+            $hObj = [PSCustomObject]@{ status = 'healthy'; uptime = 'active'; deploymentsCount = $depCount }
             $buf = [System.Text.Encoding]::UTF8.GetBytes(($hObj | ConvertTo-Json))
             $res.ContentType = 'application/json'
             $res.StatusCode = 200
@@ -521,12 +548,17 @@ while ($listener.IsListening) {
             $res.Close()
         } else {
             # Serve Fleet Dashboard
-            $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
-            $records = [System.Collections.Generic.List[object]]::new()
-            if ($files) {
-                foreach ($f in $files) {
-                    try { $records.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+            $records = if ($inMemoryServer) {
+                @($inMemoryDeployments)
+            } else {
+                $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                $l = [System.Collections.Generic.List[object]]::new()
+                if ($files) {
+                    foreach ($f in $files) {
+                        try { $l.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                    }
                 }
+                @($l)
             }
             $html = Build-FleetDashboardHtml -Deployments $records
             $buf = [System.Text.Encoding]::UTF8.GetBytes($html)

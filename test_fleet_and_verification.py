@@ -30,6 +30,7 @@ def run_ps(cmd):
 
 def test_closed_loop_verification_and_receipt():
     print("\n--- Test 1: Closed-Loop Verification Engine & Tamper-Evident Receipt ---")
+    # 1. Test In-Memory First (Zero Traces by Default)
     ps_cmd = "$rec = Export-HubProvisioningReceipt; $rec | ConvertTo-Json -Depth 4"
     res = run_ps(ps_cmd)
     assert res.returncode == 0, f"Export-HubProvisioningReceipt failed:\n{res.stderr}"
@@ -44,38 +45,47 @@ def test_closed_loop_verification_and_receipt():
     data = json.loads('\n'.join(lines[json_start:]))
 
     assert data.get('Success') is True, f"Receipt generation did not report Success=true: {data}"
-    html_path = data.get('HtmlPath')
-    json_path = data.get('JsonPath')
+    assert data.get('InMemory') is True, f"Receipt should be held in-memory by default: {data}"
+    assert not os.path.exists("C:\\AutopilotLogs"), "C:\\AutopilotLogs should NOT exist on disk by default!"
     dep_id = data.get('DeploymentId')
+    print(f"  [PASS] In-Memory Receipt generated (Deployment ID: {dep_id}, Verdict: {data.get('ReceiptData', {}).get('Verdict')})")
 
-    print(f"  [PASS] Receipt generated: {html_path}")
-    print(f"  [PASS] JSON sidecar:      {json_path}")
-    print(f"  [PASS] Hub Deployment ID: {dep_id}")
-
-    assert os.path.exists(html_path), f"HTML receipt file not found: {html_path}"
-    assert os.path.exists(json_path), f"JSON receipt file not found: {json_path}"
-
-    with open(html_path, 'r', encoding='utf-8') as f:
-        html_content = f.read()
-    assert "Autopilot Provisioning Receipt" in html_content
-    assert "Integrity Seal (" in html_content  # honest label: HMAC-SHA256 when keyed, else SHA-256 checksum
-    assert dep_id in html_content
-
-    # Verify cryptographic seal using Test-HubProvisioningReceipt
-    verify_cmd = f"$v = Test-HubProvisioningReceipt -ReceiptPathOrObject '{json_path}'; $v | ConvertTo-Json"
+    # Verify cryptographic seal using Test-HubProvisioningReceipt with in-memory object
+    verify_cmd = """
+    $rec = Export-HubProvisioningReceipt
+    $v = Test-HubProvisioningReceipt -ReceiptPathOrObject $rec.ReceiptData
+    $v | ConvertTo-Json
+    """
     res_v = run_ps(verify_cmd)
     assert res_v.returncode == 0, f"Test-HubProvisioningReceipt failed:\n{res_v.stderr}"
     lines_v = res_v.stdout.strip().splitlines()
     j_idx = next(i for i, l in enumerate(lines_v) if l.strip().startswith('{'))
     v_data = json.loads('\n'.join(lines_v[j_idx:]))
+    assert v_data.get('IsValid') is True, f"In-memory cryptographic seal validation failed: {v_data}"
+    print(f"  [PASS] In-memory cryptographic integrity seal verified: {v_data.get('StoredHash')}")
 
-    assert v_data.get('IsValid') is True, f"Cryptographic seal validation failed: {v_data}"
-    print(f"  [PASS] Cryptographic integrity seal verified: {v_data.get('StoredHash')}")
+    # 2. Test Explicit User Export (-SaveToDisk)
+    temp_receipt_dir = os.path.join(os.environ.get('TEMP', 'C:\\Temp'), f'ReceiptExport_{int(time.time())}')
+    export_cmd = f"$rec = Export-HubProvisioningReceipt -SaveToDisk -OutputDir '{temp_receipt_dir}'; $rec | ConvertTo-Json -Depth 4"
+    res_exp = run_ps(export_cmd)
+    assert res_exp.returncode == 0, f"Export-HubProvisioningReceipt -SaveToDisk failed:\n{res_exp.stderr}"
+    lines_exp = res_exp.stdout.strip().splitlines()
+    j_exp_idx = next(i for i, l in enumerate(lines_exp) if l.strip().startswith('{'))
+    exp_data = json.loads('\n'.join(lines_exp[j_exp_idx:]))
+    html_path = exp_data.get('HtmlPath')
+    json_path = exp_data.get('JsonPath')
+    assert os.path.exists(html_path), f"Exported HTML receipt file not found: {html_path}"
+    assert os.path.exists(json_path), f"Exported JSON receipt file not found: {json_path}"
 
-    # Adversarial tampering test: modify receipt JSON on disk and confirm validation FAILS
+    with open(html_path, 'r', encoding='utf-8') as f:
+        html_content = f.read()
+    assert "Autopilot Provisioning Receipt" in html_content
+    assert "Integrity Seal (" in html_content
+    assert exp_data.get('DeploymentId') in html_content
+
+    # Adversarial tampering test on exported file
     with open(json_path, 'r', encoding='utf-8') as f:
         tampered_obj = json.load(f)
-    orig_verdict = tampered_obj['Verdict']
     tampered_obj['Verdict'] = 'TAMPERED_STATUS'
     tampered_path = json_path.replace('.json', '_tampered.json')
     with open(tampered_path, 'w', encoding='utf-8') as f:
@@ -88,8 +98,13 @@ def test_closed_loop_verification_and_receipt():
     t_data = json.loads('\n'.join(lines_t[j_idx_t:]))
     assert t_data.get('IsValid') is False, f"Tampered receipt should have failed verification: {t_data}"
     print(f"  [PASS] Adversarial tampering detected and rejected: {t_data.get('Reason')}")
-    if os.path.exists(tampered_path):
-        os.remove(tampered_path)
+
+    # Clean up exported files
+    for p in [html_path, json_path, tampered_path]:
+        if os.path.exists(p):
+            os.remove(p)
+    if os.path.exists(temp_receipt_dir):
+        os.rmdir(temp_receipt_dir)
 
 def test_fleet_telemetry_and_buffering():
     print("\n--- Test 2: Fleet Plane Telemetry & Offline Buffering ---")
@@ -116,9 +131,11 @@ def test_fleet_telemetry_and_buffering():
             break
     data = json.loads('\n'.join(lines[json_start:]))
     assert data.get('Buffered') is True, f"Telemetry should have been buffered offline: {data}"
+    assert data.get('InMemory') is True, f"Telemetry should be buffered in-memory: {data}"
+    assert not os.path.exists("C:\\AutopilotLogs"), "C:\\AutopilotLogs should NOT exist on disk by default!"
     buf_path = data.get('Path')
-    assert os.path.exists(buf_path), f"Buffered telemetry file not found: {buf_path}"
-    print(f"  [PASS] Offline buffering verified: {buf_path}")
+    assert buf_path.startswith('memory://FleetBuffer'), f"Expected memory buffer path, got: {buf_path}"
+    print(f"  [PASS] In-memory offline buffering verified (Zero disk trace): {buf_path}")
 
 def test_cohort_baselines_and_outliers():
     print("\n--- Test 3: Cross-Fleet Cohort Baselines & Statistical Outlier Alerting ---")
@@ -276,11 +293,10 @@ def test_security_posture_and_laps():
     ps_cmd = """
     $sec = Set-HubSecurityBaseline
     $adm = Set-HubLocalAdminPosture
-    $lapsKey = 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\LAPS\\Config'
     [PSCustomObject]@{
         SecBaseline = $sec.Success
         LocalAdmin  = $adm.Success
-        LapsConfigured = (Test-Path $lapsKey)
+        Message     = $adm.Message
     } | ConvertTo-Json
     """
     res = run_ps(ps_cmd)
@@ -290,8 +306,8 @@ def test_security_posture_and_laps():
     json_start = next(i for i, l in enumerate(lines) if l.strip().startswith('{'))
     data = json.loads('\n'.join(lines[json_start:]))
     assert data.get('SecBaseline') is True or data.get('LocalAdmin') is True
-    assert data.get('LapsConfigured') is True
-    print(f"  [PASS] Security Baseline, Local Admin Posture, and Windows LAPS configuration verified.")
+    assert "zero registry keys written" in data.get('Message', '')
+    print(f"  [PASS] Security Baseline and Local Admin Posture verified (Zero registry keys written).")
 
 def test_live_fleet_server_and_dashboard():
     print("\n--- Test 8: Live Fleet Plane HTTP Server & Real-Time Dashboard ---")
