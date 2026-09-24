@@ -269,6 +269,26 @@ def test_cart_mode_harvest_and_batch_registration():
     assert data['Step3Total'] == 2, f"Expected deduplication to keep total at 2, got {data['Step3Total']}"
     print(f"  [PASS] Cart Harvest multi-unit accumulation & deduplication verified: {data['CsvPath']} (Total: 2 units)")
 
+    # Verify In-Memory Cart Harvest (Zero disk trace when no CSV path or USB is given)
+    ps_inmem_cmd = f"""
+    $resInMem = Invoke-HubCartHarvest -CartName 'InMemoryTestCart' -GroupTag 'INMEM' -HardwareHashOverride '{oa3_b64}' -SerialNumberOverride 'UNIT-INMEM-01'
+    [PSCustomObject]@{{
+        Success    = $resInMem.Success
+        InMemory   = $resInMem.InMemory
+        CartCsv    = $resInMem.CartCsvPath
+        TotalUnits = $resInMem.TotalUnits
+    }} | ConvertTo-Json
+    """
+    res_im = run_ps(ps_inmem_cmd)
+    assert res_im.returncode == 0, f"In-memory cart harvest failed:\n{res_im.stderr}"
+    lines_im = res_im.stdout.strip().splitlines()
+    j_im_idx = next(i for i, l in enumerate(lines_im) if l.strip().startswith('{'))
+    im_data = json.loads('\n'.join(lines_im[j_im_idx:]))
+    assert im_data.get('Success') is True, f"In-memory cart harvest failed: {im_data}"
+    assert im_data.get('InMemory') is True, f"Cart harvest should be in-memory: {im_data}"
+    assert not os.path.exists("C:\\Autopilot_Carts"), "C:\\Autopilot_Carts should NOT exist on disk by default!"
+    print(f"  [PASS] In-Memory Cart Harvest verified (Zero disk trace, C:\\Autopilot_Carts does not exist).")
+
     # Verify Register-AutopilotDevice accepts HardwareHash and SerialNumber without ParameterBindingException
     reg_test_cmd = f"""
     try {{

@@ -142,6 +142,7 @@ def test_headless_playbook_execution():
         assert "completed successfully across all 9 tabs" in res.stdout, f"Routine '{routine}' did not report success across all 9 tabs:\n{res.stdout}"
         assert "[PLAYBOOK RECORDS] Execution records held in-memory" in res.stdout, f"Routine '{routine}' missing in-memory record notice in output:\n{res.stdout}"
         assert not os.path.exists("C:\\AutopilotLogs"), "C:\\AutopilotLogs directory should NOT exist on disk by default!"
+        assert not os.path.exists("catdb.INTEG.RAW"), "catdb.INTEG.RAW should NOT exist on disk!"
         for tab_num in range(1, 10):
             assert f"Tab {tab_num}/9:" in res.stdout, f"Routine '{routine}' missing Tab {tab_num}/9 in output!"
         print(f"    [PASS] '{routine}' completed cleanly in-memory (zero disk traces) across all 9 tabs.")

@@ -364,6 +364,26 @@ function Remove-HubTraces {
         }
     }
 
+    # 1b. Clean residual directories on removable USB flash drives
+    try {
+        $usbDrives = Get-CimInstance Win32_LogicalDisk -Filter "DriveType = 2" -ErrorAction SilentlyContinue
+        if ($usbDrives) {
+            foreach ($d in $usbDrives) {
+                if (Test-Path "$($d.DeviceID)\") {
+                    foreach ($sub in @('Autopilot_Playbooks', 'Autopilot_Carts')) {
+                        $usbDir = Join-Path "$($d.DeviceID)\" $sub
+                        if (Test-Path -LiteralPath $usbDir) {
+                            try {
+                                Remove-Item -LiteralPath $usbDir -Recurse -Force -ErrorAction SilentlyContinue
+                                $purgedItems.Add("USB Directory: $usbDir")
+                            } catch { }
+                        }
+                    }
+                }
+            }
+        }
+    } catch { }
+
     # 2. Specific trace files in Temp
     $tempPath = [System.IO.Path]::GetTempPath()
     $tempFilters = @(
@@ -382,7 +402,9 @@ function Remove-HubTraces {
         'GraphTokenCache.json',
         'HubDiag_*',
         'FleetDashboard.html',
-        'Telemetry_*.json'
+        'Telemetry_*.json',
+        'catdb.INTEG.RAW',
+        '*.INTEG.RAW'
     )
 
     foreach ($pattern in $tempFilters) {
@@ -398,6 +420,23 @@ function Remove-HubTraces {
             }
         } catch { }
     }
+
+    # 2b. Lingering trace files in current working directory
+    try {
+        $cwd = [System.IO.Directory]::GetCurrentDirectory()
+        $cwdFilters = @('catdb.INTEG.RAW', '*.INTEG.RAW')
+        foreach ($pattern in $cwdFilters) {
+            $files = Get-ChildItem -Path $cwd -Filter $pattern -ErrorAction SilentlyContinue
+            if ($files) {
+                foreach ($f in $files) {
+                    try {
+                        Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+                        $purgedItems.Add("File: $($f.FullName)")
+                    } catch { }
+                }
+            }
+        }
+    } catch { }
 
     # 3. Clean any legacy LAPS registry keys
     $lapsConfigKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS\Config'
@@ -3429,24 +3468,37 @@ function Repair-HubCryptSvcCatroot {
         '{127D0A1D-4EF2-11D1-8608-00C04FC295EE}'
     )
 
-    foreach ($guid in $guidFolders) {
-        $cat2DbDir = Join-Path $cat2Root $guid
-        $catDbFile = Join-Path $cat2DbDir 'catdb'
+    $origDir = [System.IO.Directory]::GetCurrentDirectory()
+    $tempDir = [System.IO.Path]::GetTempPath()
+    try {
+        [System.IO.Directory]::SetCurrentDirectory($tempDir)
+        foreach ($guid in $guidFolders) {
+            $cat2DbDir = Join-Path $cat2Root $guid
+            $catDbFile = Join-Path $cat2DbDir 'catdb'
 
-        if (Test-Path $catDbFile) {
-            $log.Add("Checking ESENT integrity on $guid\catdb...")
-            $gOut = (& $esentutl /g "$catDbFile" 2>&1) -join ' '
-            $log.Add("esentutl /g result: $gOut")
+            if (Test-Path $catDbFile) {
+                $log.Add("Checking ESENT integrity on $guid\catdb...")
+                $gOut = (& $esentutl /g "$catDbFile" 2>&1) -join ' '
+                $log.Add("esentutl /g result: $gOut")
 
-            if ($gOut -notmatch 'Integrity check successful') {
-                $log.Add("Corruption detected in $guid. Executing recovery / repair...")
-                & $esentutl /r edb /l "$cat2DbDir" /d "$cat2DbDir" 2>&1 | Out-Null
-                & $esentutl /p "$catDbFile" /o 2>&1 | Out-Null
-                $log.Add("Completed esentutl /p repair on $guid.")
-            } else {
-                $log.Add("Catroot2 ESENT database in $guid verified OK.")
+                if ($gOut -notmatch 'Integrity check successful') {
+                    $log.Add("Corruption detected in $guid. Executing recovery / repair...")
+                    & $esentutl /r edb /l "$cat2DbDir" /d "$cat2DbDir" 2>&1 | Out-Null
+                    & $esentutl /p "$catDbFile" /o 2>&1 | Out-Null
+                    $log.Add("Completed esentutl /p repair on $guid.")
+                } else {
+                    $log.Add("Catroot2 ESENT database in $guid verified OK.")
+                }
             }
         }
+    } finally {
+        [System.IO.Directory]::SetCurrentDirectory($origDir)
+        try {
+            Get-ChildItem -Path $tempDir -Filter "*catdb*.INTEG.RAW" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            Get-ChildItem -Path $tempDir -Filter "*.INTEG.RAW" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            $stray = Join-Path $origDir "catdb.INTEG.RAW"
+            if (Test-Path $stray) { Remove-Item -LiteralPath $stray -Force -ErrorAction SilentlyContinue }
+        } catch { }
     }
 
     if (Test-Path $cat2Root) {
@@ -8210,7 +8262,8 @@ function Invoke-HubCartHarvest {
         [string]$GroupTag = '',
         [string]$AssignedUser = '',
         [string]$HardwareHashOverride = '',
-        [string]$SerialNumberOverride = ''
+        [string]$SerialNumberOverride = '',
+        [switch]$AutoDetectUsb
     )
 
     Write-Host "`n==========================================================================" -ForegroundColor Cyan
@@ -8258,7 +8311,7 @@ function Invoke-HubCartHarvest {
     }
 
     $targetCsv = $CsvPath
-    if ([string]::IsNullOrWhiteSpace($targetCsv)) {
+    if ([string]::IsNullOrWhiteSpace($targetCsv) -and $AutoDetectUsb) {
         $usbDrives = Get-CimInstance Win32_LogicalDisk -Filter "DriveType = 2" -ErrorAction SilentlyContinue
         if ($usbDrives) {
             foreach ($d in $usbDrives) {
