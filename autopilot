@@ -6892,6 +6892,11 @@ function Start-AutopilotHubGui {
                             ToolTip="Click to copy endpoint Serial Number, Model, TPM, Power &amp; Graph telemetry summary to the clipboard.">
                         <TextBlock Name="TxtCopyTelemetry" Text="COPY TELEMETRY" FontSize="8.5" FontWeight="SemiBold" Foreground="#0F172A" VerticalAlignment="Center"/>
                     </Border>
+                    <!-- One-Click Export Diagnostic JSON Pill -->
+                    <Border Name="BadgeExportDiagJson" Background="#EFF6FF" CornerRadius="3" Padding="6,1.5" Margin="4,0,0,0" VerticalAlignment="Center" BorderBrush="#BFDBFE" BorderThickness="1" Cursor="Hand"
+                            ToolTip="Click to export a full JSON hardware &amp; session diagnostic receipt to USB (or %TEMP%) and copy its path.">
+                        <TextBlock Name="TxtExportDiagJson" Text="EXPORT JSON" FontSize="8.5" FontWeight="SemiBold" Foreground="#1D4ED8" VerticalAlignment="Center"/>
+                    </Border>
             </StackPanel>
 
             <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
@@ -6932,12 +6937,12 @@ function Start-AutopilotHubGui {
 
                 <StackPanel Grid.Column="0">
                     <TextBlock Text="SERIAL NUMBER" FontSize="8" Foreground="#64748B" FontWeight="SemiBold"/>
-                    <TextBlock Name="TxtSerial" Text="Detecting..." FontSize="10.5" Foreground="#1E293B" FontWeight="Bold" FontFamily="Consolas" Margin="0,1,0,0"/>
+                    <TextBlock Name="TxtSerial" Text="Detecting..." FontSize="10.5" Foreground="#1E293B" FontWeight="Bold" FontFamily="Consolas" Margin="0,1,0,0" Cursor="Hand" ToolTip="Click to copy Serial Number to clipboard"/>
                 </StackPanel>
 
                 <StackPanel Grid.Column="1">
                     <TextBlock Text="MAKE &amp; MODEL" FontSize="8" Foreground="#64748B" FontWeight="SemiBold"/>
-                    <TextBlock Name="TxtModel" Text="Detecting..." FontSize="10.5" Foreground="#1E293B" FontWeight="SemiBold" Margin="0,1,0,0"/>
+                    <TextBlock Name="TxtModel" Text="Detecting..." FontSize="10.5" Foreground="#1E293B" FontWeight="SemiBold" Margin="0,1,0,0" Cursor="Hand" ToolTip="Click to copy Make &amp; Model to clipboard"/>
                 </StackPanel>
 
                 <StackPanel Grid.Column="2">
@@ -10607,6 +10612,30 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     # --- HEADER ACTIONS ---
     $badgeCopyTelemetry = $window.FindName('BadgeCopyTelemetry')
     $txtCopyTelemetry   = $window.FindName('TxtCopyTelemetry')
+    $badgeExportDiagJson = $window.FindName('BadgeExportDiagJson')
+    $txtExportDiagJson   = $window.FindName('TxtExportDiagJson')
+
+    if ($txtSerial) {
+        $txtSerial.Add_MouseLeftButtonUp({
+            try {
+                if ($txtSerial.Text) {
+                    [System.Windows.Clipboard]::SetText($txtSerial.Text.Trim())
+                    Write-HubLog "Copied Hardware Serial ($($txtSerial.Text.Trim())) to clipboard." "SUCCESS"
+                }
+            } catch { }
+        })
+    }
+    if ($txtModel) {
+        $txtModel.Add_MouseLeftButtonUp({
+            try {
+                if ($txtModel.Text) {
+                    [System.Windows.Clipboard]::SetText($txtModel.Text.Trim())
+                    Write-HubLog "Copied Hardware Model ($($txtModel.Text.Trim())) to clipboard." "SUCCESS"
+                }
+            } catch { }
+        })
+    }
+
     if ($badgeCopyTelemetry) {
         $badgeCopyTelemetry.Add_MouseLeftButtonUp({
             try {
@@ -10624,6 +10653,33 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                 Write-HubLog "Copied endpoint telemetry to clipboard: $summary" "SUCCESS"
             } catch {
                 Write-HubLog "Could not copy telemetry to clipboard: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
+    if ($badgeExportDiagJson) {
+        $badgeExportDiagJson.Add_MouseLeftButtonUp({
+            try {
+                $diagPayload = [ordered]@{
+                    TimestampUtc     = (Get-Date).ToUniversalTime().ToString("o")
+                    ComputerName     = $env:COMPUTERNAME
+                    SerialNumber     = if ($txtSerial) { $txtSerial.Text } else { 'Unknown' }
+                    HardwareModel    = if ($txtModel) { $txtModel.Text } else { 'Unknown' }
+                    TpmStatus        = if ($txtTpm) { $txtTpm.Text } else { 'Unknown' }
+                    PowerStatus      = if ($txtPowerStatus) { $txtPowerStatus.Text } else { 'Unknown' }
+                    PrivilegeContext = if ($txtPrivilege) { $txtPrivilege.Text } else { 'Unknown' }
+                    GraphStatus      = if ($txtGraphStatus) { $txtGraphStatus.Text } else { 'Unknown' }
+                    OSVersion        = [System.Environment]::OSVersion.VersionString
+                }
+                $jsonStr = $diagPayload | ConvertTo-Json -Depth 4
+                [System.Windows.Clipboard]::SetText($jsonStr)
+                $outDir = if (Test-Path "C:\ProgramData\AutopilotCommandHub") { "C:\ProgramData\AutopilotCommandHub" } else { $env:TEMP }
+                $outFile = Join-Path $outDir ("AutopilotDiag_{0}_{1}.json" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd_HHmmss"))
+                $jsonStr | Set-Content -Path $outFile -Encoding UTF8 -Force
+                if ($txtExportDiagJson) { $txtExportDiagJson.Text = "JSON SAVED + COPIED" }
+                Write-HubLog "Diagnostic JSON snapshot copied to clipboard and saved to $outFile" "SUCCESS"
+            } catch {
+                Write-HubLog "Could not export diagnostic JSON: $($_.Exception.Message)" "WARN"
             }
         })
     }
