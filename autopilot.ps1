@@ -6887,6 +6887,11 @@ function Start-AutopilotHubGui {
                     <Border Background="#E0F2FE" CornerRadius="3" Padding="5,1.5" Margin="4,0,0,0" VerticalAlignment="Center" BorderBrush="#BAE6FD" BorderThickness="1">
                         <TextBlock Text="STANDALONE KERNEL" FontSize="8.5" FontWeight="SemiBold" Foreground="#0284C7"/>
                     </Border>
+                    <!-- One-Click Copy Endpoint Telemetry Pill -->
+                    <Border Name="BadgeCopyTelemetry" Background="#F1F5F9" CornerRadius="3" Padding="6,1.5" Margin="4,0,0,0" VerticalAlignment="Center" BorderBrush="#CBD5E1" BorderThickness="1" Cursor="Hand"
+                            ToolTip="Click to copy endpoint Serial Number, Model, TPM, Power &amp; Graph telemetry summary to the clipboard.">
+                        <TextBlock Name="TxtCopyTelemetry" Text="COPY TELEMETRY" FontSize="8.5" FontWeight="SemiBold" Foreground="#0F172A" VerticalAlignment="Center"/>
+                    </Border>
             </StackPanel>
 
             <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
@@ -10600,6 +10605,29 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     })
 
     # --- HEADER ACTIONS ---
+    $badgeCopyTelemetry = $window.FindName('BadgeCopyTelemetry')
+    $txtCopyTelemetry   = $window.FindName('TxtCopyTelemetry')
+    if ($badgeCopyTelemetry) {
+        $badgeCopyTelemetry.Add_MouseLeftButtonUp({
+            try {
+                $ser = if ($txtSerial) { $txtSerial.Text } else { 'Unknown' }
+                $mod = if ($txtModel) { $txtModel.Text } else { 'Unknown' }
+                $tpm = if ($txtTpm) { $txtTpm.Text } else { 'Unknown' }
+                $pwr = if ($txtPowerStatus) { $txtPowerStatus.Text } else { 'Unknown' }
+                $priv = if ($txtPrivilege) { $txtPrivilege.Text } else { 'Unknown' }
+                $grph = if ($txtGraphStatus) { $txtGraphStatus.Text } else { 'Unknown' }
+                $summary = "Autopilot Hub Telemetry | Serial: $ser | Model: $mod | TPM: $tpm | $pwr | $priv | $grph"
+                [System.Windows.Clipboard]::SetText($summary)
+                if ($txtCopyTelemetry) { $txtCopyTelemetry.Text = "COPIED TO CLIPBOARD" }
+                $badgeCopyTelemetry.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#DCFCE7")
+                $badgeCopyTelemetry.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#86EFAC")
+                Write-HubLog "Copied endpoint telemetry to clipboard: $summary" "SUCCESS"
+            } catch {
+                Write-HubLog "Could not copy telemetry to clipboard: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
     if ($btnDismissMismatch) {
         $btnDismissMismatch.Add_Click({
             if ($bannerTenantMismatch) { $bannerTenantMismatch.Visibility = [System.Windows.Visibility]::Collapsed }
