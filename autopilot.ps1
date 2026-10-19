@@ -11433,6 +11433,8 @@ function Start-AutopilotHubGui {
                         <Button Name="BtnClearLogFilter" Content="✕" FontSize="9" Padding="4,1" Margin="0,0,4,0" ToolTip="Clear log keyword filter box"/>
                         <Button Name="BtnCopyFilteredLog" Content="Copy Match" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy audit log lines matching the filter box (or all lines if empty)"/>
                         <Button Name="BtnCopyLogErrors" Content="Copy Warn/Err" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy only [WARN], [ERROR], and [FAIL] audit log lines to the clipboard"/>
+                        <Button Name="BtnCopyLogTsv" Content="Copy TSV" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy structured System Audit Log rows (Timestamp, Severity, Message) as TSV for Excel/Sheets"/>
+                        <Button Name="BtnExportLogCsv" Content="Export CSV" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a structured CSV file and copy its path to the clipboard"/>
                         <Button Name="BtnCopyLog" Content="Copy Log" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnClearLog" Content="Clear" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnSaveLog" Content="Save Log..." FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
@@ -11846,6 +11848,8 @@ function Start-AutopilotHubGui {
     $btnClearLogFilter = $window.FindName('BtnClearLogFilter')
     $btnCopyFilteredLog = $window.FindName('BtnCopyFilteredLog')
     $btnCopyLogErrors  = $window.FindName('BtnCopyLogErrors')
+    $btnCopyLogTsv     = $window.FindName('BtnCopyLogTsv')
+    $btnExportLogCsv   = $window.FindName('BtnExportLogCsv')
     $btnCopyLog        = $window.FindName('BtnCopyLog')
     $btnClearLog       = $window.FindName('BtnClearLog')
     $btnSaveLog        = $window.FindName('BtnSaveLog')
@@ -13675,6 +13679,60 @@ function Start-AutopilotHubGui {
                     Write-HubLog "No [WARN] or [ERROR] lines found in audit log (copied clean status)." "INFO"
                 }
             } catch { }
+        })
+    }
+
+    if ($btnCopyLogTsv) {
+        $btnCopyLogTsv.Add_Click({
+            try {
+                $q = if ($txtLogFilter -and $txtLogFilter.Text) { $txtLogFilter.Text.Trim() } else { '' }
+                $rawLines = if ($txtHubLog -and $txtHubLog.Text) { $txtHubLog.Text -split "`r?`n" } else { @() }
+                $targetLines = @($rawLines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and ([string]::IsNullOrWhiteSpace($q) -or $_.IndexOf($q, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) })
+                $tsvOut = [System.Collections.Generic.List[string]]::new()
+                $tsvOut.Add("Line`tTimestamp`tSeverity`tMessage")
+                $idx = 0
+                foreach ($ln in $targetLines) {
+                    $idx++
+                    $cleanLn = ($ln -replace "[\t\r\n]+", " ").Trim()
+                    if ($cleanLn -match '^\[(?<ts>[^\]]+)\]\s*\[(?<sev>[^\]]+)\]\s*(?<msg>.*)$') {
+                        $tsvOut.Add("$idx`t$($Matches['ts'])`t$($Matches['sev'])`t$($Matches['msg'])")
+                    } else {
+                        $tsvOut.Add("$idx`t`tINFO`t$cleanLn")
+                    }
+                }
+                [System.Windows.Clipboard]::SetText(($tsvOut -join "`r`n"))
+                Write-HubLog "Copied $($idx) audit log row(s) as TSV for Excel/Sheets." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not copy audit log TSV: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
+    if ($btnExportLogCsv) {
+        $btnExportLogCsv.Add_Click({
+            try {
+                $q = if ($txtLogFilter -and $txtLogFilter.Text) { $txtLogFilter.Text.Trim() } else { '' }
+                $rawLines = if ($txtHubLog -and $txtHubLog.Text) { $txtHubLog.Text -split "`r?`n" } else { @() }
+                $targetLines = @($rawLines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and ([string]::IsNullOrWhiteSpace($q) -or $_.IndexOf($q, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) })
+                $rows = [System.Collections.Generic.List[object]]::new()
+                $idx = 0
+                foreach ($ln in $targetLines) {
+                    $idx++
+                    $cleanLn = ($ln -replace "[\r\n]+", " ").Trim()
+                    if ($cleanLn -match '^\[(?<ts>[^\]]+)\]\s*\[(?<sev>[^\]]+)\]\s*(?<msg>.*)$') {
+                        $rows.Add([PSCustomObject]@{ Line = $idx; Timestamp = $Matches['ts']; Severity = $Matches['sev']; Message = $Matches['msg'] })
+                    } else {
+                        $rows.Add([PSCustomObject]@{ Line = $idx; Timestamp = ''; Severity = 'INFO'; Message = $cleanLn })
+                    }
+                }
+                $outDir = if (Test-Path "C:\ProgramData\AutopilotCommandHub") { "C:\ProgramData\AutopilotCommandHub" } else { $env:TEMP }
+                $outFile = Join-Path $outDir ("AutopilotAuditLog_{0}_{1}.csv" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd_HHmmss"))
+                $rows | Export-Csv -Path $outFile -NoTypeInformation -Encoding UTF8 -Force
+                [System.Windows.Clipboard]::SetText($outFile)
+                Write-HubLog "Exported $($idx) audit log row(s) to CSV: $outFile (path copied)." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not export audit log CSV: $($_.Exception.Message)" "WARN"
+            }
         })
     }
 
