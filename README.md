@@ -89,6 +89,12 @@ Device Code Flow | App Secret
 * **Native Single-Threaded Apartment (STA) Engine**: Built on a non-blocking `DispatcherFrame` message loop that streams live color-coded logs without freezing the interface.
 * **WinUI 3 Fluent Dark Architecture**: Crafted strictly with authentic Windows 11 dark theme design tokens (`#202020` canvas, `#2B2B2B` elevation surfaces, and `#0067C0` accent blue).
 * **Cross-Subsystem Core Integration**: Combines core engines from [`AutopilotFast`](https://github.com/thebubbsy/AutopilotFast), [`IntuneShared`](https://github.com/thebubbsy/IntuneShared), and [`WingetIntune`](https://github.com/thebubbsy/WingetIntune).
+* **Fleet Plane & Telemetry Ingestion**: Every provisioning run generates a unique Hub Deployment ID (`HUB-<DATE>-<UUID>`), exports deployment telemetry, and POSTs to a centralized ingestion server (`Start-HubFleetServer.ps1`) with offline disk buffering.
+* **Cross-Fleet Cohort Baselines & Statistical Outlier Alerting**: Computes mean, stddev, and percentile distributions across hardware cohorts (e.g. Dell Latitude 5520, ThinkPad T14) to flag abnormal provisioning slowdowns or network bottlenecks.
+* **Closed-Loop Verification & Tamper-Evident Receipts**: Comprehensive post-enrollment audit verifying TPM 2.0, Secure Boot, BitLocker encryption, Autopilot profile assignment, MDM enrollment, and ESP completion, sealed with an immutable SHA-256 cryptographic digest.
+* **Config-as-Code Deployment Profiles**: Rapid site profiles (`Melbourne-Office`, `Sydney-Kiosk`, `Field-Executive`, `Engineering-Workstation`, `Factory-Floor`) that configure Group Tags, naming templates, winget app bundles, and security baselines in a single click.
+* **OEM Driver & Firmware Automation**: Native CLI integration for Dell Command Update (`dcu-cli.exe`), Lenovo System Update (`tvsu.exe`), and HP Image Assistant (`HPIA`).
+* **Bulk Cart Harvest Station**: Provisioning carts of 30-40 laptops: rapidly harvests OA3 hardware hashes, accumulates into an un-duplicated batch CSV on USB, and performs batch Graph registration.
 * **Fast, Non-Blocking Startup**: The window renders in ~3 s (pwsh 7) / ~2.4 s (Windows PowerShell 5.1), down from ~10 s. Slow, UI-free work - the 7-stage network ladder, licensing WMI, TPM probe, battery/storage counters - runs in a background runspace pool and streams into the UI as it completes, so the console never blocks on a probe. Secure Boot is read from its registry mirror (works without elevation) and the OA3 product key is cached per session.
 * **A little showmanship**: On launch the console plays a brief ASCII cowboy shootout *while* those background probes run, so the flourish overlaps real work instead of adding to it. It is skipped automatically when there is no console, output is redirected, `-NoIntro` is passed, or `AUTOPILOT_NO_INTRO` is set. Replay it any time with `.utopilot.ps1 -Shootout`. (There are one or two other things to find, too.)
 
@@ -237,7 +243,28 @@ powershell -File .\autopilot.ps1 -PatchCascade -MaxPasses 5 -IncludeDrivers
 powershell -File .\autopilot.ps1 -WindowsUpdate -ScanOnly
 powershell -File .\autopilot.ps1 -WindowsUpdate -IncludeDrivers -AutoReboot
 
-# 12. (internal) What the restart-resume scheduled task runs - cleans itself up on start
+# 12. Closed-Loop Post-Enrollment Verification & Signed Receipt
+powershell -File .\autopilot.ps1 -VerifyEnrollment
+
+# 13. Bulk Cart Harvest Station (accumulate hashes on USB with deduplication)
+powershell -File .\autopilot.ps1 -CartMode -CartName "BenchCart-01"
+
+# 14. Batch Cloud Register an accumulated Cart CSV
+powershell -File .\autopilot.ps1 -BatchRegisterCart -CartCsvPath "E:\Autopilot_Carts\AutopilotCart_BenchCart_01_20260923.csv"
+
+# 15. Apply Config-as-Code Deployment Profile (CLI headless)
+powershell -File .\autopilot.ps1 -DeploymentProfile "Melbourne-Office" -Playbook "1. Intune-Only Cloud Build"
+
+# 16. OEM Driver and Firmware Automation (Dell, Lenovo, HP)
+powershell -File .\autopilot.ps1 -OemUpdates -OemScanOnly
+
+# 17. Security Posture Enforcement (BitLocker XTS-AES 256 + LAPS + Defender Baseline)
+powershell -File .\autopilot.ps1 -EnforceSecurityPosture
+
+# 18. Launch Centralized Fleet Ingestion Server & Dashboard
+powershell -File .\Start-HubFleetServer.ps1 -Port 8443 -OpenBrowser
+
+# 19. (internal) What the restart-resume scheduled task runs - cleans itself up on start
 powershell -NoProfile -STA -File "C:\Program Files\AutopilotCommandHub\autopilot.ps1" -EnvFile "C:\Program Files\AutopilotCommandHub\.env" -ResumeFromRestart
 ```
 
@@ -250,6 +277,7 @@ AutopilotCommandHub/
 ├── autopilot.ps1            # Standalone, zero-dependency production script
 ├── autopilot                # Extensionless bootstrap version for web distribution
 ├── build_autopilot.py       # Source compiler (embeds XAML, styling, and modules)
+├── Start-HubFleetServer.ps1 # Standalone Fleet Plane HTTP Ingestion Server & Dashboard
 ├── Start-DeviceAuth.ps1     # Standalone CLI device code authenticator
 ├── Get-DellWarranty.ps1     # Standalone Dell asset warranty query tool
 ├── test_dell_warranty.py    # Automated verification test suite

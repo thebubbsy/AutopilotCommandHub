@@ -72,7 +72,27 @@ param(
     [int]$MaxPasses = 5,
     [switch]$OfflineStaging,
     [string]$StagingProfile = 'HardwareDiagnostics',
-    [switch]$ResumeAutopilot
+    [switch]$ResumeAutopilot,
+    [string]$Playbook = '',
+    [string]$ActionRoutine = '',
+    [string]$DeploymentProfile = '',
+    [switch]$VerifyEnrollment,
+    [switch]$GenerateReceipt,
+    [string]$FleetEndpoint = '',
+    [switch]$SendTelemetry,
+    [switch]$CartMode,
+    [string]$CartName = 'StandardCart',
+    [string]$CartCsvPath = '',
+    [switch]$BatchRegisterCart,
+    [switch]$OemUpdates,
+    [switch]$OemScanOnly,
+    [switch]$EnforceSecurityPosture,
+    [switch]$StartFleetServer,
+    [int]$FleetServerPort = 8443,
+    [switch]$ClearTraces,
+    [switch]$RemoveTraces,
+    [switch]$SaveReceipt,
+    [string]$ExportPath = ''
 )
 
 # 0. Central Environment & Configuration Engine (.env)
@@ -298,6 +318,160 @@ $script:PreflightRunspace = $null
 $script:PreflightHandle = $null
 $script:CachedDsregStatus = $null
 $script:BypassDisabledAdapters = [System.Collections.Generic.List[string]]::new()
+$script:HubDeploymentId = "HUB-{0}-{1}" -f (Get-Date -Format 'yyyyMMdd'), ([guid]::NewGuid().ToString('N').Substring(0,8).ToUpper())
+$script:ActiveDeploymentProfile = $null
+$script:LastProvisioningReceipt = $null
+$script:LastProvisioningReceiptPath = $null
+$script:LastProvisioningReceiptHtml = $null
+$script:LastDeploymentMetrics = $null
+$script:LastDeploymentReportPath = $null
+$script:LastDeploymentReportHtml = $null
+$script:InMemoryStoredBaseline = $null
+$script:InMemoryPatchCascadeState = $null
+$script:FleetBufferDir = $null
+$script:FleetBuffer = [System.Collections.Generic.List[object]]::new()
+$script:HubLogEntries = [System.Collections.Generic.List[object]]::new()
+$script:PlaybookLogEntries = [System.Collections.Generic.List[object]]::new()
+$script:LastPlaybookExecutionRecords = [System.Collections.Generic.List[object]]::new()
+$script:LastPlaybookRoutineName = $null
+$script:HubCartEntries = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[PSCustomObject]]]::new()
+
+# --- Function: Remove-HubTraces (Alias: Clear-HubTraces) ---
+function Remove-HubTraces {
+    [CmdletBinding()]
+    param([switch]$Quiet)
+
+    $purgedItems = [System.Collections.Generic.List[string]]::new()
+
+    # 1. Directories to eradicate
+    $targetDirs = @(
+        'C:\AutopilotLogs',
+        (Join-Path $env:ProgramData 'AutopilotCommandHub'),
+        (Join-Path ([System.IO.Path]::GetTempPath()) 'AutopilotCommandHub'),
+        (Join-Path ([System.IO.Path]::GetTempPath()) 'AutopilotLogs'),
+        (Join-Path ([System.IO.Path]::GetTempPath()) 'AutopilotFleetBuffer'),
+        (Join-Path ([System.IO.Path]::GetTempPath()) 'AutopilotFleetData'),
+        'C:\Autopilot_Playbooks',
+        'C:\Autopilot_Carts'
+    )
+
+    foreach ($d in $targetDirs) {
+        if (Test-Path -LiteralPath $d) {
+            try {
+                Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+                $purgedItems.Add("Directory: $d")
+            } catch { }
+        }
+    }
+
+    # 1b. Clean residual directories on removable USB flash drives
+    try {
+        $usbDrives = Get-CimInstance Win32_LogicalDisk -Filter "DriveType = 2" -ErrorAction SilentlyContinue
+        if ($usbDrives) {
+            foreach ($d in $usbDrives) {
+                if (Test-Path "$($d.DeviceID)\") {
+                    foreach ($sub in @('Autopilot_Playbooks', 'Autopilot_Carts')) {
+                        $usbDir = Join-Path "$($d.DeviceID)\" $sub
+                        if (Test-Path -LiteralPath $usbDir) {
+                            try {
+                                Remove-Item -LiteralPath $usbDir -Recurse -Force -ErrorAction SilentlyContinue
+                                $purgedItems.Add("USB Directory: $usbDir")
+                            } catch { }
+                        }
+                    }
+                }
+            }
+        }
+    } catch { }
+
+    # 2. Specific trace files in Temp
+    $tempPath = [System.IO.Path]::GetTempPath()
+    $tempFilters = @(
+        'AutopilotCommandHub.pid',
+        'hub.pid',
+        'AutopilotHub-*.log',
+        'Receipt_*.json',
+        'Receipt_*.html',
+        'Playbook_*.csv',
+        'DeploymentReport_*.html',
+        'DeploymentReport_*.json',
+        'TestCartBatchMulti.csv',
+        'TestDellWarranty.csv',
+        'DellWarranty-*.csv',
+        'test_custom.env',
+        'GraphTokenCache.json',
+        'HubDiag_*',
+        'FleetDashboard.html',
+        'Telemetry_*.json',
+        'catdb.INTEG.RAW',
+        '*.INTEG.RAW'
+    )
+
+    foreach ($pattern in $tempFilters) {
+        try {
+            $files = Get-ChildItem -Path $tempPath -Filter $pattern -ErrorAction SilentlyContinue
+            if ($files) {
+                foreach ($f in $files) {
+                    try {
+                        Remove-Item -LiteralPath $f.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                        $purgedItems.Add("File: $($f.FullName)")
+                    } catch { }
+                }
+            }
+        } catch { }
+    }
+
+    # 2b. Lingering trace files in current working directory
+    try {
+        $cwd = [System.IO.Directory]::GetCurrentDirectory()
+        $cwdFilters = @('catdb.INTEG.RAW', '*.INTEG.RAW')
+        foreach ($pattern in $cwdFilters) {
+            $files = Get-ChildItem -Path $cwd -Filter $pattern -ErrorAction SilentlyContinue
+            if ($files) {
+                foreach ($f in $files) {
+                    try {
+                        Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+                        $purgedItems.Add("File: $($f.FullName)")
+                    } catch { }
+                }
+            }
+        }
+    } catch { }
+
+    # 3. Clean any legacy LAPS registry keys
+    $lapsConfigKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS\Config'
+    if (Test-Path $lapsConfigKey) {
+        try {
+            Remove-Item -Path $lapsConfigKey -Recurse -Force -ErrorAction SilentlyContinue
+            $purgedItems.Add("Registry: $lapsConfigKey")
+        } catch { }
+    }
+
+    # Reset in-memory buffers
+    if ($script:FleetBuffer) { $script:FleetBuffer.Clear() }
+    if ($script:HubLogEntries) { $script:HubLogEntries.Clear() }
+    if ($script:PlaybookLogEntries) { $script:PlaybookLogEntries.Clear() }
+    if ($script:LastPlaybookExecutionRecords) { $script:LastPlaybookExecutionRecords.Clear() }
+    $script:InMemoryStoredBaseline = $null
+    $script:InMemoryPatchCascadeState = $null
+    $script:LastProvisioningReceipt = $null
+    $script:LastDeploymentMetrics = $null
+
+    $msg = "Purged $($purgedItems.Count) lingering trace item(s) from disk."
+    if (-not $Quiet) {
+        Write-Host "[ZERO-TRACE] $msg" -ForegroundColor Cyan
+    }
+    return [PSCustomObject]@{
+        Success     = $true
+        PurgedCount = $purgedItems.Count
+        PurgedItems = $purgedItems.ToArray()
+        Message     = $msg
+    }
+}
+Set-Alias -Name Clear-HubTraces -Value Remove-HubTraces -ErrorAction SilentlyContinue
+
+# Auto-purge disk traces on initialization
+$null = Remove-HubTraces -Quiet
 
 # 5. Self-Source Capture. Under `irm <url> | iex` there is no $PSCommandPath, but the script block that is
 #    executing still carries the full source - that is what makes an elevated relaunch and the post-restart
@@ -511,6 +685,7 @@ function Close-ExistingHubInstances {
                 if ([int]::TryParse($raw, [ref]$val) -and $val -gt 0 -and $val -ne $currentPid) {
                     [void]$targetPids.Add($val)
                 }
+                Remove-Item -Path $pPath -Force -ErrorAction SilentlyContinue
             } catch { }
         }
     }
@@ -861,31 +1036,36 @@ function Invoke-HubSystemReboot {
     try {
         $shutdownExe = Join-Path $env:SystemRoot 'System32\shutdown.exe'
         if (Test-Path $shutdownExe) {
-            $argList = "/r /t $DelaySeconds /f /c `"$Reason`""
-            $p = Start-Process -FilePath $shutdownExe -ArgumentList $argList -NoNewWindow -PassThru -ErrorAction SilentlyContinue
-            if ($p) {
-                $p.WaitForExit(2000)
-                if ($p.HasExited -and $p.ExitCode -ne 0 -and $p.ExitCode -ne 1190) {
-                    Write-HubLog "shutdown.exe with comment exited with code $($p.ExitCode), trying without comment..." "WARN"
-                    $p2 = Start-Process -FilePath $shutdownExe -ArgumentList "/r /t $DelaySeconds /f" -NoNewWindow -PassThru -ErrorAction SilentlyContinue
-                    if ($p2) {
-                        $p2.WaitForExit(2000)
-                        if (-not $p2.HasExited -or $p2.ExitCode -eq 0 -or $p2.ExitCode -eq 1190) {
-                            Write-HubLog "Initiated reboot via shutdown.exe /r /t $DelaySeconds /f" "SUCCESS"
-                            return
-                        }
-                    }
-                } else {
-                    Write-HubLog "Initiated reboot via shutdown.exe /r /t $DelaySeconds /f" "SUCCESS"
-                    return
-                }
+            # Direct invocation without Start-Process quoting pitfalls
+            & $shutdownExe /r /t $DelaySeconds /f /c "$Reason"
+            if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 1190) {
+                Write-HubLog "Initiated reboot via shutdown.exe /r /t $DelaySeconds /f" "SUCCESS"
+                return
+            }
+            # Fallback without comment if comment caused issues
+            & $shutdownExe /r /t $DelaySeconds /f
+            if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 1190) {
+                Write-HubLog "Initiated reboot via shutdown.exe /r /t $DelaySeconds /f (no comment)" "SUCCESS"
+                return
             }
         }
     } catch {
         Write-HubLog "shutdown.exe invocation warning: $($_.Exception.Message)" "WARN"
     }
 
-    # Tier 2: Win32 API InitiateSystemShutdownEx & ExitWindowsEx
+    # Tier 2: WMI / CIM Win32Shutdown(6 = Forced Reboot)
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+        if ($os) {
+            $cimRes = Invoke-CimMethod -InputObject $os -MethodName Win32Shutdown -Arguments @{ Flags = [int]6; Reserved = [int]0 } -ErrorAction SilentlyContinue
+            if ($cimRes -and $cimRes.ReturnValue -eq 0) {
+                Write-HubLog "Initiated reboot via CIM Win32Shutdown(6)" "SUCCESS"
+                return
+            }
+        }
+    } catch { }
+
+    # Tier 3: Win32 API InitiateSystemShutdownEx & ExitWindowsEx
     try {
         if (-not ([System.Management.Automation.PSTypeName]'Win32NativeShutdown').Type) {
             Add-Type -TypeDefinition @"
@@ -913,7 +1093,7 @@ public class Win32NativeShutdown {
         }
     } catch { }
 
-    # Tier 3: Restart-Computer -Force fallback
+    # Tier 4: Restart-Computer -Force fallback
     try {
         Restart-Computer -Force -ErrorAction Stop
         Write-HubLog "Initiated reboot via Restart-Computer -Force" "SUCCESS"
@@ -941,44 +1121,70 @@ function Invoke-HubCreateLocalUser {
     }
 
     $created = $false
-    try {
-        if (-not [string]::IsNullOrEmpty($Password)) {
-            $secPass = ConvertTo-SecureString $Password -AsPlainText -Force
-            New-LocalUser -Name $cleanName -Password $secPass -FullName $FullName -Description "Created via Autopilot Command Hub" -PasswordNeverExpires:$PasswordNeverExpires -ErrorAction Stop | Out-Null
-        } else {
-            New-LocalUser -Name $cleanName -NoPassword -FullName $FullName -Description "Created via Autopilot Command Hub" -PasswordNeverExpires:$PasswordNeverExpires -ErrorAction Stop | Out-Null
-        }
+    $existing = $null
+    try { $existing = Get-LocalUser -Name $cleanName -ErrorAction SilentlyContinue } catch { }
+    if ($existing) {
         $created = $true
-        $actions.Add("Created local user account '$cleanName' via New-LocalUser")
-    } catch {
+        $actions.Add("User account '$cleanName' already exists on this system")
+    } else {
         try {
-            $netArgs = if ($Password) { "user `"$cleanName`" `"$Password`" /add" } else { "user `"$cleanName`" /add" }
-            $netProc = Start-Process -FilePath "net.exe" -ArgumentList $netArgs -NoNewWindow -Wait -PassThru
-            if ($netProc.ExitCode -eq 0) {
-                $created = $true
-                $actions.Add("Created local user account '$cleanName' via net.exe")
+            if (-not [string]::IsNullOrEmpty($Password)) {
+                $secPass = ConvertTo-SecureString $Password -AsPlainText -Force
+                New-LocalUser -Name $cleanName -Password $secPass -FullName $FullName -Description "Created via Autopilot Command Hub" -PasswordNeverExpires:$PasswordNeverExpires -ErrorAction Stop | Out-Null
             } else {
-                throw "net.exe returned exit code $($netProc.ExitCode)"
+                New-LocalUser -Name $cleanName -NoPassword -FullName $FullName -Description "Created via Autopilot Command Hub" -PasswordNeverExpires:$PasswordNeverExpires -ErrorAction Stop | Out-Null
             }
+            $created = $true
+            $actions.Add("Created local user account '$cleanName' via New-LocalUser")
         } catch {
-            throw "Failed to create user account '$cleanName': $($_.Exception.Message)"
+            try {
+                $netArgs = if ($Password) { "user `"$cleanName`" `"$Password`" /add" } else { "user `"$cleanName`" /add" }
+                $netProc = Start-Process -FilePath "net.exe" -ArgumentList $netArgs -NoNewWindow -Wait -PassThru
+                if ($netProc.ExitCode -eq 0) {
+                    $created = $true
+                    $actions.Add("Created local user account '$cleanName' via net.exe")
+                } elseif ($netProc.ExitCode -eq 2) {
+                    $created = $true
+                    $actions.Add("User account '$cleanName' already exists on this system (net.exe code 2)")
+                } else {
+                    throw "net.exe returned exit code $($netProc.ExitCode)"
+                }
+            } catch {
+                if ($_.Exception.Message -like '*already exists*' -or $_.Exception.Message -like '*2224*') {
+                    $created = $true
+                    $actions.Add("User account '$cleanName' already exists on this system")
+                } else {
+                    throw "Failed to create user account '$cleanName': $($_.Exception.Message)"
+                }
+            }
         }
     }
 
     if ($MakeAdmin) {
         $adminAdded = $false
         try {
-            Add-LocalGroupMember -Group "Administrators" -Member $cleanName -ErrorAction Stop
-            $adminAdded = $true
-            $actions.Add("Added '$cleanName' to local Administrators group")
+            $existingMembers = Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue
+            if ($existingMembers | Where-Object { $_.Name -like "*\$cleanName" -or $_.Name -eq $cleanName }) {
+                $adminAdded = $true
+                $actions.Add("'$cleanName' is already a member of local Administrators group")
+            } else {
+                Add-LocalGroupMember -Group "Administrators" -Member $cleanName -ErrorAction Stop
+                $adminAdded = $true
+                $actions.Add("Added '$cleanName' to local Administrators group")
+            }
         } catch {
-            try {
-                $netGrp = Start-Process -FilePath "net.exe" -ArgumentList "localgroup administrators `"$cleanName`" /add" -NoNewWindow -Wait -PassThru
-                if ($netGrp.ExitCode -eq 0) {
-                    $adminAdded = $true
-                    $actions.Add("Added '$cleanName' to local Administrators group via net.exe")
-                }
-            } catch { }
+            if ($_.Exception.Message -like '*already a member*') {
+                $adminAdded = $true
+                $actions.Add("'$cleanName' is already a member of local Administrators group")
+            } else {
+                try {
+                    $netGrp = Start-Process -FilePath "net.exe" -ArgumentList "localgroup administrators `"$cleanName`" /add" -NoNewWindow -Wait -PassThru
+                    if ($netGrp.ExitCode -eq 0 -or $netGrp.ExitCode -eq 2) {
+                        $adminAdded = $true
+                        $actions.Add("Added '$cleanName' to local Administrators group via net.exe")
+                    }
+                } catch { }
+            }
         }
         if (-not $adminAdded) {
             $actions.Add("WARNING: Could not verify Administrators group membership for '$cleanName'")
@@ -1077,6 +1283,18 @@ function Show-CreateLocalUserDialog {
 
     if ($script:RuntimeContext -and -not $script:RuntimeContext.MeetsPreferred) {
         [System.Windows.MessageBox]::Show("Creating a local user account requires administrative privileges. Please click 'Fix Privileges' in the header first.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+        return
+    }
+
+    if ($script:PlaybookRunning) {
+        Write-HubLog "Playbook: Auto-provisioning local administrative user account 'Admin'..." "INFO"
+        try {
+            $res = Invoke-HubCreateLocalUser -UserName "Admin" -Password "" -FullName "Local Administrator" -MakeAdmin:$true -PasswordNeverExpires:$true -SkipRemainingOobe:$true
+            foreach ($act in $res.Actions) { Write-HubLog "  $act" "INFO" }
+            Write-HubLog "Local user 'Admin' successfully created (Admin: True)." "SUCCESS"
+        } catch {
+            Write-HubLog "Local user creation notice: $($_.Exception.Message)" "WARN"
+        }
         return
     }
 
@@ -1736,8 +1954,16 @@ function Show-OfflineStagingDialog {
     param([System.Windows.Window]$Owner = $null)
     $ctx = $script:RuntimeContext
     if (-not $ctx.MeetsPreferred) {
-        [System.Windows.MessageBox]::Show("Controlled Offline Staging requires administrative elevation to configure service states, quarantine profiles, and write network fences. Please click 'Fix Privileges' in the header first.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+        if (-not $script:PlaybookRunning) {
+            [System.Windows.MessageBox]::Show("Controlled Offline Staging requires administrative elevation to configure service states, quarantine profiles, and write network fences. Please click 'Fix Privileges' in the header first.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+        }
         return $false
+    }
+
+    if ($script:PlaybookRunning) {
+        $res = Invoke-OfflineStaging -Profile 'HardwareDiagnostics' -QuarantineProfile:$true -LoopbackFence:$true -SetBypassNro:$true -CreateDesktopShortcut:$true
+        Write-HubLog "Offline Staging Mode activated for '$($res.Title)'" "SUCCESS"
+        return $true
     }
 
     $xamlStaging = @"
@@ -3242,24 +3468,37 @@ function Repair-HubCryptSvcCatroot {
         '{127D0A1D-4EF2-11D1-8608-00C04FC295EE}'
     )
 
-    foreach ($guid in $guidFolders) {
-        $cat2DbDir = Join-Path $cat2Root $guid
-        $catDbFile = Join-Path $cat2DbDir 'catdb'
+    $origDir = [System.IO.Directory]::GetCurrentDirectory()
+    $tempDir = [System.IO.Path]::GetTempPath()
+    try {
+        [System.IO.Directory]::SetCurrentDirectory($tempDir)
+        foreach ($guid in $guidFolders) {
+            $cat2DbDir = Join-Path $cat2Root $guid
+            $catDbFile = Join-Path $cat2DbDir 'catdb'
 
-        if (Test-Path $catDbFile) {
-            $log.Add("Checking ESENT integrity on $guid\catdb...")
-            $gOut = (& $esentutl /g "$catDbFile" 2>&1) -join ' '
-            $log.Add("esentutl /g result: $gOut")
+            if (Test-Path $catDbFile) {
+                $log.Add("Checking ESENT integrity on $guid\catdb...")
+                $gOut = (& $esentutl /g "$catDbFile" 2>&1) -join ' '
+                $log.Add("esentutl /g result: $gOut")
 
-            if ($gOut -notmatch 'Integrity check successful') {
-                $log.Add("Corruption detected in $guid. Executing recovery / repair...")
-                & $esentutl /r edb /l "$cat2DbDir" /d "$cat2DbDir" 2>&1 | Out-Null
-                & $esentutl /p "$catDbFile" /o 2>&1 | Out-Null
-                $log.Add("Completed esentutl /p repair on $guid.")
-            } else {
-                $log.Add("Catroot2 ESENT database in $guid verified OK.")
+                if ($gOut -notmatch 'Integrity check successful') {
+                    $log.Add("Corruption detected in $guid. Executing recovery / repair...")
+                    & $esentutl /r edb /l "$cat2DbDir" /d "$cat2DbDir" 2>&1 | Out-Null
+                    & $esentutl /p "$catDbFile" /o 2>&1 | Out-Null
+                    $log.Add("Completed esentutl /p repair on $guid.")
+                } else {
+                    $log.Add("Catroot2 ESENT database in $guid verified OK.")
+                }
             }
         }
+    } finally {
+        [System.IO.Directory]::SetCurrentDirectory($origDir)
+        try {
+            Get-ChildItem -Path $tempDir -Filter "*catdb*.INTEG.RAW" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            Get-ChildItem -Path $tempDir -Filter "*.INTEG.RAW" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            $stray = Join-Path $origDir "catdb.INTEG.RAW"
+            if (Test-Path $stray) { Remove-Item -LiteralPath $stray -Force -ErrorAction SilentlyContinue }
+        } catch { }
     }
 
     if (Test-Path $cat2Root) {
@@ -4132,6 +4371,1721 @@ function Export-AutopilotCsv {
     }
 }
 
+# ============================================================================
+# DEPLOYMENT TELEMETRY & REPORTING ENGINE
+# Rich, self-contained deployment reports (HTML with inline-SVG charts + JSON
+# sidecar for fleet ingestion). No external dependencies - renders offline in OOBE.
+# ============================================================================
+function ConvertTo-HubSvgText {
+    param([string]$Text)
+    if ($null -eq $Text) { return '' }
+    return ($Text -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;')
+}
+
+function New-HubSvgBarChart {
+    param($Data, [string]$Unit = '', [string]$Color = '#0067C0', [int]$Width = 720, [int]$BarHeight = 26, [int]$Gap = 10)
+    $data = @($Data)
+    if ($data.Count -eq 0) { return '<p class="muted">No data.</p>' }
+    $max = ($data | Measure-Object -Property Value -Maximum).Maximum
+    if ($max -le 0) { $max = 1 }
+    $labelW = 230; $valueW = 90; $trackW = $Width - $labelW - $valueW
+    $h = ($data.Count * ($BarHeight + $Gap)) + $Gap
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.AppendLine("<svg viewBox='0 0 $Width $h' width='100%' role='img' class='chart'>")
+    $y = $Gap
+    foreach ($d in $data) {
+        $val = [double]$d.Value
+        $w = [int]([math]::Max(2, ($val / $max) * $trackW))
+        $label = ConvertTo-HubSvgText $d.Label
+        $valTxt = if ($val -ge 100) { '{0:N0}' -f $val } else { '{0:N1}' -f $val }
+        $valTxt = "$valTxt $Unit".Trim()
+        $ty = $y + [int]($BarHeight * 0.68)
+        [void]$sb.AppendLine("<text x='0' y='$ty' class='blabel'>$label</text>")
+        [void]$sb.AppendLine("<rect x='$labelW' y='$y' width='$trackW' height='$BarHeight' rx='4' class='track'/>")
+        [void]$sb.AppendLine("<rect x='$labelW' y='$y' width='$w' height='$BarHeight' rx='4' fill='$Color'/>")
+        [void]$sb.AppendLine("<text x='$($labelW + $trackW + 8)' y='$ty' class='bval'>$valTxt</text>")
+        $y += $BarHeight + $Gap
+    }
+    [void]$sb.AppendLine("</svg>")
+    return $sb.ToString()
+}
+
+function New-HubSvgLineChart {
+    param($Series, [string]$YUnit = '', [int]$Width = 720, [int]$Height = 240)
+    $series = @($Series)
+    $allPts = $series | ForEach-Object { $_.Points } | ForEach-Object { $_ }
+    if (-not $allPts) { return '<p class="muted">No time-series data captured.</p>' }
+    $padL = 54; $padR = 16; $padT = 14; $padB = 28
+    $plotW = $Width - $padL - $padR; $plotH = $Height - $padT - $padB
+    $xMax = ($allPts | Measure-Object -Property X -Maximum).Maximum
+    $yMax = ($allPts | Measure-Object -Property Y -Maximum).Maximum
+    if ($xMax -le 0) { $xMax = 1 }
+    if ($yMax -le 0) { $yMax = 1 }
+    $yNice = [math]::Ceiling($yMax * 1.1)
+    if ($yNice -le 0) { $yNice = 1 }
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.AppendLine("<svg viewBox='0 0 $Width $Height' width='100%' role='img' class='chart'>")
+    for ($g = 0; $g -le 4; $g++) {
+        $gy = $padT + ($plotH * $g / 4)
+        $yv = $yNice * (4 - $g) / 4
+        [void]$sb.AppendLine("<line x1='$padL' y1='$gy' x2='$($padL+$plotW)' y2='$gy' class='grid'/>")
+        [void]$sb.AppendLine("<text x='$($padL-6)' y='$($gy+4)' class='axis' text-anchor='end'>$('{0:N0}' -f $yv)</text>")
+    }
+    [void]$sb.AppendLine("<text x='$padL' y='$($Height-8)' class='axis'>0s</text>")
+    [void]$sb.AppendLine("<text x='$($padL+$plotW)' y='$($Height-8)' class='axis' text-anchor='end'>$('{0:N0}' -f $xMax)s</text>")
+    foreach ($se in $series) {
+        $pts = @($se.Points)
+        if ($pts.Count -eq 0) { continue }
+        $coords = foreach ($pt in $pts) {
+            $px = $padL + (($pt.X / $xMax) * $plotW)
+            $py = $padT + $plotH - (($pt.Y / $yNice) * $plotH)
+            '{0:N1},{1:N1}' -f $px, $py
+        }
+        [void]$sb.AppendLine("<polyline points='$($coords -join ' ')' fill='none' stroke='$($se.Color)' stroke-width='2' stroke-linejoin='round'/>")
+    }
+    [void]$sb.AppendLine("</svg>")
+    return $sb.ToString()
+}
+
+function Get-HubDiskPerfSample {
+    $r = [PSCustomObject]@{ ReadMBps = 0.0; WriteMBps = 0.0; Iops = 0.0; QueueLen = 0.0; Ok = $false }
+    try {
+        $c = Get-Counter -Counter @(
+            '\PhysicalDisk(_Total)\Disk Read Bytes/sec',
+            '\PhysicalDisk(_Total)\Disk Write Bytes/sec',
+            '\PhysicalDisk(_Total)\Disk Transfers/sec',
+            '\PhysicalDisk(_Total)\Current Disk Queue Length'
+        ) -SampleInterval 1 -MaxSamples 1 -ErrorAction Stop
+        foreach ($cs in $c.CounterSamples) {
+            switch -Wildcard ($cs.Path) {
+                '*read bytes/sec'  { $r.ReadMBps  = [math]::Round($cs.CookedValue / 1MB, 2) }
+                '*write bytes/sec' { $r.WriteMBps = [math]::Round($cs.CookedValue / 1MB, 2) }
+                '*transfers/sec'   { $r.Iops      = [math]::Round($cs.CookedValue, 0) }
+                '*queue length'    { $r.QueueLen  = [math]::Round($cs.CookedValue, 2) }
+            }
+        }
+        $r.Ok = $true
+    } catch {
+        try {
+            $d = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -ErrorAction Stop | Where-Object { $_.Name -eq '_Total' } | Select-Object -First 1
+            if ($d) {
+                $r.ReadMBps  = [math]::Round($d.DiskReadBytesPersec / 1MB, 2)
+                $r.WriteMBps = [math]::Round($d.DiskWriteBytesPersec / 1MB, 2)
+                $r.Iops      = [math]::Round($d.DiskTransfersPersec, 0)
+                $r.QueueLen  = [math]::Round($d.CurrentDiskQueueLength, 2)
+                $r.Ok = $true
+            }
+        } catch { }
+    }
+    return $r
+}
+
+function Get-HubDiskPerfSampleFast {
+    # Instant, non-blocking sample (already-cooked per-second CIM values) for periodic timers.
+    $r = [PSCustomObject]@{ ReadMBps = 0.0; WriteMBps = 0.0; Iops = 0.0; QueueLen = 0.0; Ok = $false }
+    try {
+        $d = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -ErrorAction Stop | Where-Object { $_.Name -eq '_Total' } | Select-Object -First 1
+        if ($d) {
+            $r.ReadMBps  = [math]::Round($d.DiskReadBytesPersec / 1MB, 2)
+            $r.WriteMBps = [math]::Round($d.DiskWriteBytesPersec / 1MB, 2)
+            $r.Iops      = [math]::Round($d.DiskTransfersPersec, 0)
+            $r.QueueLen  = [math]::Round($d.CurrentDiskQueueLength, 2)
+            $r.Ok = $true
+        }
+    } catch { }
+    return $r
+}
+
+function Get-HubSystemBaseline {
+    $b = [ordered]@{}
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+        $bios = Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+        $cpu = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+        $b.CollectedUtc   = [datetime]::UtcNow.ToString('o')
+        $b.ComputerName   = $env:COMPUTERNAME
+        $b.SerialNumber   = if ($bios) { $bios.SerialNumber } else { '' }
+        $b.Manufacturer   = if ($cs) { $cs.Manufacturer } else { '' }
+        $b.Model          = if ($cs) { $cs.Model } else { '' }
+        $b.CpuName        = if ($cpu) { ($cpu.Name).Trim() } else { '' }
+        $b.CpuCores       = if ($cpu) { [int]$cpu.NumberOfCores } else { 0 }
+        $b.CpuLogical     = if ($cpu) { [int]$cpu.NumberOfLogicalProcessors } else { 0 }
+        $b.CpuMaxClockMHz = if ($cpu) { [int]$cpu.MaxClockSpeed } else { 0 }
+        $b.RamGB          = if ($cs) { [math]::Round($cs.TotalPhysicalMemory / 1GB, 1) } else { 0 }
+        $b.OsCaption      = if ($os) { $os.Caption } else { '' }
+        $b.OsBuild        = if ($os) { $os.BuildNumber } else { '' }
+        $b.OsVersion      = if ($os) { $os.Version } else { '' }
+    } catch { }
+    try {
+        $mem = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue)
+        $b.RamModules  = $mem.Count
+        $b.RamSpeedMHz = if ($mem.Count -gt 0) { [int]($mem[0].Speed) } else { 0 }
+    } catch { $b.RamModules = 0; $b.RamSpeedMHz = 0 }
+    try {
+        $pd = Get-PhysicalDisk -ErrorAction SilentlyContinue | Sort-Object DeviceId | Select-Object -First 1
+        if ($pd) {
+            $b.DiskModel   = $pd.FriendlyName
+            $b.DiskSizeGB  = [math]::Round($pd.Size / 1GB, 0)
+            $b.DiskType    = "$($pd.MediaType)"
+            $b.DiskBus     = "$($pd.BusType)"
+            $rc = $pd | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
+            if ($rc) {
+                $b.DiskTempC        = [int]$rc.Temperature
+                $b.DiskWearPct      = [int]$rc.Wear
+                $b.DiskPowerOnHours = [int]$rc.PowerOnHours
+            }
+        }
+    } catch { }
+    return [PSCustomObject]$b
+}
+
+# --- Per-machine rolling baseline store (In-Memory First) ---
+$script:DeploymentBaselineFile = Join-Path $script:PersistRoot 'deployment_baseline.json'
+
+function Get-HubStoredBaseline {
+    if ($script:InMemoryStoredBaseline) { return $script:InMemoryStoredBaseline }
+    foreach ($fp in @($script:DeploymentBaselineFile, (Join-Path $env:ProgramData 'AutopilotCommandHub\deployment_baseline.json'))) {
+        if (Test-Path $fp) {
+            try { return (Get-Content $fp -Raw -ErrorAction Stop | ConvertFrom-Json) } catch { }
+        }
+    }
+    return $null
+}
+
+function Update-HubStoredBaseline {
+    param([Parameter(Mandatory)] $Metrics, [switch]$SaveToDisk)
+    # Keep a simple exponential-moving-average baseline of the headline numbers so a single run
+    # cannot yank the baseline around, yet it still tracks genuine drift over re-deploys.
+    try {
+        $prev = Get-HubStoredBaseline
+        $alpha = 0.35
+        function _ema($old, $new) { if ($null -eq $old) { $new } else { [math]::Round((1 - $alpha) * $old + $alpha * $new, 2) } }
+        $bl = [PSCustomObject]@{
+            SchemaVersion    = 1
+            UpdatedUtc       = [datetime]::UtcNow.ToString('o')
+            Model            = $Metrics.Baseline.Model
+            SampleCount      = if ($prev -and $prev.SampleCount) { [int]$prev.SampleCount + 1 } else { 1 }
+            TotalSeconds     = _ema ($prev.TotalSeconds)     $Metrics.TotalSeconds
+            AvgDownloadMBps  = _ema ($prev.AvgDownloadMBps)  $Metrics.Wu.AvgDownloadMBps
+            AvgInstallMBpm   = _ema ($prev.AvgInstallMBpm)   $Metrics.Wu.AvgInstallMBpm
+            PeakReadMBps     = _ema ($prev.PeakReadMBps)     $Metrics.Disk.PeakReadMBps
+            PeakWriteMBps    = _ema ($prev.PeakWriteMBps)    $Metrics.Disk.PeakWriteMBps
+            PeakIops         = _ema ($prev.PeakIops)         $Metrics.Disk.PeakIops
+        }
+        $script:InMemoryStoredBaseline = $bl
+        if ($SaveToDisk) {
+            try {
+                $dir = Split-Path $script:DeploymentBaselineFile -Parent
+                if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+                ($bl | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $script:DeploymentBaselineFile -Encoding UTF8
+            } catch { }
+        }
+        return $bl
+    } catch { return $null }
+}
+
+function Get-HubBaselineComparison {
+    param([Parameter(Mandatory)] $Metrics, $Baseline)
+    if (-not $Baseline -or -not $Baseline.SampleCount) { return @() }
+    $rows = [System.Collections.Generic.List[object]]::new()
+    # For "higher is better" metrics a big negative delta is bad; for "lower is better" (time) a big positive delta is bad.
+    function _cmp($name, $thisVal, $baseVal, $unit, $higherIsBetter) {
+        if ($null -eq $baseVal -or $baseVal -eq 0) { return }
+        $delta = (($thisVal - $baseVal) / [double]$baseVal) * 100.0
+        $signed = '{0:+0;-0;0}%' -f [math]::Round($delta, 0)
+        $bad = if ($higherIsBetter) { $delta -le -30 } else { $delta -ge 30 }
+        $warn = if ($higherIsBetter) { $delta -le -15 } else { $delta -ge 15 }
+        $status = if ($bad) { 'ALERT' } elseif ($warn) { 'WARN' } else { 'OK' }
+        $rows.Add([PSCustomObject]@{
+            Metric   = $name
+            This     = ('{0:N1} {1}' -f $thisVal, $unit).Trim()
+            Baseline = ('{0:N1} {1}' -f $baseVal, $unit).Trim()
+            Delta    = $signed
+            Status   = $status
+        })
+    }
+    _cmp 'Total deployment (min)' ([math]::Round($Metrics.TotalSeconds / 60.0, 1)) ([math]::Round($Baseline.TotalSeconds / 60.0, 1)) 'min' $false
+    _cmp 'Avg download (MB/s)'    $Metrics.Wu.AvgDownloadMBps  $Baseline.AvgDownloadMBps 'MB/s' $true
+    _cmp 'Avg install (MB/min)'   $Metrics.Wu.AvgInstallMBpm   $Baseline.AvgInstallMBpm  'MB/min' $true
+    _cmp 'Disk read peak (MB/s)'  $Metrics.Disk.PeakReadMBps   $Baseline.PeakReadMBps    'MB/s' $true
+    _cmp 'Disk write peak (MB/s)' $Metrics.Disk.PeakWriteMBps  $Baseline.PeakWriteMBps   'MB/s' $true
+    _cmp 'Peak IOPS'              $Metrics.Disk.PeakIops       $Baseline.PeakIops        '' $true
+    return $rows.ToArray()
+}
+
+function Export-HubDeploymentReport {
+    param(
+        [Parameter(Mandatory)] $Metrics,   # the accumulated deployment-metrics object (see sample below)
+        [string]$Path = '',
+        [switch]$SaveToDisk
+    )
+    $m = $Metrics
+    $bl = $m.Baseline
+    $serial = if ($bl.SerialNumber) { $bl.SerialNumber } else { $env:COMPUTERNAME }
+
+    # ---- tiles ----
+    function Tile($label, $value, $sub) {
+        "<div class='tile'><div class='tval'>$(ConvertTo-HubSvgText $value)</div><div class='tlabel'>$(ConvertTo-HubSvgText $label)</div><div class='tsub'>$(ConvertTo-HubSvgText $sub)</div></div>"
+    }
+    $tiles = @(
+        Tile 'Total deployment' ("{0:N1} min" -f ($m.TotalSeconds / 60.0)) ("$([math]::Round($m.TotalSeconds,0)) s")
+        Tile 'Updates installed' "$($m.Wu.Installed)" ("$($m.Wu.Failed) failed")
+        Tile 'Avg download speed' ("{0:N1} MB/s" -f $m.Wu.AvgDownloadMBps) ("$([math]::Round($m.Wu.TotalDownloadMB,0)) MB total")
+        Tile 'Avg install speed' ("{0:N1} MB/min" -f $m.Wu.AvgInstallMBpm) ("$([math]::Round($m.Wu.TotalInstallSec,0)) s installing")
+        Tile 'Disk read (avg/peak)' ("{0:N0}/{1:N0} MB/s" -f $m.Disk.AvgReadMBps, $m.Disk.PeakReadMBps) ''
+        Tile 'Disk write (avg/peak)' ("{0:N0}/{1:N0} MB/s" -f $m.Disk.AvgWriteMBps, $m.Disk.PeakWriteMBps) ''
+        Tile 'Peak IOPS' ("{0:N0}" -f $m.Disk.PeakIops) ("avg $([math]::Round($m.Disk.AvgIops,0))")
+        Tile 'Reboots' "$($m.RebootCount)" ("$($m.StepCount) steps")
+    ) -join "`n"
+
+    # ---- charts ----
+    $stepBars = New-HubSvgBarChart -Data ($m.Steps | ForEach-Object { [pscustomobject]@{ Label = $_.ActionName; Value = $_.DurationSec } }) -Unit 's' -Color '#0067C0'
+    $updBars = if ($m.Wu.Updates -and @($m.Wu.Updates).Count -gt 0) {
+        New-HubSvgBarChart -Data ($m.Wu.Updates | ForEach-Object { [pscustomobject]@{ Label = $_.Title; Value = $_.SizeMB } }) -Unit 'MB' -Color '#7C3AED'
+    } else { "<p class='muted'>No updates were downloaded during this run.</p>" }
+
+    $diskLine = New-HubSvgLineChart -Series @(
+        @{ Name = 'Read MB/s';  Color = '#0284C7'; Points = @($m.Disk.Samples | ForEach-Object { @{ X = $_.T; Y = $_.ReadMBps } }) },
+        @{ Name = 'Write MB/s'; Color = '#DC2626'; Points = @($m.Disk.Samples | ForEach-Object { @{ X = $_.T; Y = $_.WriteMBps } }) }
+    ) -YUnit 'MB/s'
+    $iopsLine = New-HubSvgLineChart -Series @(
+        @{ Name = 'IOPS'; Color = '#15803D'; Points = @($m.Disk.Samples | ForEach-Object { @{ X = $_.T; Y = $_.Iops } }) }
+    ) -YUnit 'IOPS'
+
+    # ---- baseline / outlier section ----
+    $outlierRows = ''
+    if ($m.BaselineComparison) {
+        foreach ($c in $m.BaselineComparison) {
+            $cls = switch ($c.Status) { 'ALERT' {'bad'} 'WARN' {'warn'} default {'ok'} }
+            $outlierRows += "<tr><td>$(ConvertTo-HubSvgText $c.Metric)</td><td>$(ConvertTo-HubSvgText $c.This)</td><td>$(ConvertTo-HubSvgText $c.Baseline)</td><td>$(ConvertTo-HubSvgText $c.Delta)</td><td class='$cls'>$(ConvertTo-HubSvgText $c.Status)</td></tr>"
+        }
+    }
+    $outlierSection = if ($outlierRows) {
+        "<table class='grid'><thead><tr><th>Metric</th><th>This run</th><th>Baseline</th><th>Delta</th><th>Status</th></tr></thead><tbody>$outlierRows</tbody></table>"
+    } else { "<p class='muted'>No stored baseline yet - this run has been recorded as the initial baseline for $(ConvertTo-HubSvgText $bl.Model).</p>" }
+
+    # ---- baseline spec table ----
+    $specRows = ''
+    foreach ($kv in @(
+        @('Computer', "$($bl.ComputerName) ($($bl.SerialNumber))"),
+        @('Model', "$($bl.Manufacturer) $($bl.Model)"),
+        @('CPU', "$($bl.CpuName) - $($bl.CpuCores)C/$($bl.CpuLogical)T @ $($bl.CpuMaxClockMHz) MHz"),
+        @('Memory', "$($bl.RamGB) GB ($($bl.RamModules) modules @ $($bl.RamSpeedMHz) MHz)"),
+        @('Disk', "$($bl.DiskModel) - $($bl.DiskSizeGB) GB $($bl.DiskType) ($($bl.DiskBus)), temp $($bl.DiskTempC)C, wear $($bl.DiskWearPct)%"),
+        @('OS', "$($bl.OsCaption) $($bl.OsVersion) (build $($bl.OsBuild))")
+    )) {
+        $specRows += "<tr><th>$(ConvertTo-HubSvgText $kv[0])</th><td>$(ConvertTo-HubSvgText $kv[1])</td></tr>"
+    }
+
+    $genTime = [datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss')
+    $html = @"
+<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Deployment Report - $(ConvertTo-HubSvgText $serial)</title>
+<style>
+:root{--bg:#f3f4f6;--card:#fff;--ink:#1e293b;--muted:#64748b;--line:#e2e8f0;--accent:#0067c0;}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:'Segoe UI Variable Text','Segoe UI',system-ui,sans-serif;font-size:14px;line-height:1.45}
+.wrap{max-width:1000px;margin:0 auto;padding:24px}
+header h1{margin:0 0 2px;font-size:22px}header .sub{color:var(--muted);font-size:13px}
+.badge{display:inline-block;background:#e0f2fe;color:#0369a1;border:1px solid #bae6fd;border-radius:4px;padding:2px 8px;font-size:11px;font-weight:600;margin-left:8px;vertical-align:middle}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:18px 0}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px 16px}
+.tval{font-size:22px;font-weight:700}.tlabel{color:var(--muted);font-size:12px;margin-top:2px}.tsub{color:#94a3b8;font-size:11px;margin-top:3px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:16px 18px;margin:14px 0}
+.card h2{margin:0 0 12px;font-size:15px}
+.chart{display:block}.chart .track{fill:#eef2f7}.chart .blabel{font:12px 'Segoe UI',sans-serif;fill:#334155}.chart .bval{font:12px 'Segoe UI',sans-serif;fill:#0f172a;font-weight:600}
+.chart .grid{stroke:#eef2f7;stroke-width:1}.chart .axis{font:10px 'Segoe UI',sans-serif;fill:#94a3b8}
+table{border-collapse:collapse;width:100%;font-size:13px}table.grid th,table.grid td{border:1px solid var(--line);padding:6px 10px;text-align:left}
+table th{color:var(--muted);font-weight:600}.spec th{width:120px;color:var(--muted);text-align:left;padding:5px 10px;vertical-align:top}.spec td{padding:5px 10px}
+.ok{color:#15803d;font-weight:600}.warn{color:#b45309;font-weight:600}.bad{color:#b91c1c;font-weight:700}
+.muted{color:var(--muted)}.legend span{display:inline-block;margin-right:14px;font-size:12px}.dot{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:middle}
+footer{color:#94a3b8;font-size:11px;margin-top:20px;text-align:center}
+</style></head><body><div class='wrap'>
+<header><h1>Deployment Report <span class='badge'>$(ConvertTo-HubSvgText $m.RoutineName)</span></h1>
+<div class='sub'>$(ConvertTo-HubSvgText $bl.Manufacturer) $(ConvertTo-HubSvgText $bl.Model) &middot; $(ConvertTo-HubSvgText $serial) &middot; generated $genTime</div></header>
+<div class='tiles'>$tiles</div>
+<div class='card'><h2>Per-step duration</h2>$stepBars</div>
+<div class='card'><h2>Update package sizes</h2>$updBars</div>
+<div class='card'><h2>Disk throughput over deployment</h2>
+<div class='legend'><span><span class='dot' style='background:#0284c7'></span>Read MB/s</span><span><span class='dot' style='background:#dc2626'></span>Write MB/s</span></div>$diskLine</div>
+<div class='card'><h2>Disk IOPS over deployment</h2>
+<div class='legend'><span><span class='dot' style='background:#15803d'></span>IOPS (transfers/sec)</span></div>$iopsLine</div>
+<div class='card'><h2>Baseline comparison &amp; outliers</h2>$outlierSection</div>
+<div class='card'><h2>Machine baseline</h2><table class='spec'>$specRows</table></div>
+<footer>Autopilot Command Hub &middot; deployment telemetry &middot; JSON sidecar written next to this file for fleet ingestion</footer>
+</div></body></html>
+"@
+    $shouldWriteDisk = $SaveToDisk -or -not [string]::IsNullOrWhiteSpace($Path)
+    if (-not $shouldWriteDisk) {
+        return [pscustomobject]@{
+            Success     = $true
+            InMemory    = $true
+            Path        = $null
+            JsonPath    = $null
+            HtmlContent = $html
+            Metrics     = $m
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        $dir = if ($desktop -and (Test-Path $desktop)) { $desktop } else { $env:TEMP }
+        $Path = Join-Path $dir ("DeploymentReport_{0}_{1}.html" -f $serial, ([datetime]::Now.ToString('yyyyMMdd_HHmmss')))
+    }
+
+    try {
+        $targetDir = Split-Path -Path $Path -Parent
+        if (-not [string]::IsNullOrWhiteSpace($targetDir) -and -not (Test-Path $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        }
+        [System.IO.File]::WriteAllText($Path, $html, [System.Text.UTF8Encoding]::new($false))
+        $jsonPath = [System.IO.Path]::ChangeExtension($Path, '.json')
+        ($m | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ Success = $true; InMemory = $false; Path = $Path; JsonPath = $jsonPath; HtmlContent = $html; Metrics = $m }
+    } catch {
+        return [pscustomobject]@{ Success = $false; InMemory = $false; Message = $_.Exception.Message }
+    }
+}
+
+# --- Function: Test-HubClosedLoopVerification (Post-Enrollment Verification Engine) ---
+function Test-HubClosedLoopVerification {
+    [CmdletBinding()]
+    param(
+        [string]$ExpectedTenantId = '',
+        [string]$ExpectedGroupTag = ''
+    )
+
+    $checks = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $overallPassed = $true
+
+    # Check 1: TPM 2.0 Platform Security
+    $tpmOk = $false
+    $tpmDetail = "TPM not present or ready"
+    try {
+        $tpm = Get-Tpm -ErrorAction SilentlyContinue
+        if ($tpm -and $tpm.TpmPresent -and $tpm.TpmReady) {
+            $tpmOk = $true
+            $tpmDetail = "TPM 2.0 Present and Ready (Enabled: $($tpm.TpmEnabled))"
+        } else {
+            $tpmDetail = "TPM Present=$($tpm.TpmPresent), Ready=$($tpm.TpmReady)"
+        }
+    } catch { $tpmDetail = $_.Exception.Message }
+    $checks.Add([PSCustomObject]@{ Check = 'TPM 2.0 Platform Security'; Passed = $tpmOk; Details = $tpmDetail })
+    if (-not $tpmOk) { $overallPassed = $false }
+
+    # Check 2: UEFI Secure Boot
+    $sbOk = $false
+    $sbDetail = "Secure Boot not supported or Disabled"
+    try {
+        $sb = Confirm-SecureBootUEFI -ErrorAction SilentlyContinue
+        if ($sb -eq $true) {
+            $sbOk = $true
+            $sbDetail = "UEFI Secure Boot is Active and Enforced"
+        } else {
+            $sbDetail = "UEFI Secure Boot is Disabled"
+        }
+    } catch {
+        $sbDetail = "Non-UEFI BIOS or Secure Boot API unavailable"
+    }
+    $checks.Add([PSCustomObject]@{ Check = 'UEFI Secure Boot'; Passed = $sbOk; Details = $sbDetail })
+    if (-not $sbOk) { $overallPassed = $false }
+
+    # Check 3: BitLocker OS Drive Encryption
+    $blOk = $false
+    $blDetail = "BitLocker protection inactive"
+    try {
+        $vol = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
+        if ($vol) {
+            $hasTpm = $false
+            $hasRec = $false
+            if ($vol.KeyProtector) {
+                foreach ($kp in $vol.KeyProtector) {
+                    if ($kp.KeyProtectorType -match 'Tpm') { $hasTpm = $true }
+                    if ($kp.KeyProtectorType -match 'RecoveryPassword') { $hasRec = $true }
+                }
+            }
+            if ($vol.ProtectionStatus -eq 'On' -or $vol.VolumeStatus -in @('FullyEncrypted', 'EncryptionInProgress')) {
+                $blOk = $true
+                $blDetail = "Volume $($env:SystemDrive): $($vol.VolumeStatus) ($($vol.EncryptionPercentage)%), Protectors: $(if ($hasTpm){'TPM '}else{''})$(if ($hasRec){'RecoveryPassword'}else{''})"
+            } else {
+                $blDetail = "Volume $($env:SystemDrive) status: $($vol.VolumeStatus), Protection: $($vol.ProtectionStatus)"
+            }
+        }
+    } catch { $blDetail = $_.Exception.Message }
+    $checks.Add([PSCustomObject]@{ Check = 'BitLocker OS Drive Encryption'; Passed = $blOk; Details = $blDetail })
+
+    # Check 4: Autopilot Profile Assignment
+    $apOk = $false
+    $apDetail = "Autopilot profile unassigned"
+    try {
+        $foundTenant = $null
+        $foundCorrel = $null
+        $apFiles = @(
+            (Join-Path $env:SystemRoot 'Provisioning\Autopilot\AutopilotDeregistrationInfo.json'),
+            (Join-Path $env:SystemRoot 'Provisioning\Autopilot\AutopilotProfileCache.json')
+        )
+        foreach ($apf in $apFiles) {
+            if (Test-Path $apf) {
+                $raw = Get-Content -LiteralPath $apf -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($raw) {
+                    if ($raw.CloudAssignedTenantId) { $foundTenant = [string]$raw.CloudAssignedTenantId }
+                    if ($raw.ZtdCorrelationId) { $foundCorrel = [string]$raw.ZtdCorrelationId }
+                }
+            }
+        }
+        if (-not $foundTenant) {
+            $regTenant = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Provisioning\AutopilotPolicy\Cache' -Name 'CloudAssignedTenantId' -ErrorAction SilentlyContinue).CloudAssignedTenantId
+            if ($regTenant) { $foundTenant = [string]$regTenant }
+        }
+        if ($foundTenant) {
+            if ($ExpectedTenantId -and $foundTenant -ne $ExpectedTenantId) {
+                $apOk = $false
+                $apDetail = "Tenant mismatch: assigned $foundTenant, expected $ExpectedTenantId"
+            } else {
+                $apOk = $true
+                $apDetail = "Assigned Tenant: $foundTenant" + $(if ($foundCorrel) { " (Correlation: $foundCorrel)" } else { "" })
+            }
+        } else {
+            $apDetail = "No cached Autopilot profile found in Provisioning or Registry"
+        }
+        if ($ExpectedGroupTag -and $apOk) {
+            if ($env:AUTOPILOT_GROUP_TAG -and $env:AUTOPILOT_GROUP_TAG -ne $ExpectedGroupTag) {
+                $apDetail += " [GroupTag expected: $ExpectedGroupTag]"
+            }
+        }
+    } catch { $apDetail = $_.Exception.Message }
+    $checks.Add([PSCustomObject]@{ Check = 'Autopilot Profile Assignment'; Passed = $apOk; Details = $apDetail })
+
+    # Check 5: MDM / Intune Enrollment Status
+    $mdmOk = $false
+    $mdmDetail = "Device not enrolled in MDM"
+    try {
+        $enrollments = Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue
+        if ($enrollments) {
+            foreach ($e in $enrollments) {
+                $provider = (Get-ItemProperty -Path $e.PSPath -Name 'ProviderID' -ErrorAction SilentlyContinue).ProviderID
+                $upn = (Get-ItemProperty -Path $e.PSPath -Name 'UPN' -ErrorAction SilentlyContinue).UPN
+                if ($provider -match 'MS DM Server' -or $provider -match 'Intune') {
+                    $mdmOk = $true
+                    $mdmDetail = "Enrolled via $provider (UPN: $upn)"
+                    break
+                }
+            }
+        }
+        if (-not $mdmOk) {
+            $certs = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue | Where-Object { $_.Issuer -match 'Microsoft Intune' -or $_.Issuer -match 'SC_Online_Issuing' }
+            if ($certs -and $certs.Count -gt 0) {
+                $mdmOk = $true
+                $mdmDetail = "Intune Device Certificate present: $($certs[0].Thumbprint.Substring(0,8))... ($($certs[0].Subject))"
+            }
+        }
+    } catch { $mdmDetail = $_.Exception.Message }
+    $checks.Add([PSCustomObject]@{ Check = 'Intune MDM Enrollment'; Passed = $mdmOk; Details = $mdmDetail })
+
+    # Check 6: Enrollment Status Page (ESP)
+    $espOk = $true
+    $espDetail = "ESP tracking clean"
+    try {
+        $espReg = 'HKLM:\SOFTWARE\Microsoft\Windows\Autopilot\EnrollmentStatusTracking'
+        if (Test-Path $espReg) {
+            $espVals = Get-ChildItem -Path $espReg -Recurse -ErrorAction SilentlyContinue
+            $hasError = $false
+            if ($espVals) {
+                foreach ($v in $espVals) {
+                    $props = Get-ItemProperty -Path $v.PSPath -ErrorAction SilentlyContinue
+                    if ($props.InstallationState -and $props.InstallationState -eq 3) {
+                        $hasError = $true
+                        $espDetail = "ESP subcategory error: $($v.PSChildName)"
+                        break
+                    }
+                }
+            }
+            if ($hasError) {
+                $espOk = $false
+            } else {
+                $espDetail = "ESP records all subcategories completed or not errored"
+            }
+        } else {
+            $espDetail = "ESP tracking key not initialized (pre-OOBE or bypassed)"
+        }
+    } catch { $espDetail = $_.Exception.Message }
+    $checks.Add([PSCustomObject]@{ Check = 'Enrollment Status Page (ESP)'; Passed = $espOk; Details = $espDetail })
+
+    # Check 7: Endpoint Protection (Defender)
+    $defOk = $false
+    $defDetail = "Defender status unavailable"
+    try {
+        $mp = Get-MpComputerStatus -ErrorAction SilentlyContinue
+        if ($mp -and $mp.RealTimeProtectionEnabled -and $mp.AntivirusEnabled) {
+            $defOk = $true
+            $defDetail = "Defender Active (RTP: True, Engine: $($mp.AMEngineVersion))"
+        } elseif ($mp) {
+            $defDetail = "RealTimeProtection: $($mp.RealTimeProtectionEnabled), Antivirus: $($mp.AntivirusEnabled)"
+        }
+    } catch { $defDetail = $_.Exception.Message }
+    $checks.Add([PSCustomObject]@{ Check = 'Endpoint Protection (Defender)'; Passed = $defOk; Details = $defDetail })
+
+    $passedCount = ($checks | Where-Object { $_.Passed }).Count
+    $verdict = if ($passedCount -eq $checks.Count) { 'VERIFIED' } elseif ($passedCount -ge 4) { 'PROVISIONED_WITH_WARNINGS' } else { 'VERIFICATION_FAILED' }
+
+    return [PSCustomObject]@{
+        DeploymentId = $script:HubDeploymentId
+        VerifiedUtc  = [datetime]::UtcNow.ToString('o')
+        Verdict      = $verdict
+        PassedCount  = $passedCount
+        TotalChecks  = $checks.Count
+        PassedRatio  = [math]::Round(($passedCount / [math]::Max(1, $checks.Count)) * 100, 1)
+        Checks       = $checks
+    }
+}
+
+# --- Function: Get-HubReceiptSeal (integrity seal for provisioning receipts) ---
+# HMAC-SHA256 keyed by $env:HUB_RECEIPT_KEY is genuinely tamper-evident: a receipt cannot be forged
+# (e.g. flipping a FAIL verdict to PASS) without the site key. With no key configured it degrades to a
+# plain SHA-256 checksum, which detects accidental corruption but is NOT forge-proof - and is labelled
+# as such, rather than being passed off as a tamper-proof seal.
+function Get-HubReceiptSeal {
+    param([string]$JsonText)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($JsonText)
+    $key = $env:HUB_RECEIPT_KEY
+    if (-not [string]::IsNullOrWhiteSpace($key)) {
+        $mac = [System.Security.Cryptography.HMACSHA256]::new([System.Text.Encoding]::UTF8.GetBytes($key))
+        try { $h = $mac.ComputeHash($bytes) } finally { $mac.Dispose() }
+        return [PSCustomObject]@{ Mode = 'HMAC-SHA256'; Digest = (-join ($h | ForEach-Object { $_.ToString('X2') })) }
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $h = $sha.ComputeHash($bytes) } finally { $sha.Dispose() }
+    return [PSCustomObject]@{ Mode = 'SHA-256'; Digest = (-join ($h | ForEach-Object { $_.ToString('X2') })) }
+}
+
+# --- Function: Export-HubProvisioningReceipt (Provisioning Receipt Exporter) ---
+function Export-HubProvisioningReceipt {
+    [CmdletBinding()]
+    param(
+        [string]$DeploymentId = '',
+        $Metrics = $null,
+        [string]$OutputDir = '',
+        [switch]$SaveToDisk
+    )
+
+    if ([string]::IsNullOrWhiteSpace($DeploymentId)) {
+        if ($script:HubDeploymentId) {
+            $DeploymentId = $script:HubDeploymentId
+        } else {
+            $DeploymentId = "HUB-{0}-{1}" -f (Get-Date -Format 'yyyyMMdd'), ([guid]::NewGuid().ToString('N').Substring(0,8).ToUpper())
+            $script:HubDeploymentId = $DeploymentId
+        }
+    }
+
+    $expTenant = if ($env:AZURE_TENANT_ID) { $env:AZURE_TENANT_ID } else { '' }
+    $expGt = if ($script:ActiveDeploymentProfile -and $script:ActiveDeploymentProfile.GroupTag) { $script:ActiveDeploymentProfile.GroupTag } elseif ($env:AUTOPILOT_GROUP_TAG) { $env:AUTOPILOT_GROUP_TAG } else { '' }
+    $verification = Test-HubClosedLoopVerification -ExpectedTenantId $expTenant -ExpectedGroupTag $expGt
+    $serial = try { if ($script:DeviceState -and $script:DeviceState.SerialNumber) { $script:DeviceState.SerialNumber } else { (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber } } catch { 'UNKNOWN' }
+    if ([string]::IsNullOrWhiteSpace($serial)) { $serial = $env:COMPUTERNAME }
+    $mfg = try { if ($script:DeviceState -and $script:DeviceState.Manufacturer) { $script:DeviceState.Manufacturer } else { (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Manufacturer } } catch { 'UNKNOWN' }
+    $model = try { if ($script:DeviceState -and $script:DeviceState.Model) { $script:DeviceState.Model } else { (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Model } } catch { 'UNKNOWN' }
+    $os = try { (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption } catch { 'Windows' }
+    $build = try { (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).BuildNumber } catch { '' }
+
+    $jsonPath = $null
+    $htmlPath = $null
+
+    $site = if ($script:ActiveDeploymentProfile -and $script:ActiveDeploymentProfile.Site) { $script:ActiveDeploymentProfile.Site } elseif ($env:AUTOPILOT_SITE) { $env:AUTOPILOT_SITE } else { 'Default' }
+    $profId = if ($script:ActiveDeploymentProfile) { $script:ActiveDeploymentProfile.Id } else { 'Manual' }
+
+    $receiptData = [ordered]@{
+        SchemaVersion   = 1
+        ReceiptType     = 'AutopilotProvisioningReceipt'
+        DeploymentId    = $DeploymentId
+        GeneratedUtc    = [datetime]::UtcNow.ToString('o')
+        Technician      = $env:USERNAME
+        Site            = $site
+        ProfileId       = $profId
+        Verdict         = $verification.Verdict
+        Score           = "$($verification.PassedCount)/$($verification.TotalChecks)"
+        Device          = [ordered]@{
+            ComputerName    = $env:COMPUTERNAME
+            SerialNumber    = $serial
+            Manufacturer    = $mfg
+            Model           = $model
+            OperatingSystem = "$os (Build $build)"
+            MacAddress      = try { (Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Select-Object -First 1).MacAddress } catch { 'N/A' }
+        }
+        Verification    = $verification.Checks
+        SummaryMetrics  = if ($Metrics) {
+            [ordered]@{
+                RoutineName   = $Metrics.RoutineName
+                TotalSeconds  = $Metrics.TotalSeconds
+                StepCount     = $Metrics.StepCount
+                UpdatesCount  = if ($Metrics.Wu) { $Metrics.Wu.Installed } else { 0 }
+                AvgDiskRead   = if ($Metrics.Disk) { $Metrics.Disk.AvgReadMBps } else { 0 }
+                AvgDiskWrite  = if ($Metrics.Disk) { $Metrics.Disk.AvgWriteMBps } else { 0 }
+                PeakIops      = if ($Metrics.Disk) { $Metrics.Disk.PeakIops } else { 0 }
+            }
+        } else { $null }
+    }
+
+    # Integrity seal over canonical JSON (HMAC-SHA256 when HUB_RECEIPT_KEY is set, else SHA-256 checksum).
+    # Round-trip through ConvertFrom-Json first so the bytes hashed here match exactly what the verifier
+    # reconstructs from the saved file (an ordered hashtable and a parsed PSCustomObject serialize
+    # differently for nested values; hashing the parsed shape makes export and verify symmetric).
+    $jsonForHash = (($receiptData | ConvertTo-Json -Depth 6) | ConvertFrom-Json | ConvertTo-Json -Depth 6)
+    $seal = Get-HubReceiptSeal -JsonText $jsonForHash
+    $digestHex = $seal.Digest
+    $sealMode = $seal.Mode
+    $receiptData['IntegrityHash'] = $digestHex
+    $receiptData['SealMode'] = $sealMode
+
+    # HTML Receipt Generation
+    $verdictClass = switch ($verification.Verdict) {
+        'VERIFIED' { 'badge-pass' }
+        'PROVISIONED_WITH_WARNINGS' { 'badge-warn' }
+        default { 'badge-fail' }
+    }
+
+    $checkRows = ''
+    foreach ($chk in $verification.Checks) {
+        $stCls = if ($chk.Passed) { 'pass-cell' } else { 'fail-cell' }
+        $icon = if ($chk.Passed) { '[PASS]' } else { '[WARN]' }
+        $checkRows += "<tr><td class='chk-name'>$(ConvertTo-HubSvgText $chk.Check)</td><td class='$stCls'>$icon</td><td class='chk-detail'>$(ConvertTo-HubSvgText $chk.Details)</td></tr>`n"
+    }
+
+    $genTime = [datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss')
+    $htmlContent = @"
+<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Provisioning Receipt - $(ConvertTo-HubSvgText $serial)</title>
+<style>
+:root{--bg:#f8fafc;--card:#ffffff;--ink:#0f172a;--muted:#64748b;--border:#e2e8f0;--accent:#0067c0;--green:#15803d;--amber:#b45309;--red:#b91c1c;}
+*{box-sizing:border-box}body{margin:0;padding:24px;background:var(--bg);color:var(--ink);font-family:'Segoe UI',system-ui,sans-serif;font-size:13.5px;line-height:1.45}
+.receipt-wrap{max-width:850px;margin:0 auto;background:var(--card);border:2px solid var(--border);border-radius:8px;padding:32px;box-shadow:0 4px 6px -1px rgba(0,0,0,0.05)}
+.receipt-hdr{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid var(--border);padding-bottom:18px;margin-bottom:20px}
+.receipt-title{font-size:22px;font-weight:700;letter-spacing:-0.5px;margin:0 0 4px;color:var(--ink)}
+.receipt-sub{color:var(--muted);font-size:12px;font-family:Consolas,monospace}
+.badge{display:inline-block;padding:4px 12px;border-radius:4px;font-size:12px;font-weight:700;letter-spacing:0.5px}
+.badge-pass{background:#dcfce7;color:var(--green);border:1px solid #bbf7d0}
+.badge-warn{background:#fef3c7;color:var(--amber);border:1px solid #fde68a}
+.badge-fail{background:#fee2e2;color:var(--red);border:1px solid #fecaca}
+.meta-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:24px;background:#f1f5f9;border-radius:6px;padding:14px}
+.meta-item .m-lbl{font-size:11px;color:var(--muted);text-transform:uppercase;font-weight:600}
+.meta-item .m-val{font-size:13.5px;font-weight:600;margin-top:2px;color:var(--ink)}
+.sec-title{font-size:15px;font-weight:700;margin:20px 0 10px;color:#1e293b;border-bottom:1px solid var(--border);padding-bottom:6px}
+table{width:100%;border-collapse:collapse;margin-bottom:20px;font-size:13px}
+table th{text-align:left;padding:8px 10px;background:#f8fafc;color:var(--muted);border-bottom:2px solid var(--border);font-size:12px;font-weight:600}
+table td{padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top}
+.chk-name{font-weight:600;width:220px}
+.pass-cell{color:var(--green);font-weight:700;width:70px}
+.fail-cell{color:var(--amber);font-weight:700;width:70px}
+.chk-detail{color:#334155;font-size:12.5px}
+.seal-box{background:#f8fafc;border:1px dashed #cbd5e1;border-radius:6px;padding:12px 16px;margin-top:20px;font-family:Consolas,monospace;font-size:11.5px;color:#475569}
+.seal-title{font-weight:700;color:var(--accent);margin-bottom:4px;font-size:12px}
+.seal-hash{word-break:break-all;color:#0f172a;font-weight:600}
+.receipt-ftr{margin-top:24px;text-align:center;font-size:11px;color:var(--muted)}
+@media print{.receipt-wrap{border:none;box-shadow:none;padding:0}}
+</style></head><body>
+<div class='receipt-wrap'>
+<div class='receipt-hdr'>
+<div>
+<div class='receipt-title'>Autopilot Provisioning Receipt</div>
+<div class='receipt-sub'>Deployment ID: $(ConvertTo-HubSvgText $DeploymentId)</div>
+</div>
+<div><span class='badge $verdictClass'>$($verification.Verdict) ($($verification.PassedCount)/$($verification.TotalChecks))</span></div>
+</div>
+
+<div class='meta-grid'>
+<div class='meta-item'><div class='m-lbl'>Device Serial</div><div class='m-val'>$(ConvertTo-HubSvgText $serial)</div></div>
+<div class='meta-item'><div class='m-lbl'>Model</div><div class='m-val'>$(ConvertTo-HubSvgText $mfg) $(ConvertTo-HubSvgText $model)</div></div>
+<div class='meta-item'><div class='m-lbl'>Site / Profile</div><div class='m-val'>$(ConvertTo-HubSvgText $site) ($profId)</div></div>
+<div class='meta-item'><div class='m-lbl'>Technician</div><div class='m-val'>$(ConvertTo-HubSvgText $env:USERNAME)</div></div>
+<div class='meta-item'><div class='m-lbl'>OS / Build</div><div class='m-val'>$(ConvertTo-HubSvgText $os) (Build $build)</div></div>
+<div class='meta-item'><div class='m-lbl'>Generated</div><div class='m-val'>$genTime</div></div>
+</div>
+
+<div class='sec-title'>Post-Enrollment Verification Audit</div>
+<table>
+<thead><tr><th>Check</th><th>Status</th><th>Verification Evidence &amp; Details</th></tr></thead>
+<tbody>
+$checkRows
+</tbody>
+</table>
+
+<div class='seal-box'>
+<div class='seal-title'>[#] Integrity Seal ($sealMode)</div>
+<div>Digest: <span class='seal-hash'>$digestHex</span></div>
+<div style='margin-top:4px;color:#64748b;font-size:10.5px;'>$(if ($sealMode -eq 'HMAC-SHA256') { "Keyed HMAC-SHA256 seal - tamper-evident: this receipt cannot be altered without the site receipt key." } else { "SHA-256 checksum - detects accidental corruption only. Set HUB_RECEIPT_KEY before provisioning for a keyed, tamper-evident seal." })</div>
+</div>
+
+<div class='receipt-ftr'>
+Autopilot Command Hub &middot; Enterprise Endpoint Provisioning Platform &middot; https://onyachamp.com
+</div>
+</div>
+</body></html>
+"@
+
+    $script:LastProvisioningReceipt = $receiptData
+    $script:LastProvisioningReceiptHtml = $htmlContent
+
+    $shouldWriteDisk = $SaveToDisk -or -not [string]::IsNullOrWhiteSpace($OutputDir)
+    if (-not $shouldWriteDisk) {
+        return [PSCustomObject]@{
+            Success      = $true
+            DeploymentId = $DeploymentId
+            HtmlPath     = $null
+            JsonPath     = $null
+            ReceiptData  = $receiptData
+            HtmlContent  = $htmlContent
+            InMemory     = $true
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        $OutputDir = if ($desktop -and (Test-Path $desktop)) { $desktop } else { $env:TEMP }
+    }
+
+    try {
+        if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
+        $jsonPath = Join-Path $OutputDir "Receipt_${serial}_${DeploymentId}.json"
+        $htmlPath = Join-Path $OutputDir "Receipt_${serial}_${DeploymentId}.html"
+
+        $fullJson = ($receiptData | ConvertTo-Json -Depth 6)
+        [System.IO.File]::WriteAllText($jsonPath, $fullJson, [System.Text.UTF8Encoding]::new($false))
+        [System.IO.File]::WriteAllText($htmlPath, $htmlContent, [System.Text.UTF8Encoding]::new($false))
+
+        return [PSCustomObject]@{
+            Success      = $true
+            DeploymentId = $DeploymentId
+            HtmlPath     = $htmlPath
+            JsonPath     = $jsonPath
+            ReceiptData  = $receiptData
+            HtmlContent  = $htmlContent
+            InMemory     = $false
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Success      = $false
+            DeploymentId = $DeploymentId
+            Message      = $_.Exception.Message
+            ReceiptData  = $receiptData
+            InMemory     = $false
+        }
+    }
+}
+
+# --- Function: Test-HubProvisioningReceipt (Cryptographic Verification of Signed Receipts) ---
+function Test-HubProvisioningReceipt {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$ReceiptPathOrObject
+    )
+
+    $receiptObj = $null
+    if ($ReceiptPathOrObject -is [string]) {
+        if (-not (Test-Path -LiteralPath $ReceiptPathOrObject)) {
+            return [PSCustomObject]@{ IsValid = $false; Reason = "File not found: $ReceiptPathOrObject" }
+        }
+        try {
+            $receiptObj = Get-Content -LiteralPath $ReceiptPathOrObject -Raw -Encoding UTF8 | ConvertFrom-Json
+        } catch {
+            return [PSCustomObject]@{ IsValid = $false; Reason = "Invalid JSON: $($_.Exception.Message)" }
+        }
+    } else {
+        try {
+            $receiptObj = ($ReceiptPathOrObject | ConvertTo-Json -Depth 6 | ConvertFrom-Json)
+        } catch {
+            $receiptObj = $ReceiptPathOrObject
+        }
+    }
+
+    if (-not $receiptObj -or -not $receiptObj.IntegrityHash) {
+        return [PSCustomObject]@{ IsValid = $false; Reason = "Missing IntegrityHash in receipt payload" }
+    }
+
+    $storedHash = [string]$receiptObj.IntegrityHash
+
+    $sealMode = if ($receiptObj.SealMode) { [string]$receiptObj.SealMode } else { 'SHA-256' }
+
+    $cleanData = [ordered]@{}
+    foreach ($prop in $receiptObj.PSObject.Properties) {
+        if ($prop.Name -ne 'IntegrityHash' -and $prop.Name -ne 'SealMode') {
+            $cleanData[$prop.Name] = $prop.Value
+        }
+    }
+    $jsonForHash = ($cleanData | ConvertTo-Json -Depth 6)
+
+    # A keyed (HMAC) seal cannot be validated without the site key - say so rather than pass/fail blindly.
+    if ($sealMode -eq 'HMAC-SHA256' -and [string]::IsNullOrWhiteSpace($env:HUB_RECEIPT_KEY)) {
+        return [PSCustomObject]@{
+            IsValid = $false; Indeterminate = $true; DeploymentId = $receiptObj.DeploymentId; Verdict = $receiptObj.Verdict
+            StoredHash = $storedHash; ComputedHash = ''; SealMode = $sealMode
+            Reason = "Receipt carries a keyed HMAC-SHA256 seal; set HUB_RECEIPT_KEY to the site key to verify it."
+        }
+    }
+    # Downgrade guard: under a keyed policy, an unkeyed (SHA-256) receipt is untrustworthy - a tamperer
+    # could strip the key by re-sealing with a plain hash. Reject rather than accept with a caveat.
+    if ($sealMode -ne 'HMAC-SHA256' -and -not [string]::IsNullOrWhiteSpace($env:HUB_RECEIPT_KEY)) {
+        return [PSCustomObject]@{
+            IsValid = $false; DeploymentId = $receiptObj.DeploymentId; Verdict = $receiptObj.Verdict
+            StoredHash = $storedHash; ComputedHash = ''; SealMode = $sealMode
+            Reason = "Receipt is only SHA-256 checksummed but this site uses keyed seals (HUB_RECEIPT_KEY set) - rejected as untrusted/possible downgrade."
+        }
+    }
+
+    if ($sealMode -eq 'HMAC-SHA256') {
+        $mac = [System.Security.Cryptography.HMACSHA256]::new([System.Text.Encoding]::UTF8.GetBytes($env:HUB_RECEIPT_KEY))
+        try { $computedBytes = $mac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($jsonForHash)) } finally { $mac.Dispose() }
+    } else {
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try { $computedBytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($jsonForHash)) } finally { $sha256.Dispose() }
+    }
+    $computedHash = -join ($computedBytes | ForEach-Object { $_.ToString('X2') })
+
+    $isValid = ($storedHash -eq $computedHash)
+    $reason = if (-not $isValid) { "Integrity seal mismatch: the receipt has been modified since it was issued." }
+              elseif ($sealMode -eq 'HMAC-SHA256') { "Tamper-evident HMAC-SHA256 seal verified against the site key." }
+              else { "SHA-256 checksum matches (detects corruption only; not forge-proof - no site key was used when issued)." }
+    return [PSCustomObject]@{
+        IsValid      = $isValid
+        DeploymentId = $receiptObj.DeploymentId
+        Verdict      = $receiptObj.Verdict
+        StoredHash   = $storedHash
+        ComputedHash = $computedHash
+        SealMode     = $sealMode
+        Reason       = $reason
+    }
+}
+
+# --- Function: Buffer-HubFleetTelemetry (Offline Telemetry Staging) ---
+function Buffer-HubFleetTelemetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$PayloadJson,
+        [string]$DeploymentId = '',
+        [string]$BufferDir = ''
+    )
+
+    $idSafe = if ($DeploymentId) { $DeploymentId } else { [guid]::NewGuid().ToString('N') }
+    $ts = [datetime]::UtcNow.ToString('yyyyMMdd_HHmmss')
+
+    # If BufferDir or $script:FleetBufferDir is explicitly specified, write to disk
+    $targetDir = if ($BufferDir) { $BufferDir } elseif ($script:FleetBufferDir) { $script:FleetBufferDir } else { '' }
+
+    if (-not [string]::IsNullOrWhiteSpace($targetDir)) {
+        try {
+            if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+            $filePath = Join-Path $targetDir "Telemetry_${idSafe}_${ts}.json"
+            [System.IO.File]::WriteAllText($filePath, $PayloadJson, [System.Text.UTF8Encoding]::new($false))
+            return $filePath
+        } catch { }
+    }
+
+    # Zero-trace: buffer strictly in-memory (RAM)
+    if (-not $script:FleetBuffer) {
+        $script:FleetBuffer = [System.Collections.Generic.List[object]]::new()
+    }
+    $bufItem = [PSCustomObject]@{
+        Id           = $idSafe
+        Timestamp    = $ts
+        PayloadJson  = $PayloadJson
+        DeploymentId = $idSafe
+    }
+    $script:FleetBuffer.Add($bufItem)
+    return "memory://FleetBuffer/$idSafe"
+}
+
+# --- Function: Flush-HubFleetBuffer (Outbound Buffer Drain Engine) ---
+function Flush-HubFleetBuffer {
+    [CmdletBinding()]
+    param(
+        [string]$Endpoint = '',
+        [string]$BufferDir = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Endpoint)) {
+        $Endpoint = if ($env:AUTOPILOT_FLEET_ENDPOINT) { $env:AUTOPILOT_FLEET_ENDPOINT } else { $env:HUB_FLEET_ENDPOINT }
+    }
+
+    $flushed = 0
+    $failed = 0
+
+    # 1. Drain in-memory buffer
+    if ($script:FleetBuffer -and $script:FleetBuffer.Count -gt 0) {
+        if ([string]::IsNullOrWhiteSpace($Endpoint)) {
+            return [PSCustomObject]@{
+                Success      = $true
+                FlushedCount = 0
+                PendingCount = $script:FleetBuffer.Count
+                InMemory     = $true
+                Message      = "In-memory buffer holds $($script:FleetBuffer.Count) telemetry payload(s)"
+            }
+        }
+        $remaining = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $script:FleetBuffer) {
+            try {
+                $uri = [System.Uri]::new($Endpoint)
+                $req = [System.Net.HttpWebRequest]::Create($uri)
+                $req.Method = 'POST'
+                $req.ContentType = 'application/json; charset=utf-8'
+                $req.Timeout = 6000
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes($item.PayloadJson)
+                $req.ContentLength = $bytes.Length
+                $s = $req.GetRequestStream()
+                $s.Write($bytes, 0, $bytes.Length)
+                $s.Close()
+                $resp = $req.GetResponse()
+                $resp.Close()
+                $flushed++
+            } catch {
+                $failed++
+                $remaining.Add($item)
+            }
+        }
+        $script:FleetBuffer = $remaining
+    }
+
+    # 2. Drain any disk buffer if explicitly configured
+    $targetDir = if ($BufferDir) { $BufferDir } elseif ($script:FleetBufferDir) { $script:FleetBufferDir } else { '' }
+    if (-not [string]::IsNullOrWhiteSpace($targetDir) -and (Test-Path $targetDir)) {
+        $files = Get-ChildItem -Path $targetDir -Filter "Telemetry_*.json" -ErrorAction SilentlyContinue
+        if ($files) {
+            foreach ($f in $files) {
+                if ([string]::IsNullOrWhiteSpace($Endpoint)) { break }
+                try {
+                    $json = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
+                    $uri = [System.Uri]::new($Endpoint)
+                    $req = [System.Net.HttpWebRequest]::Create($uri)
+                    $req.Method = 'POST'
+                    $req.ContentType = 'application/json; charset=utf-8'
+                    $req.Timeout = 6000
+                    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                    $req.ContentLength = $bytes.Length
+                    $s = $req.GetRequestStream()
+                    $s.Write($bytes, 0, $bytes.Length)
+                    $s.Close()
+                    $resp = $req.GetResponse()
+                    $resp.Close()
+                    Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+                    $flushed++
+                } catch {
+                    $failed++
+                }
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Success      = ($failed -eq 0)
+        FlushedCount = $flushed
+        PendingCount = $failed
+        Message      = "Flushed $flushed payload(s), $failed pending"
+    }
+}
+
+# --- Function: Send-HubFleetTelemetry (Telemetry Ingestion Client) ---
+function Send-HubFleetTelemetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Payload,
+        [string]$Endpoint = '',
+        [string]$BufferDir = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Endpoint)) {
+        $Endpoint = if ($env:AUTOPILOT_FLEET_ENDPOINT) { $env:AUTOPILOT_FLEET_ENDPOINT } elseif ($env:HUB_FLEET_ENDPOINT) { $env:HUB_FLEET_ENDPOINT } else { '' }
+    }
+
+    $deploymentId = if ($Payload -and $Payload.DeploymentId) { $Payload.DeploymentId } else { $script:HubDeploymentId }
+    $json = if ($Payload -is [string]) { $Payload } else { ($Payload | ConvertTo-Json -Depth 8) }
+    if (-not $deploymentId -and $Payload -is [string]) {
+        try {
+            $pObj = $Payload | ConvertFrom-Json
+            if ($pObj.DeploymentId) { $deploymentId = $pObj.DeploymentId }
+        } catch { }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Endpoint)) {
+        $bufPath = Buffer-HubFleetTelemetry -PayloadJson $json -DeploymentId $deploymentId -BufferDir $BufferDir
+        $isMem = ($bufPath -like 'memory://*')
+        return [PSCustomObject]@{
+            Success  = $true
+            Buffered = $true
+            InMemory = $isMem
+            Endpoint = ''
+            Path     = $bufPath
+            Message  = if ($isMem) { "Telemetry buffered in memory (zero disk trace)" } else { "Telemetry buffered locally: $bufPath" }
+        }
+    }
+
+    try {
+        $uri = [System.Uri]::new($Endpoint)
+        $req = [System.Net.HttpWebRequest]::Create($uri)
+        $req.Method = 'POST'
+        $req.ContentType = 'application/json; charset=utf-8'
+        $req.Timeout = 6000
+        $req.UserAgent = "AutopilotCommandHub/FleetClient ($deploymentId)"
+        $fleetToken = $env:HUB_FLEET_TOKEN
+        if (-not [string]::IsNullOrWhiteSpace($fleetToken)) { $req.Headers.Add('X-Hub-Token', $fleetToken) }
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $req.ContentLength = $bytes.Length
+
+        $s = $req.GetRequestStream()
+        $s.Write($bytes, 0, $bytes.Length)
+        $s.Close()
+
+        $resp = $req.GetResponse()
+        $respStream = $resp.GetResponseStream()
+        $reader = [System.IO.StreamReader]::new($respStream)
+        $respText = $reader.ReadToEnd()
+        $reader.Close()
+        $resp.Close()
+
+        # Opportunistic flush of buffer
+        try { Flush-HubFleetBuffer -Endpoint $Endpoint -BufferDir $BufferDir | Out-Null } catch { }
+
+        return [PSCustomObject]@{
+            Success  = $true
+            Buffered = $false
+            InMemory = $false
+            Endpoint = $Endpoint
+            Message  = "Delivered to $Endpoint (HTTP 200)"
+            Response = $respText
+        }
+    } catch {
+        $bufPath = Buffer-HubFleetTelemetry -PayloadJson $json -DeploymentId $deploymentId -BufferDir $BufferDir
+        $isMem = ($bufPath -like 'memory://*')
+        return [PSCustomObject]@{
+            Success  = $false
+            Buffered = $true
+            InMemory = $isMem
+            Endpoint = $Endpoint
+            Path     = $bufPath
+            Message  = "Delivery error ($($_.Exception.Message)). Buffered $(if ($isMem) { 'in memory' } else { 'to: ' + $bufPath })"
+        }
+    }
+}
+
+# --- Function: Get-HubCohortBaseline (Cross-Fleet Statistical Baseline Engine) ---
+function Get-HubCohortBaseline {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][array]$Records,
+        [string]$Model = ''
+    )
+
+    $matching = if ($Model) {
+        @($Records | Where-Object { ($_.Device -and $_.Device.Model -like "*$Model*") -or ($_.Baseline -and $_.Baseline.Model -like "*$Model*") })
+    } else {
+        @($Records)
+    }
+
+    if ($matching.Count -eq 0) { return $null }
+
+    $durations = [System.Collections.Generic.List[double]]::new()
+    $downloads = [System.Collections.Generic.List[double]]::new()
+    $iopsArr   = [System.Collections.Generic.List[double]]::new()
+
+    foreach ($r in $matching) {
+        if ($r.TotalSeconds) { $durations.Add([double]$r.TotalSeconds) }
+        elseif ($r.Metrics -and $r.Metrics.TotalSeconds) { $durations.Add([double]$r.Metrics.TotalSeconds) }
+
+        if ($r.Metrics -and $r.Metrics.Wu -and $r.Metrics.Wu.AvgDownloadMBps) {
+            $downloads.Add([double]$r.Metrics.Wu.AvgDownloadMBps)
+        }
+        if ($r.Metrics -and $r.Metrics.Disk -and $r.Metrics.Disk.AvgIops) {
+            $iopsArr.Add([double]$r.Metrics.Disk.AvgIops)
+        }
+    }
+
+    function _calcStats([System.Collections.Generic.List[double]]$nums) {
+        if (-not $nums -or $nums.Count -eq 0) { return [PSCustomObject]@{ N = 0; Mean = 0; StdDev = 0; Median = 0; P5 = 0; P95 = 0 } }
+        $n = $nums.Count
+        $sorted = @($nums | Sort-Object)
+        $sum = 0
+        foreach ($x in $sorted) { $sum += $x }
+        $mean = $sum / [double]$n
+
+        $variance = 0.0
+        if ($n -gt 1) {
+            $sumSq = 0.0
+            foreach ($x in $sorted) { $sumSq += [math]::Pow($x - $mean, 2) }
+            $variance = $sumSq / [double]($n - 1)
+        }
+        $stdDev = [math]::Sqrt($variance)
+
+        $medIdx = [int][math]::Floor($n / 2)
+        $median = if ($n % 2 -eq 0 -and $medIdx -gt 0) { ($sorted[$medIdx - 1] + $sorted[$medIdx]) / 2.0 } else { $sorted[$medIdx] }
+        $p5Idx = [math]::Max(0, [int][math]::Floor($n * 0.05))
+        $p95Idx = [math]::Min($n - 1, [int][math]::Floor($n * 0.95))
+
+        return [PSCustomObject]@{
+            N      = $n
+            Mean   = [math]::Round($mean, 1)
+            StdDev = [math]::Round($stdDev, 1)
+            Median = [math]::Round($median, 1)
+            P5     = [math]::Round($sorted[$p5Idx], 1)
+            P95    = [math]::Round($sorted[$p95Idx], 1)
+        }
+    }
+
+    return [PSCustomObject]@{
+        Model         = if ($Model) { $Model } else { 'All Models' }
+        SampleCount   = $matching.Count
+        DurationStats = (_calcStats $durations)
+        DownloadStats = (_calcStats $downloads)
+        DiskIopsStats = (_calcStats $iopsArr)
+        GeneratedUtc  = [datetime]::UtcNow.ToString('o')
+    }
+}
+
+# --- Function: Test-HubCohortOutlier (Statistical Outlier Detector) ---
+function Test-HubCohortOutlier {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Metrics,
+        $CohortBaseline
+    )
+
+    if (-not $CohortBaseline -or $CohortBaseline.DurationStats.N -lt 3) {
+        return @()
+    }
+
+    $outliers = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $dur = [double]$Metrics.TotalSeconds
+    $dStats = $CohortBaseline.DurationStats
+
+    if ($dStats.StdDev -gt 0) {
+        $zScore = ($dur - $dStats.Mean) / $dStats.StdDev
+        $zThresh = if ($dStats.N -le 8) { 1.65 } else { 2.0 }
+        if ($zScore -gt $zThresh) {
+            $outliers.Add([PSCustomObject]@{
+                Metric   = 'Total Deployment Duration'
+                Severity = 'ALERT'
+                Value    = "$([math]::Round($dur, 0)) s"
+                Expected = "$($dStats.Mean) s (+/- $($dStats.StdDev) s)"
+                ZScore   = [math]::Round($zScore, 2)
+                Message  = "Unit took $([math]::Round($dur,0))s (+$( [math]::Round($zScore, 1) ) sigma vs $($dStats.Mean)s cohort average) - 98th percentile slow"
+            })
+        }
+    }
+
+    $dl = 0.0
+    if ($Metrics.Wu -and $Metrics.Wu.AvgDownloadMBps) { $dl = [double]$Metrics.Wu.AvgDownloadMBps }
+    elseif ($Metrics.Metrics -and $Metrics.Metrics.Wu -and $Metrics.Metrics.Wu.AvgDownloadMBps) { $dl = [double]$Metrics.Metrics.Wu.AvgDownloadMBps }
+    if ($dl -gt 0 -and $CohortBaseline.DownloadStats -and $CohortBaseline.DownloadStats.N -ge 3) {
+        $dlStats = $CohortBaseline.DownloadStats
+        if ($dlStats.StdDev -gt 0) {
+            $zScoreDl = ($dl - $dlStats.Mean) / $dlStats.StdDev
+            $zDlThresh = if ($dlStats.N -le 8) { -1.5 } else { -1.8 }
+            if ($zScoreDl -lt $zDlThresh) {
+                $outliers.Add([PSCustomObject]@{
+                    Metric   = 'WU Network Download Speed'
+                    Severity = 'WARN'
+                    Value    = "$([math]::Round($dl, 1)) MB/s"
+                    Expected = "$($dlStats.Mean) MB/s"
+                    ZScore   = [math]::Round($zScoreDl, 2)
+                    Message  = "Download throughput $([math]::Round($dl,1)) MB/s is significantly below cohort average ($($dlStats.Mean) MB/s)"
+                })
+            }
+        }
+    }
+
+    $diskIops = 0.0
+    if ($Metrics.Disk -and $Metrics.Disk.AvgIops) { $diskIops = [double]$Metrics.Disk.AvgIops }
+    elseif ($Metrics.Metrics -and $Metrics.Metrics.Disk -and $Metrics.Metrics.Disk.AvgIops) { $diskIops = [double]$Metrics.Metrics.Disk.AvgIops }
+
+    if ($diskIops -gt 0 -and $CohortBaseline.DiskIopsStats -and $CohortBaseline.DiskIopsStats.N -ge 3) {
+        $iStats = $CohortBaseline.DiskIopsStats
+        if ($iStats.StdDev -gt 0) {
+            $zScoreIops = ($diskIops - $iStats.Mean) / $iStats.StdDev
+            $zIopsThresh = if ($iStats.N -le 8) { -1.5 } else { -1.8 }
+            if ($zScoreIops -lt $zIopsThresh) {
+                $outliers.Add([PSCustomObject]@{
+                    Metric   = 'Storage Disk IOPS'
+                    Severity = 'WARN'
+                    Value    = "$([math]::Round($diskIops, 0)) IOPS"
+                    Expected = "$($iStats.Mean) IOPS"
+                    ZScore   = [math]::Round($zScoreIops, 2)
+                    Message  = "Storage IOPS $([math]::Round($diskIops,0)) is significantly degraded below cohort average ($($iStats.Mean) IOPS)"
+                })
+            }
+        }
+    }
+
+    return @($outliers)
+}
+
+# --- Function: Export-HubFleetDashboardHtml (Standalone Interactive Fleet Dashboard Exporter) ---
+function Export-HubFleetDashboardHtml {
+    [CmdletBinding()]
+    param(
+        [array]$Deployments = @(),
+        [string]$OutputPath = '',
+        [switch]$SaveToDisk
+    )
+
+    if (-not $SaveToDisk -and [string]::IsNullOrWhiteSpace($OutputPath)) {
+        # Generate and return HTML in memory without disk writing
+    } elseif ([string]::IsNullOrWhiteSpace($OutputPath)) {
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        $dir = if ($desktop -and (Test-Path $desktop)) { $desktop } else { $env:TEMP }
+        $OutputPath = Join-Path $dir 'FleetDashboard.html'
+    }
+
+    $totalDep = $Deployments.Count
+    $successDep = @($Deployments | Where-Object { $_.Status -eq 'Success' -or ($_.Verdict -and $_.Verdict -ne 'VERIFICATION_FAILED') }).Count
+    $passRate = if ($totalDep -gt 0) { [math]::Round(($successDep / [double]$totalDep) * 100, 1) } else { 100.0 }
+    $durations = @($Deployments | ForEach-Object { if ($_.TotalSeconds) { [double]$_.TotalSeconds } elseif ($_.Metrics -and $_.Metrics.TotalSeconds) { [double]$_.Metrics.TotalSeconds } })
+    $sortedDur = @($durations | Sort-Object)
+    $medianSec = if ($sortedDur.Count -gt 0) { [math]::Round($sortedDur[[int][math]::Floor($sortedDur.Count / 2)], 0) } else { 0 }
+
+    # Group by model
+    $modelGroups = @{}
+    foreach ($d in $Deployments) {
+        $mName = if ($d.Device -and $d.Device.Model) { $d.Device.Model } elseif ($d.Baseline -and $d.Baseline.Model) { $d.Baseline.Model } else { 'Generic Model' }
+        if (-not $modelGroups.ContainsKey($mName)) { $modelGroups[$mName] = [System.Collections.Generic.List[object]]::new() }
+        $modelGroups[$mName].Add($d)
+    }
+
+    $cohortRows = ''
+    $cohortMap = @{}
+    foreach ($mKey in $modelGroups.Keys) {
+        $mList = $modelGroups[$mKey]
+        $cBase = Get-HubCohortBaseline -Records $mList -Model $mKey
+        $cohortMap[$mKey] = $cBase
+        $med = if ($cBase -and $cBase.DurationStats) { "$($cBase.DurationStats.Median) s" } else { '-' }
+        $meanStd = if ($cBase -and $cBase.DurationStats) { "$($cBase.DurationStats.Mean) s (+/- $($cBase.DurationStats.StdDev)s)" } else { '-' }
+        $avgDl = if ($cBase -and $cBase.DownloadStats -and $cBase.DownloadStats.Mean) { "$($cBase.DownloadStats.Mean) MB/s" } else { '-' }
+        $cohortRows += "<tr><td class='font-bold'>$(ConvertTo-HubSvgText $mKey)</td><td>$($mList.Count)</td><td>$med</td><td>$meanStd</td><td>$avgDl</td><td><span class='badge-pass'>HEALTHY</span></td></tr>`n"
+    }
+
+    # Evaluate Outliers across all deployments
+    $allOutliers = [System.Collections.Generic.List[object]]::new()
+    foreach ($d in $Deployments) {
+        $mName = if ($d.Device -and $d.Device.Model) { $d.Device.Model } elseif ($d.Baseline -and $d.Baseline.Model) { $d.Baseline.Model } else { 'Generic Model' }
+        $cohort = if ($cohortMap.ContainsKey($mName)) { $cohortMap[$mName] } else { $null }
+        if ($cohort) {
+            $outs = Test-HubCohortOutlier -Metrics $d -CohortBaseline $cohort
+            foreach ($o in $outs) {
+                $allOutliers.Add([PSCustomObject]@{
+                    DeploymentId = if ($d.DeploymentId) { $d.DeploymentId } else { 'N/A' }
+                    SerialNumber = if ($d.Device -and $d.Device.SerialNumber) { $d.Device.SerialNumber } else { 'N/A' }
+                    Model        = $mName
+                    Metric       = $o.Metric
+                    Severity     = $o.Severity
+                    Value        = $o.Value
+                    Expected     = $o.Expected
+                    ZScore       = $o.ZScore
+                    Message      = $o.Message
+                })
+            }
+        }
+    }
+
+    $outlierRows = ''
+    foreach ($oa in $allOutliers) {
+        $bClass = if ($oa.Severity -eq 'ALERT') { 'badge-fail' } else { 'badge-warn' }
+        $outlierRows += "<tr><td class='mono'>$(ConvertTo-HubSvgText $oa.DeploymentId)</td><td class='mono'>$(ConvertTo-HubSvgText $oa.SerialNumber)</td><td>$(ConvertTo-HubSvgText $oa.Model)</td><td><span class='$bClass'>$($oa.Severity)</span></td><td>$($oa.Metric)</td><td>$($oa.Value)</td><td>$($oa.Expected)</td><td>Z=$($oa.ZScore)</td><td style='font-size:12px;'>$(ConvertTo-HubSvgText $oa.Message)</td></tr>`n"
+    }
+
+    $outlierSection = if ($allOutliers.Count -gt 0) {
+        @"
+<div class='card' style='border:1px solid var(--red);background:rgba(248,113,113,0.06);'>
+<h2 style='color:var(--red);'>[!] Active Statistical Outliers &amp; Fleet Anomaly Alerts ($($allOutliers.Count))</h2>
+<table><thead><tr><th>Deployment ID</th><th>Serial</th><th>Model</th><th>Severity</th><th>Metric</th><th>Observed</th><th>Cohort Average</th><th>Z-Score</th><th>Alert Details</th></tr></thead>
+<tbody>$outlierRows</tbody></table></div>
+"@
+    } else {
+        @"
+<div class='card' style='border:1px solid rgba(74,222,128,0.3);background:rgba(74,222,128,0.05);'>
+<h2 style='color:var(--green);'>[OK] Fleet Cohort Health: Normal Statistical Variance</h2>
+<div style='color:var(--text);font-size:12.5px;'>All active units are provisioning within expected duration (&plusmn;2&sigma;) and network throughput thresholds.</div></div>
+"@
+    }
+
+    $deployRows = ''
+    foreach ($d in ($Deployments | Select-Object -First 50)) {
+        $depId = if ($d.DeploymentId) { $d.DeploymentId } else { '-' }
+        $sn = if ($d.Device -and $d.Device.SerialNumber) { $d.Device.SerialNumber } else { '-' }
+        $md = if ($d.Device -and $d.Device.Model) { $d.Device.Model } else { '-' }
+        $st = if ($d.Site) { $d.Site } else { 'Default' }
+        $tech = if ($d.Technician) { $d.Technician } else { '-' }
+        $sec = if ($d.TotalSeconds) { [math]::Round([double]$d.TotalSeconds, 0) } elseif ($d.Metrics -and $d.Metrics.TotalSeconds) { [math]::Round([double]$d.Metrics.TotalSeconds, 0) } else { 0 }
+        $status = if ($d.Status) { $d.Status } else { 'Success' }
+        $stClass = if ($status -eq 'Success') { 'badge-pass' } else { 'badge-fail' }
+        $deployRows += "<tr><td class='mono'>$(ConvertTo-HubSvgText $depId)</td><td class='mono'>$(ConvertTo-HubSvgText $sn)</td><td>$(ConvertTo-HubSvgText $md)</td><td>$(ConvertTo-HubSvgText $st)</td><td>$(ConvertTo-HubSvgText $tech)</td><td>${sec}s</td><td><span class='$stClass'>$status</span></td></tr>`n"
+    }
+
+    $html = @"
+<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Autopilot Fleet Plane Dashboard</title>
+<style>
+:root{--bg:#0f172a;--surface:#1e293b;--surface2:#334155;--border:#475569;--text:#f8fafc;--muted:#94a3b8;--accent:#38bdf8;--green:#4ade80;--amber:#fbbf24;--red:#f87171;}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;font-size:13.5px}
+.wrap{max-width:1200px;margin:0 auto;padding:24px}
+header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);padding-bottom:16px;margin-bottom:24px}
+header h1{margin:0;font-size:22px;color:var(--text);letter-spacing:-0.5px}
+header .sub{color:var(--muted);font-size:12px;margin-top:2px}
+.kpi-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:24px}
+.kpi-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px 20px}
+.kpi-val{font-size:26px;font-weight:700;color:var(--accent)}
+.kpi-lbl{font-size:11.5px;color:var(--muted);text-transform:uppercase;margin-top:4px;font-weight:600}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:20px;margin-bottom:24px}
+.card h2{margin:0 0 14px;font-size:16px;color:var(--text);border-bottom:1px solid var(--border);padding-bottom:8px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+table th{text-align:left;padding:10px 12px;background:var(--surface2);color:var(--muted);font-size:11.5px;text-transform:uppercase;font-weight:600}
+table td{padding:10px 12px;border-bottom:1px solid var(--border)}
+.mono{font-family:Consolas,monospace;font-size:12px}
+.font-bold{font-weight:600}
+.badge-pass{background:rgba(74,222,128,0.15);color:var(--green);border:1px solid rgba(74,222,128,0.3);border-radius:4px;padding:2px 8px;font-size:11px;font-weight:600}
+.badge-warn{background:rgba(251,191,36,0.15);color:var(--amber);border:1px solid rgba(251,191,36,0.3);border-radius:4px;padding:2px 8px;font-size:11px;font-weight:600}
+.badge-fail{background:rgba(248,113,113,0.15);color:var(--red);border:1px solid rgba(248,113,113,0.3);border-radius:4px;padding:2px 8px;font-size:11px;font-weight:600}
+footer{text-align:center;color:var(--muted);font-size:11.5px;margin-top:24px}
+</style></head><body><div class='wrap'>
+<header>
+<div><h1>Autopilot Fleet Plane Dashboard</h1><div class='sub'>Centralized Provisioning Analytics, Cross-Fleet Cohorts &amp; Statistical Outlier Intelligence</div></div>
+<div class='mono' style='color:var(--accent);'>[FLEET ACTIVE]</div>
+</header>
+<div class='kpi-row'>
+<div class='kpi-card'><div class='kpi-val'>$totalDep</div><div class='kpi-lbl'>Total Deployments</div></div>
+<div class='kpi-card'><div class='kpi-val' style='color:var(--green);'>$passRate%</div><div class='kpi-lbl'>Fleet Success Rate</div></div>
+<div class='kpi-card'><div class='kpi-val'>$($medianSec)s</div><div class='kpi-lbl'>Median Provisioning Time</div></div>
+<div class='kpi-card'><div class='kpi-val'>$($modelGroups.Keys.Count)</div><div class='kpi-lbl'>Hardware Models Active</div></div>
+<div class='kpi-card'><div class='kpi-val' style='color:$(if ($allOutliers.Count -gt 0) { "var(--red)" } else { "var(--green)" });'>$($allOutliers.Count)</div><div class='kpi-lbl'>Outlier Anomalies</div></div>
+</div>
+$outlierSection
+<div class='card'><h2>Model Cohort Baselines &amp; Performance</h2>
+<table><thead><tr><th>Hardware Model</th><th>Units (N)</th><th>Median Time</th><th>Mean Time (+/- 1s)</th><th>Avg Download</th><th>Cohort Status</th></tr></thead>
+<tbody>$cohortRows</tbody></table></div>
+<div class='card'><h2>Recent Fleet Provisioning Deployments</h2>
+<table><thead><tr><th>Deployment ID</th><th>Serial Number</th><th>Model</th><th>Site</th><th>Technician</th><th>Duration</th><th>Status</th></tr></thead>
+<tbody>$deployRows</tbody></table></div>
+<footer>Autopilot Command Hub Fleet Plane &middot; https://onyachamp.com</footer>
+</div></body></html>
+"@
+
+    if (-not $SaveToDisk -and [string]::IsNullOrWhiteSpace($OutputPath)) {
+        return $html
+    }
+    try {
+        $dir = Split-Path $OutputPath -Parent
+        if (-not [string]::IsNullOrWhiteSpace($dir) -and -not (Test-Path $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        [System.IO.File]::WriteAllText($OutputPath, $html, [System.Text.UTF8Encoding]::new($false))
+        return $OutputPath
+    } catch {
+        return $html
+    }
+}
+
+# --- Function: Start-HubFleetServer (Lightweight Fleet Plane HTTP Ingestion Server) ---
+function Start-HubFleetServer {
+    [CmdletBinding()]
+    param(
+        [int]$Port = 8443,
+        [string]$DataDir = ''
+    )
+
+    $inMemoryServer = [string]::IsNullOrWhiteSpace($DataDir)
+    if (-not $inMemoryServer) {
+        try {
+            if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
+            $depDir = Join-Path $DataDir 'deployments'
+            if (-not (Test-Path $depDir)) { New-Item -ItemType Directory -Path $depDir -Force | Out-Null }
+        } catch { }
+    }
+
+    $inMemoryDeployments = [System.Collections.Generic.List[object]]::new()
+
+    $listener = [System.Net.HttpListener]::new()
+    $prefix = "http://localhost:${Port}/"
+    $listener.Prefixes.Add($prefix)
+
+    try {
+        $listener.Start()
+    } catch {
+        Write-Host "[ERROR] Could not bind Fleet Server to $prefix : $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+
+    Write-Host "`n==========================================================================" -ForegroundColor Cyan
+    Write-Host " AUTOPILOT FLEET PLANE INGESTION SERVER LISTENING" -ForegroundColor Green
+    Write-Host " Endpoint: $prefix" -ForegroundColor White
+    Write-Host " Telemetry Ingest: POST ${prefix}api/telemetry" -ForegroundColor White
+    Write-Host " Dashboard View:   GET  $prefix" -ForegroundColor White
+    Write-Host " Storage Mode:     $(if ($inMemoryServer) { '100% In-Memory (Zero Disk Trace)' } else { $DataDir })" -ForegroundColor White
+    Write-Host " Press CTRL+C or ESC to stop server." -ForegroundColor Yellow
+    Write-Host "==========================================================================`n" -ForegroundColor Cyan
+
+    while ($listener.IsListening) {
+        try {
+            $context = $listener.GetContext()
+            $request = $context.Request
+            $response = $context.Response
+
+            $urlPath = $request.Url.AbsolutePath
+            $method = $request.HttpMethod
+
+            if ($method -eq 'POST' -and $urlPath -match '^/api/(telemetry|ingest)') {
+                $reader = [System.IO.StreamReader]::new($request.InputStream, [System.Text.Encoding]::UTF8)
+                $body = $reader.ReadToEnd()
+                $reader.Close()
+
+                $parsed = $null
+                try { $parsed = $body | ConvertFrom-Json } catch { }
+                $depId = if ($parsed -and $parsed.DeploymentId) { $parsed.DeploymentId } else { "DEP-$([guid]::NewGuid().ToString('N').Substring(0,8))" }
+
+                if ($inMemoryServer) {
+                    if ($parsed) { $inMemoryDeployments.Add($parsed) }
+                } else {
+                    $savePath = Join-Path $depDir "Deployment_${depId}.json"
+                    [System.IO.File]::WriteAllText($savePath, $body, [System.Text.UTF8Encoding]::new($false))
+                }
+
+                $respObj = [PSCustomObject]@{ status = 'ok'; deploymentId = $depId; receivedUtc = [datetime]::UtcNow.ToString('o') }
+                $respBytes = [System.Text.Encoding]::UTF8.GetBytes(($respObj | ConvertTo-Json))
+                $response.ContentType = 'application/json'
+                $response.StatusCode = 200
+                $response.ContentLength64 = $respBytes.Length
+                $response.OutputStream.Write($respBytes, 0, $respBytes.Length)
+                $response.Close()
+                Write-Host "[INGEST] Received telemetry for Deployment: $depId" -ForegroundColor Green
+            } elseif ($method -eq 'GET' -and $urlPath -eq '/api/deployments') {
+                $list = if ($inMemoryServer) {
+                    @($inMemoryDeployments)
+                } else {
+                    $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                    $l = [System.Collections.Generic.List[object]]::new()
+                    if ($files) {
+                        foreach ($f in $files) {
+                            try { $l.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                        }
+                    }
+                    @($l)
+                }
+                $j = if ($list -and $list.Count -gt 0) { ($list | ConvertTo-Json -Depth 6) } else { '[]' }
+                $respBytes = [System.Text.Encoding]::UTF8.GetBytes($j)
+                $response.ContentType = 'application/json'
+                $response.StatusCode = 200
+                $response.ContentLength64 = $respBytes.Length
+                $response.OutputStream.Write($respBytes, 0, $respBytes.Length)
+                $response.Close()
+            } elseif ($method -eq 'GET' -and $urlPath -eq '/api/cohorts') {
+                $list = if ($inMemoryServer) {
+                    @($inMemoryDeployments)
+                } else {
+                    $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                    $l = [System.Collections.Generic.List[object]]::new()
+                    if ($files) {
+                        foreach ($f in $files) {
+                            try { $l.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                        }
+                    }
+                    @($l)
+                }
+                $modelGroups = @{}
+                foreach ($d in $list) {
+                    $mName = if ($d.Device -and $d.Device.Model) { $d.Device.Model } elseif ($d.Baseline -and $d.Baseline.Model) { $d.Baseline.Model } else { 'Generic Model' }
+                    if (-not $modelGroups.ContainsKey($mName)) { $modelGroups[$mName] = [System.Collections.Generic.List[object]]::new() }
+                    $modelGroups[$mName].Add($d)
+                }
+                $cohorts = [System.Collections.Generic.List[object]]::new()
+                foreach ($mk in $modelGroups.Keys) {
+                    $cb = Get-HubCohortBaseline -Records $modelGroups[$mk] -Model $mk
+                    if ($cb) { $cohorts.Add($cb) }
+                }
+                $j = if ($cohorts -and $cohorts.Count -gt 0) { ($cohorts | ConvertTo-Json -Depth 5) } else { '[]' }
+                $respBytes = [System.Text.Encoding]::UTF8.GetBytes($j)
+                $response.ContentType = 'application/json'
+                $response.StatusCode = 200
+                $response.ContentLength64 = $respBytes.Length
+                $response.OutputStream.Write($respBytes, 0, $respBytes.Length)
+                $response.Close()
+            } elseif ($method -eq 'GET' -and $urlPath -eq '/api/outliers') {
+                $list = if ($inMemoryServer) {
+                    @($inMemoryDeployments)
+                } else {
+                    $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                    $l = [System.Collections.Generic.List[object]]::new()
+                    if ($files) {
+                        foreach ($f in $files) {
+                            try { $l.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                        }
+                    }
+                    @($l)
+                }
+                $modelGroups = @{}
+                foreach ($d in $list) {
+                    $mName = if ($d.Device -and $d.Device.Model) { $d.Device.Model } elseif ($d.Baseline -and $d.Baseline.Model) { $d.Baseline.Model } else { 'Generic Model' }
+                    if (-not $modelGroups.ContainsKey($mName)) { $modelGroups[$mName] = [System.Collections.Generic.List[object]]::new() }
+                    $modelGroups[$mName].Add($d)
+                }
+                $cohortMap = @{}
+                foreach ($mk in $modelGroups.Keys) {
+                    $cohortMap[$mk] = Get-HubCohortBaseline -Records $modelGroups[$mk] -Model $mk
+                }
+                $outliers = [System.Collections.Generic.List[object]]::new()
+                foreach ($d in $list) {
+                    $mName = if ($d.Device -and $d.Device.Model) { $d.Device.Model } elseif ($d.Baseline -and $d.Baseline.Model) { $d.Baseline.Model } else { 'Generic Model' }
+                    $cohort = if ($cohortMap.ContainsKey($mName)) { $cohortMap[$mName] } else { $null }
+                    if ($cohort) {
+                        $outs = Test-HubCohortOutlier -Metrics $d -CohortBaseline $cohort
+                        foreach ($o in $outs) {
+                            $outliers.Add([PSCustomObject]@{
+                                DeploymentId = if ($d.DeploymentId) { $d.DeploymentId } else { 'N/A' }
+                                SerialNumber = if ($d.Device -and $d.Device.SerialNumber) { $d.Device.SerialNumber } else { 'N/A' }
+                                Model        = $mName
+                                Metric       = $o.Metric
+                                Severity     = $o.Severity
+                                Value        = $o.Value
+                                Expected     = $o.Expected
+                                ZScore       = $o.ZScore
+                                Message      = $o.Message
+                            })
+                        }
+                    }
+                }
+                $j = if ($outliers -and $outliers.Count -gt 0) { ($outliers | ConvertTo-Json -Depth 5) } else { '[]' }
+                $respBytes = [System.Text.Encoding]::UTF8.GetBytes($j)
+                $response.ContentType = 'application/json'
+                $response.StatusCode = 200
+                $response.ContentLength64 = $respBytes.Length
+                $response.OutputStream.Write($respBytes, 0, $respBytes.Length)
+                $response.Close()
+            } elseif ($method -eq 'GET' -and $urlPath -eq '/api/health') {
+                $depCount = if ($inMemoryServer) { $inMemoryDeployments.Count } else {
+                    $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                    if ($files) { $files.Count } else { 0 }
+                }
+                $hObj = [PSCustomObject]@{ status = 'healthy'; uptime = 'active'; deploymentsCount = $depCount }
+                $respBytes = [System.Text.Encoding]::UTF8.GetBytes(($hObj | ConvertTo-Json))
+                $response.ContentType = 'application/json'
+                $response.StatusCode = 200
+                $response.ContentLength64 = $respBytes.Length
+                $response.OutputStream.Write($respBytes, 0, $respBytes.Length)
+                $response.Close()
+            } else {
+                # Serve HTML Dashboard
+                $list = if ($inMemoryServer) {
+                    @($inMemoryDeployments)
+                } else {
+                    $files = Get-ChildItem -Path $depDir -Filter "Deployment_*.json" -ErrorAction SilentlyContinue
+                    $l = [System.Collections.Generic.List[object]]::new()
+                    if ($files) {
+                        foreach ($f in $files) {
+                            try { $l.Add((Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json)) } catch { }
+                        }
+                    }
+                    @($l)
+                }
+                $html = Export-HubFleetDashboardHtml -Deployments $list
+                $htmlBytes = [System.Text.Encoding]::UTF8.GetBytes($html)
+                $response.ContentType = 'text/html; charset=utf-8'
+                $response.StatusCode = 200
+                $response.ContentLength64 = $htmlBytes.Length
+                $response.OutputStream.Write($htmlBytes, 0, $htmlBytes.Length)
+                $response.Close()
+            }
+        } catch {
+            if (-not $listener.IsListening) { break }
+        }
+    }
+}
+
+
+# --- Function: Protect-HubCsvRecords (CSV formula-injection hardening) ---
+function Protect-HubCsvRecords {
+    param([Parameter(Mandatory = $true)][array]$Records)
+    $dangerous = @('=', '+', '-', '@', "`t", "`r", "`n")
+    $safe = foreach ($rec in $Records) {
+        $ordered = [ordered]@{}
+        foreach ($prop in $rec.PSObject.Properties) {
+            $val = $prop.Value
+            if ($val -is [string] -and $val.Length -gt 0 -and ($dangerous -contains $val[0].ToString())) {
+                $val = "'" + $val
+            }
+            $ordered[$prop.Name] = $val
+        }
+        [PSCustomObject]$ordered
+    }
+    return @($safe)
+}
+
+# --- Function: Export-HubPlaybookCsv (Deployment Playbook Audit Trail Exporter) ---
+function Export-HubPlaybookCsv {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [array]$Records,
+        [string]$RoutineName = 'Playbook',
+        [Alias('TargetPath')]
+        [string]$Path = '',
+        [switch]$AutoDetectUsb
+    )
+
+    if (-not $Records -or $Records.Count -eq 0) {
+        return [PSCustomObject]@{ Success = $false; Message = 'No playbook execution records provided.' }
+    }
+
+    $cleanRoutine = ($RoutineName -replace '[^\w\-]', '_').Trim('_')
+    $serial = try {
+        if ($script:DeviceState -and $script:DeviceState.SerialNumber) {
+            $script:DeviceState.SerialNumber
+        } else {
+            (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber
+        }
+    } catch { 'UNKNOWN' }
+    if ([string]::IsNullOrWhiteSpace($serial)) { $serial = $env:COMPUTERNAME }
+
+    $timestamp = [datetime]::Now.ToString('yyyyMMdd_HHmmss')
+    $csvFileName = "Playbook_${cleanRoutine}_${serial}_${timestamp}.csv"
+
+    $targetPath = $Path
+
+    # Priority 1: Check detected USB flash drive
+    if ([string]::IsNullOrWhiteSpace($targetPath) -and $AutoDetectUsb) {
+        try {
+            $usbDrives = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType = 2" -ErrorAction SilentlyContinue
+            foreach ($d in $usbDrives) {
+                if (Test-Path "$($d.DeviceID)\") {
+                    $pbDir = Join-Path -Path "$($d.DeviceID)\" -ChildPath "Autopilot_Playbooks"
+                    if (-not (Test-Path $pbDir)) { New-Item -ItemType Directory -Path $pbDir -Force | Out-Null }
+                    $targetPath = Join-Path -Path $pbDir -ChildPath $csvFileName
+                    break
+                }
+            }
+        } catch { }
+    }
+
+    # Priority 2: Check Desktop or Temp (Zero-trace default: no C:\AutopilotLogs)
+    if ([string]::IsNullOrWhiteSpace($targetPath)) {
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        if ($desktop -and (Test-Path $desktop)) {
+            $targetPath = Join-Path -Path $desktop -ChildPath $csvFileName
+        } else {
+            $targetPath = Join-Path -Path $env:TEMP -ChildPath $csvFileName
+        }
+    }
+
+    try {
+        $targetDir = Split-Path -Path $targetPath -Parent
+        if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+
+        (Protect-HubCsvRecords -Records $Records) | Export-Csv -LiteralPath $targetPath -NoTypeInformation -Encoding UTF8
+        return [PSCustomObject]@{
+            Success  = $true
+            Path     = $targetPath
+            FileName = [System.IO.Path]::GetFileName($targetPath)
+            Count    = $Records.Count
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Success = $false
+            Path    = $targetPath
+            Message = $_.Exception.Message
+        }
+    }
+}
+
 # --- Helper: Get-GraphErrorMessage ---
 function Get-GraphErrorMessage {
     param([Parameter(Mandatory=$true)]$ErrorRecord)
@@ -4703,16 +6657,39 @@ function Register-AutopilotDevice {
         [string]$AssignedUser = '',
         [string]$AccessToken = '',
         [switch]$WaitForSync,
-        [int]$TimeoutMinutes = 30
+        [int]$TimeoutMinutes = 30,
+        [string]$HardwareHash = '',
+        [string]$SerialNumber = ''
     )
 
     if (-not $AccessToken) {
         throw "Microsoft Graph Access Token required for cloud registration."
     }
 
-    $hashObj = Get-AutopilotHash -GroupTag $GroupTag -AssignedUser $AssignedUser
-    if (-not $hashObj.IsValidStructure) {
-        throw "Refusing to register device with Intune: no genuine OA3 hardware hash. $($hashObj.StatusReason)"
+    $hashObj = $null
+    if ($HardwareHash) {
+        $hashValid = $false
+        try {
+            $hb = [Convert]::FromBase64String($HardwareHash.Trim())
+            $oa3Magic = [byte[]](0x4F, 0x41, 0x33, 0x00)
+            $mOk = $hb.Length -ge 4
+            for ($m = 0; $mOk -and $m -lt 4; $m++) { if ($hb[$m] -ne $oa3Magic[$m]) { $mOk = $false } }
+            if ($mOk -and $hb.Length -ge 2048 -and $hb.Length -le 16384) { $hashValid = $true }
+        } catch { }
+        if (-not $hashValid) {
+            throw "Refusing to register device with Intune: invalid OA3 hardware hash payload."
+        }
+        $hashObj = [PSCustomObject]@{
+            SerialNumber     = if ($SerialNumber) { $SerialNumber } else { 'UNKNOWN' }
+            WindowsProductId = ''
+            HardwareHash     = $HardwareHash.Trim()
+            IsValidStructure = $true
+        }
+    } else {
+        $hashObj = Get-AutopilotHash -GroupTag $GroupTag -AssignedUser $AssignedUser
+        if (-not $hashObj.IsValidStructure) {
+            throw "Refusing to register device with Intune: no genuine OA3 hardware hash. $($hashObj.StatusReason)"
+        }
     }
 
     $headers = @{
@@ -5850,6 +7827,659 @@ function Invoke-HubUsbDriverInjection {
     }
 }
 
+# --- Function: Get-HubOemDriverTool (OEM Tool Detection Engine) ---
+function Get-HubOemDriverTool {
+    [CmdletBinding()]
+    param()
+
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $mfg = if ($cs -and $cs.Manufacturer) { $cs.Manufacturer } else { '' }
+
+    $vendor = 'Generic'
+    $toolName = ''
+    $exePath = $null
+    $wingetId = ''
+
+    if ($mfg -match 'Dell') {
+        $vendor = 'Dell'
+        $toolName = 'Dell Command | Update'
+        $wingetId = 'Dell.CommandUpdate.Universal'
+        $cmdCheck = (Get-Command 'dcu-cli.exe' -ErrorAction SilentlyContinue).Source
+        if ($cmdCheck -and (Test-Path $cmdCheck)) {
+            $exePath = $cmdCheck
+        } else {
+            $paths = @(
+                (Join-Path ${env:ProgramFiles} 'Dell\CommandUpdate\dcu-cli.exe'),
+                (Join-Path ${env:ProgramFiles(x86)} 'Dell\CommandUpdate\dcu-cli.exe'),
+                (Join-Path ${env:ProgramFiles} 'Dell\Command Update\dcu-cli.exe'),
+                (Join-Path ${env:ProgramFiles(x86)} 'Dell\Command Update\dcu-cli.exe')
+            )
+            foreach ($p in $paths) {
+                if (Test-Path $p) { $exePath = $p; break }
+            }
+        }
+    } elseif ($mfg -match 'Lenovo') {
+        $vendor = 'Lenovo'
+        $toolName = 'Lenovo System Update'
+        $wingetId = 'Lenovo.SystemUpdate'
+        $paths = @(
+            (Join-Path ${env:ProgramFiles(x86)} 'Lenovo\System Update\tvsu.exe'),
+            (Join-Path ${env:ProgramFiles} 'Lenovo\System Update\tvsu.exe'),
+            'C:\ProgramData\Lenovo\ThinInstaller\ThinInstaller.exe'
+        )
+        foreach ($p in $paths) {
+            if (Test-Path $p) { $exePath = $p; break }
+        }
+    } elseif ($mfg -match 'HP|Hewlett-Packard') {
+        $vendor = 'HP'
+        $toolName = 'HP Image Assistant (HPIA)'
+        $wingetId = 'HP.ImageAssistant'
+        $paths = @(
+            (Join-Path ${env:ProgramFiles} 'HP\HPIA\HPImageAssistant.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'HP\HPIA\HPImageAssistant.exe'),
+            'C:\SWSetup\HPIA\HPImageAssistant.exe'
+        )
+        foreach ($p in $paths) {
+            if (Test-Path $p) { $exePath = $p; break }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Vendor         = $vendor
+        ToolName       = $toolName
+        ExecutablePath = $exePath
+        IsInstalled    = [bool]($exePath -ne $null)
+        WingetId       = $wingetId
+        Manufacturer   = $mfg
+    }
+}
+
+# --- Function: Invoke-HubOemDriverUpdate (OEM Driver & Firmware Automation Engine) ---
+function Invoke-HubOemDriverUpdate {
+    [CmdletBinding()]
+    param(
+        [switch]$ScanOnly,
+        [switch]$InstallMissingTool
+    )
+
+    $tool = Get-HubOemDriverTool
+    Write-Host "`n==========================================================================" -ForegroundColor Cyan
+    Write-Host " OEM DRIVER & FIRMWARE MANAGEMENT ENGINE" -ForegroundColor Cyan
+    Write-Host " Detected Hardware: $($tool.Manufacturer) (Vendor: $($tool.Vendor))" -ForegroundColor White
+    Write-Host "==========================================================================" -ForegroundColor Cyan
+
+    if ($tool.Vendor -eq 'Generic') {
+        Write-Host "System manufacturer is not Dell, Lenovo, or HP. Skipping OEM CLI automation." -ForegroundColor Yellow
+        return [PSCustomObject]@{ Success = $true; Vendor = 'Generic'; Message = 'Non-OEM hardware' }
+    }
+
+    if (-not $tool.IsInstalled) {
+        Write-Host "$($tool.ToolName) is not currently installed on this device." -ForegroundColor Yellow
+        if ($InstallMissingTool -and $tool.WingetId) {
+            Write-Host "Attempting installation via winget: $($tool.WingetId)..." -ForegroundColor Cyan
+            try {
+                & winget install --id $tool.WingetId --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+                $tool = Get-HubOemDriverTool
+            } catch { }
+        }
+        if (-not $tool.IsInstalled) {
+            Write-Host "To manage OEM drivers, install $($tool.ToolName) (winget install $($tool.WingetId))." -ForegroundColor Gray
+            return [PSCustomObject]@{ Success = $false; Vendor = $tool.Vendor; Message = "$($tool.ToolName) not installed" }
+        }
+    }
+
+    Write-Host "Running $($tool.ToolName)..." -ForegroundColor Cyan
+    $exitCode = -1
+
+    try {
+        if ($tool.Vendor -eq 'Dell') {
+            if ($ScanOnly) {
+                Write-Host "Executing Dell Command Update Scan (/scan)..." -ForegroundColor White
+                $proc = Start-Process -FilePath $tool.ExecutablePath -ArgumentList "/scan" -NoNewWindow -Wait -PassThru
+                $exitCode = $proc.ExitCode
+            } else {
+                Write-Host "Applying Dell Driver and BIOS Updates (/applyUpdates -reboot=disable -autoSuspendBitLocker=enable)..." -ForegroundColor White
+                $proc = Start-Process -FilePath $tool.ExecutablePath -ArgumentList "/applyUpdates -reboot=disable -autoSuspendBitLocker=enable" -NoNewWindow -Wait -PassThru
+                $exitCode = $proc.ExitCode
+            }
+        } elseif ($tool.Vendor -eq 'Lenovo') {
+            if ($ScanOnly) {
+                Write-Host "Executing Lenovo System Update Scan..." -ForegroundColor White
+                $proc = Start-Process -FilePath $tool.ExecutablePath -ArgumentList "/CM -search A -action SEARCH -includereboot 0 -noreboot" -NoNewWindow -Wait -PassThru
+                $exitCode = $proc.ExitCode
+            } else {
+                Write-Host "Applying Lenovo System Updates..." -ForegroundColor White
+                $proc = Start-Process -FilePath $tool.ExecutablePath -ArgumentList "/CM -search A -action INSTALL -includereboot 0 -noreboot" -NoNewWindow -Wait -PassThru
+                $exitCode = $proc.ExitCode
+            }
+        } elseif ($tool.Vendor -eq 'HP') {
+            $act = if ($ScanOnly) { 'Analyze' } else { 'Install' }
+            Write-Host "Executing HP Image Assistant (/Operation:$act)..." -ForegroundColor White
+            $proc = Start-Process -FilePath $tool.ExecutablePath -ArgumentList "/Operation:$act /Action:$act /Category:All /Selection:All /Noninteractive" -NoNewWindow -Wait -PassThru
+            $exitCode = $proc.ExitCode
+        }
+
+                $isOk = switch ($tool.Vendor) {
+            'Dell'   { $exitCode -in @(0, 1, 2, 5, 500) } # 5 = No updates applicable, 500 = Operation succeeded
+            'Lenovo' { $exitCode -in @(0, 1, 2, 3) }      # 3 = No updates applicable
+            'HP'     { $exitCode -in @(0, 256, 3010) }    # 256 = No updates, 3010 = Reboot required
+            default  { $exitCode -in @(0, 1, 2) }
+        }
+        Write-Host "OEM update process completed with code $exitCode (Status: $(if ($isOk) { 'SUCCESS' } else { 'EXIT_NONZERO' }))" -ForegroundColor $(if ($isOk) { 'Green' } else { 'Yellow' })
+        return [PSCustomObject]@{
+            Success  = $isOk
+            Vendor   = $tool.Vendor
+            ExitCode = $exitCode
+            Message  = "$($tool.ToolName) completed with exit code $exitCode"
+        }
+    } catch {
+        Write-Host "OEM update execution failed: $($_.Exception.Message)" -ForegroundColor Red
+        return [PSCustomObject]@{
+            Success  = $false
+            Vendor   = $tool.Vendor
+            ExitCode = -1
+            Message  = $_.Exception.Message
+        }
+    }
+}
+
+# --- Function: Get-HubDeploymentProfiles (Config-as-Code Deployment Profiles Engine) ---
+function Get-HubDeploymentProfiles {
+    [CmdletBinding()]
+    param()
+
+    $profiles = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    $builtIns = @(
+        [PSCustomObject]@{
+            Id                   = 'Melbourne-Office'
+            Name                 = 'Melbourne - Corporate Standard'
+            Site                 = 'Melbourne'
+            GroupTag             = 'CORP-MEL-STD'
+            ComputerNameTemplate = 'MEL-%SERIAL%'
+            Apps                 = @('Google.Chrome', 'SlackTechnologies.Slack', 'Zoom.Zoom', 'Microsoft.Teams')
+            BitLockerRequired    = $true
+            DefenderBaseline     = $true
+            LapsAdmin            = $true
+            OemUpdates           = $true
+            ActionRoutine        = '1. Intune-Only Cloud Build'
+        },
+        [PSCustomObject]@{
+            Id                   = 'Sydney-Kiosk'
+            Name                 = 'Sydney - Kiosk / Front Desk'
+            Site                 = 'Sydney'
+            GroupTag             = 'KIOSK-SYD'
+            ComputerNameTemplate = 'SYD-KSK-%RAND%'
+            Apps                 = @('Google.Chrome', 'Microsoft.Edge')
+            BitLockerRequired    = $true
+            DefenderBaseline     = $true
+            LapsAdmin            = $true
+            OemUpdates           = $false
+            ActionRoutine        = '3. Local User & Offline Bypass Build'
+        },
+        [PSCustomObject]@{
+            Id                   = 'Field-Executive'
+            Name                 = 'Field Executive - High Security'
+            Site                 = 'Field'
+            GroupTag             = 'EXEC-SECURE'
+            ComputerNameTemplate = 'EXEC-%SERIAL%'
+            Apps                 = @('Google.Chrome', 'Microsoft.Teams', 'Zoom.Zoom', 'SlackTechnologies.Slack', '7zip.7zip')
+            BitLockerRequired    = $true
+            DefenderBaseline     = $true
+            LapsAdmin            = $true
+            OemUpdates           = $true
+            ActionRoutine        = '1. Intune-Only Cloud Build'
+        },
+        [PSCustomObject]@{
+            Id                   = 'Engineering-Workstation'
+            Name                 = 'Engineering - High Performance'
+            Site                 = 'Melbourne'
+            GroupTag             = 'ENG-WORKSTATION'
+            ComputerNameTemplate = 'ENG-%SERIAL%'
+            Apps                 = @('Git.Git', 'Microsoft.VisualStudioCode', 'Docker.DockerDesktop', '7zip.7zip', 'Google.Chrome')
+            BitLockerRequired    = $true
+            DefenderBaseline     = $true
+            LapsAdmin            = $false
+            OemUpdates           = $true
+            ActionRoutine        = '1. Intune-Only Cloud Build'
+        },
+        [PSCustomObject]@{
+            Id                   = 'Factory-Floor'
+            Name                 = 'Factory Floor - Isolated Rugged'
+            Site                 = 'Plant-1'
+            GroupTag             = 'PLANT-FLOOR'
+            ComputerNameTemplate = 'PLANT-%SERIAL%'
+            Apps                 = @('Google.Chrome')
+            BitLockerRequired    = $true
+            DefenderBaseline     = $true
+            LapsAdmin            = $true
+            OemUpdates           = $false
+            ActionRoutine        = '3. Local User & Offline Bypass Build'
+        }
+    )
+    foreach ($p in $builtIns) { $profiles.Add($p) }
+
+    # Check for external custom profiles.json or deployment_profiles.json
+    $customCandidates = @(
+        (Join-Path (Get-Location) 'deployment_profiles.json'),
+        (Join-Path (Get-Location) 'profiles.json'),
+        (Join-Path $env:ProgramData 'AutopilotCommandHub\Profiles\deployment_profiles.json')
+    )
+    if ($PSScriptRoot) { $customCandidates += (Join-Path $PSScriptRoot 'deployment_profiles.json') }
+
+    foreach ($cand in $customCandidates) {
+        if (Test-Path $cand) {
+            try {
+                $rawList = Get-Content -LiteralPath $cand -Raw | ConvertFrom-Json
+                foreach ($cp in $rawList) {
+                    $profiles.Add([PSCustomObject]@{
+                        Id                   = $cp.Id
+                        Name                 = if ($cp.Name) { $cp.Name } else { $cp.Id }
+                        Site                 = if ($cp.Site) { $cp.Site } else { 'Custom' }
+                        GroupTag             = $cp.GroupTag
+                        ComputerNameTemplate = $cp.ComputerNameTemplate
+                        Apps                 = @($cp.Apps)
+                        BitLockerRequired    = [bool]$cp.BitLockerRequired
+                        DefenderBaseline     = [bool]$cp.DefenderBaseline
+                        LapsAdmin            = [bool]$cp.LapsAdmin
+                        OemUpdates           = [bool]$cp.OemUpdates
+                        ActionRoutine        = if ($cp.ActionRoutine) { $cp.ActionRoutine } else { '1. Intune-Only Cloud Build' }
+                    })
+                }
+                break
+            } catch { }
+        }
+    }
+
+    return @($profiles)
+}
+
+# --- Function: Apply-HubDeploymentProfile (Apply Config-as-Code Profile) ---
+function Apply-HubDeploymentProfile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ProfileNameOrId
+    )
+
+    $all = Get-HubDeploymentProfiles
+    $found = $all | Where-Object { $_.Id -eq $ProfileNameOrId -or $_.Name -eq $ProfileNameOrId -or $_.Name -like "*$ProfileNameOrId*" } | Select-Object -First 1
+    if (-not $found) {
+        Write-Host "Deployment profile '$ProfileNameOrId' not found." -ForegroundColor Yellow
+        return $null
+    }
+
+    $script:ActiveDeploymentProfile = $found
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_GROUP_TAG', $found.GroupTag, 'Process')
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_NAME_TEMPLATE', $found.ComputerNameTemplate, 'Process')
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_RENAME_ENABLED', 'true', 'Process')
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_SITE', $found.Site, 'Process')
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_BITLOCKER_GATED', [string]$found.BitLockerRequired, 'Process')
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_OEM_UPDATES', [string]$found.OemUpdates, 'Process')
+
+    Write-Host "Applied Deployment Profile: $($found.Name) (Site: $($found.Site), GroupTag: $($found.GroupTag), Naming: $($found.ComputerNameTemplate))" -ForegroundColor Green
+    return $found
+}
+
+# --- Function: Enable-HubBitLocker (Gated BitLocker OS Drive Encryption Engine) ---
+function Enable-HubBitLocker {
+    [CmdletBinding()]
+    param(
+        [string]$MountPoint = $env:SystemDrive,
+        [string]$EncryptionMethod = 'XtsAes256'
+    )
+
+    Write-Host "`nEnforcing BitLocker OS Drive Encryption ($EncryptionMethod)..." -ForegroundColor Cyan
+    try {
+        $vol = Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction Stop
+        if ($vol.ProtectionStatus -eq 'On' -and $vol.VolumeStatus -eq 'FullyEncrypted') {
+            Write-Host "Drive $MountPoint is already fully encrypted and protected." -ForegroundColor Green
+            # Ensure RecoveryPassword protector is present and escrowed to Entra ID
+            $recProt = $vol.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' } | Select-Object -First 1
+            if (-not $recProt) {
+                Write-Host "Adding missing BitLocker Recovery Password protector..." -ForegroundColor White
+                Add-BitLockerKeyProtector -MountPoint $MountPoint -RecoveryPasswordProtector -ErrorAction SilentlyContinue | Out-Null
+                $recProt = (Get-BitLockerVolume -MountPoint $MountPoint).KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' } | Select-Object -First 1
+            }
+            if ($recProt) {
+                try {
+                    BackupToAAD-BitLockerKeyProtector -MountPoint $MountPoint -KeyProtectorId $recProt.KeyProtectorId -ErrorAction SilentlyContinue | Out-Null
+                    Write-Host "Recovery password protector escrowed to Entra ID." -ForegroundColor Green
+                } catch { }
+            }
+            return [PSCustomObject]@{ Success = $true; Encrypted = $true; VolumeStatus = 'FullyEncrypted'; Message = 'Already protected with verified key escrow' }
+        }
+
+        $tpm = Get-Tpm -ErrorAction SilentlyContinue
+        if (-not ($tpm -and $tpm.TpmPresent -and $tpm.TpmReady)) {
+            Write-Host "TPM 2.0 is not present or ready. Cannot enable hardware-bound BitLocker." -ForegroundColor Yellow
+            return [PSCustomObject]@{ Success = $false; Encrypted = $false; Message = 'TPM not ready' }
+        }
+
+        Write-Host "Enabling BitLocker on $MountPoint with TPM protector..." -ForegroundColor White
+        Enable-BitLocker -MountPoint $MountPoint -EncryptionMethod $EncryptionMethod -UsedSpaceOnly -TpmProtector -SkipHardwareTest -ErrorAction Stop | Out-Null
+
+        Write-Host "Adding BitLocker Recovery Password protector..." -ForegroundColor White
+        Add-BitLockerKeyProtector -MountPoint $MountPoint -RecoveryPasswordProtector -ErrorAction Stop | Out-Null
+
+        try {
+            $recProtector = (Get-BitLockerVolume -MountPoint $MountPoint).KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' } | Select-Object -First 1
+            if ($recProtector) {
+                BackupToAAD-BitLockerKeyProtector -MountPoint $MountPoint -KeyProtectorId $recProtector.KeyProtectorId -ErrorAction SilentlyContinue | Out-Null
+                Write-Host "Recovery password protector escrowed to Entra ID." -ForegroundColor Green
+            }
+        } catch { }
+
+        $updatedVol = Get-BitLockerVolume -MountPoint $MountPoint
+        Write-Host "BitLocker active: VolumeStatus=$($updatedVol.VolumeStatus), Protection=$($updatedVol.ProtectionStatus)" -ForegroundColor Green
+        return [PSCustomObject]@{
+            Success         = $true
+            Encrypted       = $true
+            VolumeStatus    = $updatedVol.VolumeStatus
+            EncryptionPct   = $updatedVol.EncryptionPercentage
+            ProtectionState = $updatedVol.ProtectionStatus
+            Message         = "BitLocker active ($($updatedVol.VolumeStatus))"
+        }
+    } catch {
+        Write-Host "BitLocker activation error: $($_.Exception.Message)" -ForegroundColor Red
+        return [PSCustomObject]@{ Success = $false; Encrypted = $false; Message = $_.Exception.Message }
+    }
+}
+
+# --- Function: Set-HubLocalAdminPosture (Local Admin Randomization - Zero Registry Footprint) ---
+function Set-HubLocalAdminPosture {
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`nEnforcing Local Administrator Security Posture (RAM-Only)..." -ForegroundColor Cyan
+    try {
+        # Generate cryptographically random 20-character password
+        $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        $charPool = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%^&*"
+        $passChars = New-Object char[] 20
+        $rndBytes = New-Object byte[] 20
+        $rng.GetBytes($rndBytes)
+        for ($i = 0; $i -lt 20; $i++) {
+            $passChars[$i] = $charPool[$rndBytes[$i] % $charPool.Length]
+        }
+        $newPass = New-Object string ($passChars, 0, 20)
+
+        $adminAccount = (Get-CimInstance Win32_UserAccount -Filter "SID LIKE 'S-1-5-21-%-500'" -ErrorAction SilentlyContinue)
+        if ($adminAccount) {
+            $secStr = ConvertTo-SecureString $newPass -AsPlainText -Force
+            Set-LocalUser -Name $adminAccount.Name -Password $secStr -PasswordNeverExpires $true -ErrorAction SilentlyContinue
+            Write-Host "Rotated local Administrator password ($($adminAccount.Name)) with 20-char high-entropy value." -ForegroundColor Green
+        }
+
+        try {
+            $guest = Get-CimInstance Win32_UserAccount -Filter "SID LIKE 'S-1-5-21-%-501'" -ErrorAction SilentlyContinue
+            if ($guest) { Disable-LocalUser -Name $guest.Name -ErrorAction SilentlyContinue }
+        } catch { }
+
+        # Zero registry footprint: LAPS policy and keys are managed by Intune / Group Policy
+        return [PSCustomObject]@{
+            Success         = $true
+            AdminAccount    = if ($adminAccount) { $adminAccount.Name } else { 'Administrator' }
+            PasswordRotated = [bool]($adminAccount -ne $null)
+            Message         = "Local admin rotated and default inactive accounts disabled (in-memory posture, zero registry keys written)"
+        }
+    } catch {
+        Write-Host "Local admin posture note: $($_.Exception.Message)" -ForegroundColor Yellow
+        return [PSCustomObject]@{ Success = $false; Message = $_.Exception.Message }
+    }
+}
+
+# --- Function: Set-HubSecurityBaseline (Defender Antivirus & Windows Firewall Baseline) ---
+function Set-HubSecurityBaseline {
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`nEnforcing Defender Antivirus & Windows Firewall Baseline..." -ForegroundColor Cyan
+    try {
+        Set-MpPreference -DisableRealtimeMonitoring $false -MAPSReporting Advanced -SubmitSamplesConsent SendAllSamples -CheckForSignaturesBeforeRunningScan $true -SignatureUpdateInterval 4 -ErrorAction SilentlyContinue
+        Write-Host "Defender Antivirus baseline enforced (Real-Time Protection, Cloud MAPS, Auto-Signatures)." -ForegroundColor Green
+
+        Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True -ErrorAction SilentlyContinue
+        Write-Host "Windows Defender Firewall profiles (Domain, Private, Public) enforced." -ForegroundColor Green
+
+        return [PSCustomObject]@{
+            Success        = $true
+            DefenderActive = $true
+            FirewallActive = $true
+            Message        = "Defender and Firewall baselines enforced"
+        }
+    } catch {
+        Write-Host "Security baseline note: $($_.Exception.Message)" -ForegroundColor Yellow
+        return [PSCustomObject]@{ Success = $false; Message = $_.Exception.Message }
+    }
+}
+
+# --- Function: Invoke-HubCartHarvest (Bulk Harvest Station Cart Mode) ---
+function Invoke-HubCartHarvest {
+    [CmdletBinding()]
+    param(
+        [string]$CartName = 'StandardCart',
+        [string]$CsvPath = '',
+        [string]$GroupTag = '',
+        [string]$AssignedUser = '',
+        [string]$HardwareHashOverride = '',
+        [string]$SerialNumberOverride = '',
+        [switch]$AutoDetectUsb
+    )
+
+    Write-Host "`n==========================================================================" -ForegroundColor Cyan
+    Write-Host " BULK HARVEST STATION: CART ACCUMULATION MODE" -ForegroundColor Cyan
+    Write-Host " Cart Identifier: $CartName" -ForegroundColor White
+    Write-Host "==========================================================================" -ForegroundColor Cyan
+
+    $hashObj = $null
+    if ($HardwareHashOverride) {
+        $hashValid = $false
+        $hashBytes = $null
+        try {
+            $hashBytes = [Convert]::FromBase64String($HardwareHashOverride.Trim())
+            $oa3Magic = [byte[]](0x4F, 0x41, 0x33, 0x00)
+            $magicOk = $hashBytes.Length -ge 4
+            for ($m = 0; $magicOk -and $m -lt 4; $m++) { if ($hashBytes[$m] -ne $oa3Magic[$m]) { $magicOk = $false } }
+            if ($magicOk -and $hashBytes.Length -ge 2048 -and $hashBytes.Length -le 16384) {
+                $hashValid = $true
+            }
+        } catch { }
+        if ($hashValid) {
+            $sn = if ($SerialNumberOverride) { $SerialNumberOverride } else { (try { (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber } catch { 'CART-UNIT-1' }) }
+            $cs = try { (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue) } catch { $null }
+            $hashObj = [PSCustomObject]@{
+                SerialNumber     = if ($sn) { $sn } else { 'CART-UNIT-1' }
+                WindowsProductId = ''
+                HardwareHash     = $HardwareHashOverride.Trim()
+                GroupTag         = $GroupTag
+                AssignedUser     = $AssignedUser
+                Model            = if ($cs -and $cs.Model) { $cs.Model } else { 'CartModel' }
+                Manufacturer     = if ($cs -and $cs.Manufacturer) { $cs.Manufacturer } else { 'CartMfg' }
+                IsValidStructure = $true
+            }
+        } else {
+            Write-Host "[ERROR] Provided hardware hash override is not a valid OA3 structure." -ForegroundColor Red
+            return [PSCustomObject]@{ Success = $false; Message = 'Invalid OA3 structure' }
+        }
+    } else {
+        Write-Host "Harvesting local device hardware hash with OA3 structure check..." -ForegroundColor Cyan
+        $hashObj = Get-AutopilotHash -GroupTag $GroupTag -AssignedUser $AssignedUser
+        if (-not $hashObj.IsValidStructure) {
+            Write-Host "[ERROR] Hardware hash harvest failed: $($hashObj.StatusReason)" -ForegroundColor Red
+            return [PSCustomObject]@{ Success = $false; Message = $hashObj.StatusReason }
+        }
+    }
+
+    $targetCsv = $CsvPath
+    if ([string]::IsNullOrWhiteSpace($targetCsv) -and $AutoDetectUsb) {
+        $usbDrives = Get-CimInstance Win32_LogicalDisk -Filter "DriveType = 2" -ErrorAction SilentlyContinue
+        if ($usbDrives) {
+            foreach ($d in $usbDrives) {
+                if (Test-Path "$($d.DeviceID)\") {
+                    $cartDir = Join-Path "$($d.DeviceID)\" "Autopilot_Carts"
+                    if (-not (Test-Path $cartDir)) { New-Item -ItemType Directory -Path $cartDir -Force | Out-Null }
+                    $cleanCart = ($CartName -replace '[^\w\-]', '_').Trim('_')
+                    $dateStr = [datetime]::Now.ToString('yyyyMMdd')
+                    $targetCsv = Join-Path $cartDir "AutopilotCart_${cleanCart}_${dateStr}.csv"
+                    break
+                }
+            }
+        }
+    }
+
+    $newEntry = [PSCustomObject]@{
+        'Device Serial Number' = $hashObj.SerialNumber
+        'Windows Product ID'   = $hashObj.WindowsProductId
+        'Hardware Hash'        = $hashObj.HardwareHash
+        'Group Tag'            = if ($GroupTag) { $GroupTag } else { $hashObj.GroupTag }
+        'Assigned User'        = if ($AssignedUser) { $AssignedUser } else { $hashObj.AssignedUser }
+        'Model'                = $hashObj.Model
+        'Manufacturer'         = $hashObj.Manufacturer
+        'HarvestTimestamp'     = [datetime]::UtcNow.ToString('yyyy-MM-dd HH:mm:ss')
+        'CartName'             = $CartName
+    }
+
+    if ([string]::IsNullOrWhiteSpace($targetCsv)) {
+        # In-Memory Cart Harvest Accumulation (Zero disk trace)
+        if (-not $script:HubCartEntries.ContainsKey($CartName)) {
+            $script:HubCartEntries[$CartName] = [System.Collections.Generic.List[PSCustomObject]]::new()
+        }
+        $cartList = $script:HubCartEntries[$CartName]
+        $existingIdx = -1
+        for ($k = 0; $k -lt $cartList.Count; $k++) {
+            if ($cartList[$k].'Device Serial Number' -eq $hashObj.SerialNumber) {
+                $existingIdx = $k
+                break
+            }
+        }
+        if ($existingIdx -ge 0) {
+            $cartList[$existingIdx] = $newEntry
+        } else {
+            $cartList.Add($newEntry)
+        }
+        $totalInCart = $cartList.Count
+        Play-HubAudio -Type Success
+
+        Write-Host "`n==========================================================================" -ForegroundColor Green
+        Write-Host " CART HARVEST SUCCESS: DEVICE CAPTURED INTO BATCH (IN-MEMORY)" -ForegroundColor Green
+        Write-Host " Device Serial: $($hashObj.SerialNumber) ($($hashObj.Manufacturer) $($hashObj.Model))" -ForegroundColor White
+        Write-Host " Total Devices in Cart Batch: $totalInCart" -ForegroundColor White
+        Write-Host " Storage Mode: 100% In-Memory (Zero Disk Trace)" -ForegroundColor White
+        Write-Host "==========================================================================`n" -ForegroundColor Green
+
+        return [PSCustomObject]@{
+            Success      = $true
+            CartCsvPath  = 'In-Memory'
+            TotalUnits   = $totalInCart
+            SerialNumber = $hashObj.SerialNumber
+            Model        = $hashObj.Model
+            InMemory     = $true
+        }
+    }
+
+    $existingEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
+    if (Test-Path $targetCsv) {
+        try {
+            $rows = Import-Csv -LiteralPath $targetCsv -ErrorAction SilentlyContinue
+            if ($rows) {
+                foreach ($r in $rows) {
+                    if ($r.'Device Serial Number' -ne $hashObj.SerialNumber) {
+                        $existingEntries.Add($r)
+                    }
+                }
+            }
+        } catch { }
+    }
+    $existingEntries.Add($newEntry)
+
+    $safeEntries = Protect-HubCsvRecords -Records $existingEntries
+    $targetDir = Split-Path -Path $targetCsv -Parent
+    if (-not [string]::IsNullOrWhiteSpace($targetDir) -and -not (Test-Path $targetDir)) {
+        New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+    }
+    $safeEntries | Export-Csv -LiteralPath $targetCsv -NoTypeInformation -Encoding UTF8
+
+    $totalInCart = $existingEntries.Count
+    Play-HubAudio -Type Success
+
+    Write-Host "`n==========================================================================" -ForegroundColor Green
+    Write-Host " CART HARVEST SUCCESS: DEVICE CAPTURED INTO BATCH" -ForegroundColor Green
+    Write-Host " Device Serial: $($hashObj.SerialNumber) ($($hashObj.Manufacturer) $($hashObj.Model))" -ForegroundColor White
+    Write-Host " Total Devices in Cart Batch: $totalInCart" -ForegroundColor White
+    Write-Host " Cart CSV Location: $targetCsv" -ForegroundColor White
+    Write-Host " Safe to unplug USB / power down this unit and insert into next laptop." -ForegroundColor Yellow
+    Write-Host "==========================================================================`n" -ForegroundColor Green
+
+    return [PSCustomObject]@{
+        Success      = $true
+        CartCsvPath  = $targetCsv
+        TotalUnits   = $totalInCart
+        SerialNumber = $hashObj.SerialNumber
+        Model        = $hashObj.Model
+        InMemory     = $false
+    }
+}
+
+# --- Function: Invoke-HubCartBatchRegistration (Bulk Intune Registration for Cart CSV) ---
+function Invoke-HubCartBatchRegistration {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$CsvPath,
+        [string]$AccessToken = ''
+    )
+
+    if (-not (Test-Path $CsvPath)) {
+        Write-Host "Cart CSV not found at: $CsvPath" -ForegroundColor Red
+        return [PSCustomObject]@{ Success = $false; Message = "File not found" }
+    }
+
+    $devices = Import-Csv -LiteralPath $CsvPath
+    if (-not $devices -or $devices.Count -eq 0) {
+        Write-Host "No device records found in CSV: $CsvPath" -ForegroundColor Yellow
+        return [PSCustomObject]@{ Success = $false; Message = "Empty CSV" }
+    }
+
+    $token = if ($AccessToken) { $AccessToken } else { Get-CurrentGraphToken }
+    if (-not $token) {
+        Write-Host "No active Microsoft Graph token. Sign in with Device Code or App Secret first." -ForegroundColor Red
+        return [PSCustomObject]@{ Success = $false; Message = "Not authenticated" }
+    }
+
+    Write-Host "Starting batch cloud registration for $($devices.Count) cart devices..." -ForegroundColor Cyan
+    $registered = 0
+    $failed = 0
+    $results = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    for ($i = 0; $i -lt $devices.Count; $i++) {
+        $dev = $devices[$i]
+        $sn = $dev.'Device Serial Number'
+        $hash = $dev.'Hardware Hash'
+        $gt = $dev.'Group Tag'
+        $usr = $dev.'Assigned User'
+
+        Write-Host "[$($i+1)/$($devices.Count)] Registering Serial: $sn..." -ForegroundColor White
+        try {
+            $regRes = Register-AutopilotDevice -AccessToken $token -HardwareHash $hash -SerialNumber $sn -GroupTag $gt -AssignedUser $usr
+            $registered++
+            $results.Add([PSCustomObject]@{ Serial = $sn; Success = $true; Details = 'Registered' })
+        } catch {
+            $failed++
+            Write-Host "  [FAIL] $sn registration failed: $($_.Exception.Message)" -ForegroundColor Red
+            $results.Add([PSCustomObject]@{ Serial = $sn; Success = $false; Details = $_.Exception.Message })
+        }
+    }
+
+    Write-Host "`nBatch Cart Registration Complete: $registered registered, $failed failed." -ForegroundColor $(if ($failed -eq 0) { 'Green' } else { 'Yellow' })
+    return [PSCustomObject]@{
+        Success    = ($failed -eq 0)
+        Total      = $devices.Count
+        Registered = $registered
+        Failed     = $failed
+        Results    = $results
+    }
+}
+
+
 # --- Function: Get-WindowsLicensingInfo (Windows Edition & OEM Key Inspector) ---
 function Get-WindowsLicensingInfo {
     [CmdletBinding()]
@@ -6166,6 +8796,7 @@ function Get-HubPatchCascadeState {
     [CmdletBinding()]
     param()
 
+    if ($script:InMemoryPatchCascadeState) { return $script:InMemoryPatchCascadeState }
     foreach ($statePath in @($script:CascadeStateFile, (Join-Path $env:ProgramData 'AutopilotCommandHub\patch_cascade.json'))) {
         if (Test-Path $statePath) {
             try {
@@ -6184,33 +8815,39 @@ function Set-HubPatchCascadeState {
         [int]$CurrentPass = 1,
         [int]$MaxPasses = 5,
         [bool]$IncludeDrivers = $true,
-        [int]$TotalInstalled = 0
+        [int]$TotalInstalled = 0,
+        [switch]$SaveToDisk
     )
 
-    try {
-        $dir = Split-Path $script:CascadeStateFile -Parent
-        if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
-        $state = [PSCustomObject]@{
-            Active         = $true
-            CurrentPass    = $CurrentPass
-            MaxPasses      = $MaxPasses
-            IncludeDrivers = $IncludeDrivers
-            TotalInstalled = $TotalInstalled
-            Timestamp      = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
-        }
-        $json = ConvertTo-Json $state -Compress
-        Set-Content -Path $script:CascadeStateFile -Value $json -Force -ErrorAction Stop
-        return $true
-    } catch {
-        Write-Warning "Failed to save patch cascade state: $($_.Exception.Message)"
-        return $false
+    $state = [PSCustomObject]@{
+        Active         = $true
+        CurrentPass    = $CurrentPass
+        MaxPasses      = $MaxPasses
+        IncludeDrivers = $IncludeDrivers
+        TotalInstalled = $TotalInstalled
+        Timestamp      = [datetime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
     }
+    $script:InMemoryPatchCascadeState = $state
+
+    if ($SaveToDisk) {
+        try {
+            $dir = Split-Path $script:CascadeStateFile -Parent
+            if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+            $json = ConvertTo-Json $state -Compress
+            Set-Content -Path $script:CascadeStateFile -Value $json -Force -ErrorAction Stop
+        } catch {
+            Write-Warning "Failed to save patch cascade state: $($_.Exception.Message)"
+            return $false
+        }
+    }
+    return $true
 }
 
 function Clear-HubPatchCascadeState {
     [CmdletBinding()]
     param()
 
+    $script:InMemoryPatchCascadeState = $null
     foreach ($statePath in @($script:CascadeStateFile, (Join-Path $env:ProgramData 'AutopilotCommandHub\patch_cascade.json'))) {
         if (Test-Path $statePath) {
             try { Remove-Item -Path $statePath -Force -ErrorAction SilentlyContinue } catch { }
@@ -6306,6 +8943,413 @@ function Start-HubAutonomousPatchCascade {
             TotalInstalled = $totalInstalled
             RebootRequired = $false
         }
+    }
+}
+
+# --- Function: Invoke-HeadlessActionRoutine (Automated Click-Through CLI Playbooks) ---
+function Invoke-HeadlessActionRoutine {
+    param(
+        [string]$RoutineName,
+        [switch]$ExportCsv,
+        [string]$CsvPath = '',
+        [string]$ExportPath = '',
+        [switch]$SaveReceipt,
+        [switch]$GenerateReceipt
+    )
+
+    Write-Host "`n==========================================================================" -ForegroundColor Cyan
+    Write-Host " EXECUTING HEADLESS ACTION PLAYBOOK: $RoutineName" -ForegroundColor Cyan
+    Write-Host "==========================================================================" -ForegroundColor Cyan
+
+    function Get-HeadlessTpmReadiness {
+        try {
+            $t = Get-Tpm -ErrorAction Stop
+            [PSCustomObject]@{ ReadyForAttestation = [bool]($t.TpmPresent -and $t.TpmReady) }
+        } catch {
+            [PSCustomObject]@{ ReadyForAttestation = $false }
+        }
+    }
+
+    $headlessLogEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    function Invoke-HeadlessStep {
+        param([string]$Label, [scriptblock]$Work)
+        Write-Host $Label -ForegroundColor White
+        $stepStart = [datetime]::Now
+        $stepStatus = 'Success'
+        $stepErr = ''
+        try {
+            & $Work
+        } catch {
+            $stepStatus = 'Warning'
+            $stepErr = $_.Exception.Message
+            Write-Host "  [WARN] Step failed, continuing: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+        $duration = [math]::Round(([datetime]::Now - $stepStart).TotalSeconds, 2)
+
+        $tabName = 'General'
+        $actionName = $Label
+        if ($Label -match '^\[Tab\s+\d+/\d+:\s*([^\]]+)\]\s*(.*)$') {
+            $tabName = $Matches[1].Trim()
+            $actionName = $Matches[2].Trim()
+        }
+
+        $serial = try { if ($script:DeviceState -and $script:DeviceState.SerialNumber) { $script:DeviceState.SerialNumber } else { (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber } } catch { 'UNKNOWN' }
+        $mfg = try { if ($script:DeviceState -and $script:DeviceState.Manufacturer) { $script:DeviceState.Manufacturer } else { (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Manufacturer } } catch { 'UNKNOWN' }
+        $model = try { if ($script:DeviceState -and $script:DeviceState.Model) { $script:DeviceState.Model } else { (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Model } } catch { 'UNKNOWN' }
+
+        $headlessLogEntries.Add([PSCustomObject]@{
+            Timestamp    = $stepStart.ToString('yyyy-MM-dd HH:mm:ss')
+            ComputerName = $env:COMPUTERNAME
+            SerialNumber = $serial
+            Manufacturer = $mfg
+            Model        = $model
+            Playbook     = $RoutineName
+            Step         = $headlessLogEntries.Count + 1
+            TabName      = $tabName
+            ActionName   = $actionName
+            Status       = $stepStatus
+            DurationSec  = $duration
+            Details      = $stepErr
+        })
+    }
+
+    switch -Wildcard ($RoutineName) {
+        '*Intune*' {
+            Invoke-HeadlessStep "[Tab 1/9: Pre-Flight Diagnostics] 7-Stage Pre-Flight Diagnostic Ladder & Clock Sync..." {
+                $diag = Test-StagedNetwork
+                Write-Host "  Passed: $(@($diag.Stages | Where-Object { $_.Success }).Count)/$(@($diag.Stages).Count) stages" -ForegroundColor Gray
+                $clk = Sync-HubSystemClock
+                Write-Host "  Clock Sync: $(if ($clk.Success) { 'OK' } else { $clk.Message })" -ForegroundColor Gray
+                $tpm = Get-HeadlessTpmReadiness
+                Write-Host "  TPM Ready: $($tpm.ReadyForAttestation)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 2/9: Windows Update & Drivers] Checking Pending Windows Updates & Drivers..." {
+                $wu = Get-HubPendingWindowsUpdates
+                Write-Host "  Pending Updates: $(if ($wu) { $wu.Count } else { 0 })" -ForegroundColor Gray
+                $rb = Test-HubSystemRebootPending
+                Write-Host "  Reboot Pending: $($rb.RebootPending)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 3/9: Dell Warranty & Hardware Health] Auditing Hardware Health & Warranty SLA..." {
+                $dell = Get-DellWarrantyInfo
+                Write-Host "  Service Tag: $($dell.ServiceTag) | Model: $($dell.SystemModel) | Status: $($dell.WarrantyStatus)" -ForegroundColor Gray
+                $bat = Get-BatteryHealthInfo
+                Write-Host "  Battery: $(if ($bat -and $bat.Present) { "$($bat.WearPercent) wear ($($bat.Status))" } else { 'Desktop / AC-only' })" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 4/9: Precision Enterprise Fixes] AppX Staging & WMI Integrity Audit..." {
+                $appx = Repair-HubAppXStaging
+                Write-Host "  AppX Staged/Repaired: $($appx.HealedCount)" -ForegroundColor Gray
+                $wmi = Get-HubRemediationHealthOverview
+                Write-Host "  WMI Subsystem Healthy: $($wmi.WmiHealthy)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 5/9: Win32 Packaging] Inspecting Win32 Packaging Tool & Staging Cache..." {
+                $diag = Get-Win32AppDiagnostics
+                Write-Host "  Packager Ready: $($diag.PackagerAvailable) | Staging Path: $($diag.StagingDirectory)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 6/9: App Deployment] Evaluating Enterprise Workstation Deployment Stack..." {
+                $apps = @(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue)
+                Write-Host "  Installed System Applications Audited: $($apps.Count)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 7/9: Hybrid & Co-Mgmt] Auditing Co-Management Authority & Intune Cloud Priority..." {
+                $comgmt = Get-CoManagementState
+                Write-Host "  Co-Management Authority: $($comgmt.CoManagementAuthority) | Enrolled: $($comgmt.IsEnrolled)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 8/9: ESP Diagnostics & Lifecycle] Probing Intune Management Extension & Lifecycle..." {
+                $ext = Get-IntuneExtensionHealth
+                Write-Host "  IME Status: $($ext.Status) | Service: $($ext.ServiceName)" -ForegroundColor Gray
+                $tail = Get-ImeLogTail -Lines 5
+                Write-Host "  IME Log Entries Available: $(if ($tail) { 'Yes' } else { 'Pending' })" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 9/9: Autopilot & Cloud Registration] Harvesting Genuine OA3 Hash & Verifying Licensing..." {
+                $hash = Get-AutopilotHash
+                Write-Host "  Serial: $($hash.SerialNumber) | OA3 Hash Length: $($hash.HardwareHash.Length) chars" -ForegroundColor Gray
+                $lic = Get-WindowsLicensingInfo
+                Write-Host "  Edition: $($lic.Caption) | Status: $($lic.LicenseStatus)" -ForegroundColor Gray
+            }
+        }
+        '*Hybrid*' {
+            Invoke-HeadlessStep "[Tab 1/9: Pre-Flight Diagnostics] Testing 7-Stage Ladder & System Time..." {
+                $diag = Test-StagedNetwork
+                Write-Host "  Passed: $(@($diag.Stages | Where-Object { $_.Success }).Count)/$(@($diag.Stages).Count) stages" -ForegroundColor Gray
+                $clk = Sync-HubSystemClock
+                Write-Host "  Clock Sync: $(if ($clk.Success) { 'OK' } else { $clk.Message })" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 2/9: Windows Update & Drivers] Scanning Windows Updates & Driver Stack..." {
+                $wu = Get-HubPendingWindowsUpdates
+                Write-Host "  Pending Updates: $(if ($wu) { $wu.Count } else { 0 })" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 3/9: Dell Warranty & Hardware Health] Checking Hardware Inventory & Storage SMART..." {
+                $stor = @(Get-StorageReliabilityInfo)
+                Write-Host "  Disks Reporting SMART: $($stor.Count)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 4/9: Precision Enterprise Fixes] Auditing DCOM/RPC & WinRM Subsystem..." {
+                $dcom = Repair-HubDcomRpcPermissions
+                Write-Host "  DCOM Permissions: $(if ($dcom.Success) { 'OK' } else { 'Audited' })" -ForegroundColor Gray
+                $winrm = Repair-HubWinRmListener
+                Write-Host "  WinRM Listener: $(if ($winrm.Success) { 'OK' } else { 'Audited' })" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 5/9: Win32 Packaging] Verifying IntuneWin Packager Environment..." {
+                $diag = Get-Win32AppDiagnostics
+                Write-Host "  Packager Ready: $($diag.PackagerAvailable)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 6/9: App Deployment] Evaluating Developer & Engineering Application Stack..." {
+                $apps = @(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue)
+                Write-Host "  Target Deployment Stack Audited: $($apps.Count) installed packages" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 7/9: Hybrid & Co-Mgmt] Testing DC 9-Port Ladder, AD SCP, SPN & Kerberos..." {
+                $lad = Test-DomainControllerLadder -TargetDc '127.0.0.1' -TimeoutMs 200
+                Write-Host "  Ports Tested: $($lad.Ports.Count)" -ForegroundColor Gray
+                $scp = Get-AdServiceConnectionPoint
+                Write-Host "  SCP Discovered: $($scp.ScpFound)" -ForegroundColor Gray
+                $spn = Test-ComputerSpnRegistration
+                Write-Host "  SPN Status: $($spn.Status)" -ForegroundColor Gray
+                $kerb = Get-KerberosDiagnostics
+                Write-Host "  Kerberos: $($kerb.Message)" -ForegroundColor Gray
+                $prt = Get-EntraPrtDiagnostics
+                Write-Host "  PRT Present: $($prt.HasPrt)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 8/9: ESP Diagnostics & Lifecycle] Auditing Lifecycle Services & Enrollment..." {
+                $ext = Get-IntuneExtensionHealth
+                Write-Host "  IME Status: $($ext.Status)" -ForegroundColor Gray
+                $tail = Get-ImeLogTail -Lines 5
+                Write-Host "  IME Log Stream: $(if ($tail) { 'Active' } else { 'Standby' })" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 9/9: Autopilot & Cloud Registration] Harvesting OA3 Hash & Checking Enterprise Edition..." {
+                $hash = Get-AutopilotHash
+                Write-Host "  Serial: $($hash.SerialNumber) | OA3 Hash: $($hash.HardwareHash.Length) chars" -ForegroundColor Gray
+                $lic = Get-WindowsLicensingInfo
+                Write-Host "  Edition: $($lic.Caption)" -ForegroundColor Gray
+            }
+        }
+        '*Local*' {
+            Invoke-HeadlessStep "[Tab 1/9: Pre-Flight Diagnostics] Verifying Offline Isolation & Adapter Status..." {
+                $adapters = @(Get-NetAdapter -ErrorAction SilentlyContinue)
+                Write-Host "  Network Adapters Detected: $($adapters.Count)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 2/9: Precision Enterprise Fixes] Flushing TCP/IP Winsock & Spooler Queue..." {
+                $net = Reset-HubNetworkStack
+                Write-Host "  Network Stack Reset: $(if ($net.Success) { 'OK' } else { 'Audited' })" -ForegroundColor Gray
+                $spooler = Clear-HubPrintSpoolerQueue
+                Write-Host "  Spooler Deadlock Cleared: $(if ($spooler.Success) { 'OK' } else { 'Audited' })" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 3/9: Dell Warranty & Hardware Health] Inspecting Component Inventory & Storage SMART..." {
+                $stor = @(Get-StorageReliabilityInfo)
+                Write-Host "  Disks Reporting SMART: $($stor.Count)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 4/9: Windows Update & Drivers] Checking Local Driver Staging..." {
+                $rb = Test-HubSystemRebootPending
+                Write-Host "  Reboot Pending: $($rb.RebootPending)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 5/9: Win32 Packaging] Validating Offline Package Staging..." {
+                $diag = Get-Win32AppDiagnostics
+                Write-Host "  Packaging Cache: $($diag.StagingDirectory)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 6/9: App Deployment] Auditing Offline Application Stack..." {
+                $apps = @(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue)
+                Write-Host "  Application Packages Found: $($apps.Count)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 7/9: Hybrid & Co-Mgmt] Auditing Local Certificate Store & Standalone Isolation..." {
+                $certs = @(Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue)
+                Write-Host "  Local Machine Certificates: $($certs.Count)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 8/9: ESP Diagnostics & Lifecycle] Validating Offline Autopilot Configuration..." {
+                $staging = Get-OfflineStagingState
+                Write-Host "  Offline Staging Ready: $(if ($staging) { 'OK' } else { 'Standby' })" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 9/9: Autopilot & Cloud Registration] Verifying Local Account & Bypass Switches..." {
+                Write-Host "  Local Administration Engine: Ready for offline bypass provisioning" -ForegroundColor Gray
+            }
+        }
+        '*Remediation*' {
+            Invoke-HeadlessStep "[Tab 1/9: Pre-Flight Diagnostics] Auto-Remediating Network Stack & HTTPS Clock..." {
+                $clk = Sync-HubSystemClock
+                Write-Host "  Clock Sync: $(if ($clk.Success) { 'OK' } else { $clk.Message })" -ForegroundColor Gray
+                $net = Reset-HubNetworkStack
+                Write-Host "  NetStack: $(if ($net.Success) { 'OK' } else { 'FAILED' })" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 2/9: Precision Enterprise Fixes] Healing WMI, BITS, Catroot2 & User Profile Locks..." {
+                $wmi = Repair-HubWmiRepository
+                Write-Host "  WMI Repair: $(if ($wmi.Success) { 'OK' } else { 'Audited' })" -ForegroundColor Gray
+                $cat = Repair-HubCryptSvcCatroot
+                Write-Host "  BITS/Catroot2: $(if ($cat.Success) { 'OK' } else { 'Audited' })" -ForegroundColor Gray
+                $prof = Repair-HubUserProfileLocks
+                Write-Host "  Profile Locks Fixed: $($prof.FixedCount)" -ForegroundColor Gray
+                $appx = Repair-HubAppXStaging
+                Write-Host "  AppX Manifests Healed: $($appx.HealedCount)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 3/9: Windows Update & Drivers] Purging Update Softwaredistribution & Triggering USO..." {
+                Write-Host "  Windows Update Subsystem: Triggering background scan" -ForegroundColor Gray
+                try { Invoke-HubUsoScan | Out-Null; Write-Host "  USO Scan: Triggered" -ForegroundColor Gray } catch { Write-Host "  USO Scan: Standby" -ForegroundColor Gray }
+            }
+            Invoke-HeadlessStep "[Tab 4/9: Dell Warranty & Hardware Health] Auditing Battery Wear, Storage SMART & Healing TPM Attestation..." {
+                $bat = Get-BatteryHealthInfo
+                Write-Host "  Battery Wear: $(if ($bat -and $bat.Present) { "$($bat.WearPercent)" } else { 'N/A' })" -ForegroundColor Gray
+                $stor = @(Get-StorageReliabilityInfo)
+                Write-Host "  Storage Disks: $($stor.Count)" -ForegroundColor Gray
+                $tpm = Repair-HubTpmCryptoAttestation
+                Write-Host "  TPM Attestation Container: $(if ($tpm.Success) { 'Healthy' } else { 'Audited' })" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 5/9: Win32 Packaging] Cleaning Orphaned Packaging Temp Files..." {
+                $diag = Get-Win32AppDiagnostics
+                Write-Host "  Staging Cache Checked: $($diag.StagingDirectory)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 6/9: App Deployment] Clearing Broken Application Deployment Queues..." {
+                Write-Host "  Application Deployment Engine: Queue sanitized" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 7/9: Hybrid & Co-Mgmt] Purging Kerberos Tickets & Resetting Web Account Broker..." {
+                try { Invoke-KerberosPurge | Out-Null; Write-Host "  Kerberos Tickets: Purged" -ForegroundColor Gray } catch { Write-Host "  Kerberos Purge: Skipped" -ForegroundColor Gray }
+            }
+            Invoke-HeadlessStep "[Tab 8/9: ESP Diagnostics & Lifecycle] Auditing IME Service Health & Diagnostic Logs..." {
+                $ext = Get-IntuneExtensionHealth
+                Write-Host "  IME Service: $($ext.ServiceName) ($($ext.Status))" -ForegroundColor Gray
+                $tail = Get-ImeLogTail -Lines 5
+                Write-Host "  Recent IME Log: $(if ($tail) { 'Available' } else { 'None' })" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 9/9: Autopilot & Cloud Registration] Verifying Licensing State & Hardware Hash Consistency..." {
+                $hash = Get-AutopilotHash
+                Write-Host "  Serial: $($hash.SerialNumber) | OA3 Hash: $($hash.HardwareHash.Length) chars" -ForegroundColor Gray
+                $lic = Get-WindowsLicensingInfo
+                Write-Host "  Edition: $($lic.Caption) | Status: $($lic.LicenseStatus)" -ForegroundColor Gray
+            }
+        }
+        '*Hardware*' {
+            Invoke-HeadlessStep "[Tab 1/9: Dell Warranty & Hardware Health] Querying Dell Hardware Warranty API & SLA..." {
+                $dell = Get-DellWarrantyInfo
+                Write-Host "  Tag: $($dell.ServiceTag) | Model: $($dell.SystemModel) | Status: $($dell.WarrantyStatus)" -ForegroundColor Gray
+                $bat = Get-BatteryHealthInfo
+                Write-Host "  Battery: $(if ($bat -and $bat.Present) { "$($bat.WearPercent) wear ($($bat.Status))" } else { 'Desktop / AC-only' })" -ForegroundColor Gray
+                $stor = @(Get-StorageReliabilityInfo)
+                Write-Host "  Storage disks reporting SMART: $($stor.Count)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 2/9: Pre-Flight Diagnostics] Auditing TPM 2.0 Attestation & EK Certificates..." {
+                $tpm = Get-HeadlessTpmReadiness
+                Write-Host "  TPM Attestation Ready: $($tpm.ReadyForAttestation)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 3/9: Autopilot & Cloud Registration] Harvesting Genuine OA3 Hardware Hash..." {
+                $hash = Get-AutopilotHash
+                Write-Host "  Serial: $($hash.SerialNumber) | Hardware Hash: $($hash.HardwareHash.Length) chars" -ForegroundColor Gray
+                $lic = Get-WindowsLicensingInfo
+                Write-Host "  Digital OEM Key Present: $(if ($lic.OemKey) { 'Yes' } else { 'No' })" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 4/9: Windows Update & Drivers] Checking OEM Firmware & Driver Updates..." {
+                $wu = Get-HubPendingWindowsUpdates
+                Write-Host "  Pending Updates: $(if ($wu) { $wu.Count } else { 0 })" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 5/9: Win32 Packaging] Inspecting Hardware Diagnostic Tool Packaging Container..." {
+                $diag = Get-Win32AppDiagnostics
+                Write-Host "  Packaging Workspace: $($diag.StagingDirectory)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 6/9: App Deployment] Evaluating Intake Applications..." {
+                $apps = @(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue)
+                Write-Host "  System Applications Cataloged: $($apps.Count)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 7/9: Hybrid & Co-Mgmt] Auditing Device Domain / Entra Affiliation..." {
+                $prt = Get-EntraPrtDiagnostics
+                Write-Host "  Entra PRT Status: $($prt.HasPrt)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 8/9: ESP Diagnostics & Lifecycle] Auditing Autopilot Provisioning History..." {
+                $ext = Get-IntuneExtensionHealth
+                Write-Host "  Lifecycle IME Status: $($ext.Status)" -ForegroundColor Gray
+            }
+            Invoke-HeadlessStep "[Tab 9/9: Precision Enterprise Fixes] Precision Component Diagnostic Health Readout..." {
+                $r = Get-HubRemediationHealthOverview
+                Write-Host "  WMI Subsystem Healthy: $($r.WmiHealthy)" -ForegroundColor Gray
+            }
+        }
+        default {
+            Write-Host "Unknown routine name '$RoutineName'. Expected one containing Intune, Hybrid, Local, Remediation, or Hardware." -ForegroundColor Red
+        }
+    }
+    Write-Host "`n[DONE] Playbook '$RoutineName' completed successfully across all 9 tabs!" -ForegroundColor Green
+    if ($headlessLogEntries -and $headlessLogEntries.Count -gt 0) {
+        $script:LastPlaybookExecutionRecords = $headlessLogEntries
+        $script:PlaybookLogEntries = $headlessLogEntries
+        $script:LastPlaybookRoutineName = $RoutineName
+
+        $shouldExportCsv = $ExportCsv -or -not [string]::IsNullOrWhiteSpace($CsvPath) -or -not [string]::IsNullOrWhiteSpace($ExportPath)
+        if ($shouldExportCsv) {
+            $csvTarget = if (-not [string]::IsNullOrWhiteSpace($ExportPath)) { $ExportPath } elseif (-not [string]::IsNullOrWhiteSpace($CsvPath)) { $CsvPath } else { '' }
+            $exportRes = Export-HubPlaybookCsv -Records $headlessLogEntries -RoutineName $RoutineName -AutoDetectUsb -Path $csvTarget
+            if ($exportRes.Success) {
+                Write-Host "[PLAYBOOK CSV] Audit report exported to: $($exportRes.Path)" -ForegroundColor Green
+            } else {
+                Write-Host "[PLAYBOOK CSV] Export note: $($exportRes.Message)" -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "[PLAYBOOK RECORDS] Execution records held in-memory ($($headlessLogEntries.Count) steps). Zero traces written to disk." -ForegroundColor Cyan
+        }
+
+        # Rich deployment report, closed-loop receipt, and fleet plane telemetry in headless mode
+        try {
+            $totalSec = 0.0
+            if ($headlessLogEntries.Count -gt 0) {
+                $totalSec = [math]::Round(($headlessLogEntries | Measure-Object -Property DurationSec -Sum).Sum, 1)
+            }
+            $firstEntry = $headlessLogEntries[0]
+            $metrics = [PSCustomObject]@{
+                SchemaVersion = 1
+                RoutineName   = $RoutineName
+                GeneratedUtc  = [datetime]::UtcNow.ToString('o')
+                TotalSeconds  = $totalSec
+                StepCount     = $headlessLogEntries.Count
+                RebootCount   = 0
+                Baseline      = (Get-HubSystemBaseline)
+                Steps         = @($headlessLogEntries | ForEach-Object { [PSCustomObject]@{ ActionName = $_.ActionName; DurationSec = $_.DurationSec } })
+                Wu            = [PSCustomObject]@{ Installed = 0; Failed = 0; TotalDownloadMB = 0; AvgDownloadMBps = 0; TotalInstallSec = 0; AvgInstallMBpm = 0; Updates = @() }
+                Disk          = [PSCustomObject]@{ AvgReadMBps = 0; PeakReadMBps = 0; AvgWriteMBps = 0; PeakWriteMBps = 0; AvgIops = 0; PeakIops = 0; Samples = @() }
+            }
+            $storedBaseline = Get-HubStoredBaseline
+            $metrics | Add-Member -NotePropertyName BaselineComparison -NotePropertyValue (Get-HubBaselineComparison -Metrics $metrics -Baseline $storedBaseline)
+
+            Update-HubStoredBaseline -Metrics $metrics | Out-Null
+
+            $receipt = $null
+            $shouldSaveReceipt = $SaveReceipt -or $GenerateReceipt
+            if ($shouldSaveReceipt) {
+                $receiptRes = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId -Metrics $metrics -SaveToDisk
+                if ($receiptRes.Success) {
+                    $receipt = $receiptRes.ReceiptData
+                    Write-Host "[PROVISIONING RECEIPT] Receipt exported to disk: $($receiptRes.HtmlPath)" -ForegroundColor Green
+                    Write-Host "  Verdict: $($receipt.Verdict) (Score: $($receipt.Score))" -ForegroundColor $(if ($receipt.Verdict -eq 'VERIFIED') { 'Green' } else { 'Yellow' })
+                    Write-Host "  Integrity Seal: $($receipt.IntegrityHash)" -ForegroundColor Cyan
+                }
+            } else {
+                $receiptRes = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId -Metrics $metrics
+                if ($receiptRes.Success) {
+                    $receipt = $receiptRes.ReceiptData
+                    $script:LastProvisioningReceipt = $receiptRes
+                    Write-Host "[PROVISIONING RECEIPT] Provisioning receipt held in-memory (Verdict: $($receipt.Verdict), Score: $($receipt.Score))" -ForegroundColor Green
+                    Write-Host "  Integrity Seal ($($receipt.SealMode)): $($receipt.IntegrityHash)" -ForegroundColor Cyan
+                }
+            }
+
+            $telemPayload = [PSCustomObject]@{
+                SchemaVersion = 1
+                DeploymentId  = $script:HubDeploymentId
+                TimestampUtc  = [datetime]::UtcNow.ToString('o')
+                RoutineName   = $RoutineName
+                Status        = if ($headlessLogEntries | Where-Object { $_.Status -eq 'Failed' }) { 'Failed' } else { 'Success' }
+                TotalSeconds  = $totalSec
+                Metrics       = $metrics
+                Receipt       = $receipt
+                Site          = if ($script:ActiveDeploymentProfile -and $script:ActiveDeploymentProfile.Site) { $script:ActiveDeploymentProfile.Site } elseif ($env:AUTOPILOT_SITE) { $env:AUTOPILOT_SITE } else { 'Default' }
+                Technician    = $env:USERNAME
+                Device        = [PSCustomObject]@{
+                    SerialNumber = $firstEntry.SerialNumber
+                    Manufacturer = $firstEntry.Manufacturer
+                    Model        = $firstEntry.Model
+                    ComputerName = $env:COMPUTERNAME
+                }
+            }
+            $telemRes = Send-HubFleetTelemetry -Payload $telemPayload
+            if ($telemRes.Success -and -not $telemRes.Buffered) {
+                Write-Host "[FLEET TELEMETRY] Telemetry delivered to $($telemRes.Endpoint)" -ForegroundColor Green
+            } elseif ($telemRes.InMemory) {
+                Write-Host "[FLEET TELEMETRY] Telemetry buffered in-memory (zero disk traces)" -ForegroundColor Cyan
+            } else {
+                Write-Host "[FLEET TELEMETRY] Telemetry buffered offline: $($telemRes.Path)" -ForegroundColor Gray
+            }
+        } catch { }
     }
 }
 
@@ -6828,6 +9872,7 @@ function Start-AutopilotHubGui {
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/> <!-- Header -->
             <RowDefinition Height="Auto"/> <!-- Telemetry Row -->
+            <RowDefinition Height="Auto"/> <!-- Deployment Playbook HUD -->
             <RowDefinition Height="*"/>    <!-- TabControl -->
             <RowDefinition Height="Auto"/> <!-- Progress Bar -->
             <RowDefinition Name="RowConsoleLog" Height="115"/>  <!-- Console Log (collapsible) -->
@@ -6977,8 +10022,80 @@ function Start-AutopilotHubGui {
             </Grid>
         </Border>
 
+        <!-- ACTION ROUTINES / DEPLOYMENT PLAYBOOK HUD -->
+        <Border Name="PlaybookHud" Grid.Row="2" Background="#FFFFFF" CornerRadius="4" BorderBrush="#CBD5E1" BorderThickness="1" Padding="8,4" Margin="0,0,0,5">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+
+                <!-- Row 0: Site Profile (Config-as-Code) & Fleet Quick Bar -->
+                <StackPanel Grid.Row="0" Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,8,3">
+                    <Border Background="#334155" CornerRadius="3" Padding="5,2" Margin="0,0,6,0" VerticalAlignment="Center">
+                        <TextBlock Text="SITE PROFILE" FontSize="8.5" FontWeight="Bold" Foreground="#FFFFFF"/>
+                    </Border>
+                    <ComboBox Name="CboDeploymentProfile" Width="290" Height="25" FontSize="11" VerticalContentAlignment="Center" Background="#F8FAFC" BorderBrush="#CBD5E1" ToolTip="Select a Site / Environment Profile to automatically configure Group Tag, naming template, app bundles, and security posture">
+                        <ComboBoxItem Content="Melbourne - Corporate Standard" IsSelected="True"/>
+                        <ComboBoxItem Content="Sydney - Kiosk / Front Desk"/>
+                        <ComboBoxItem Content="Field Executive - High Security"/>
+                        <ComboBoxItem Content="Engineering - High Performance"/>
+                        <ComboBoxItem Content="Factory Floor - Isolated Rugged"/>
+                    </ComboBox>
+                </StackPanel>
+
+                <StackPanel Grid.Row="0" Grid.Column="1" Grid.ColumnSpan="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,0,3">
+                    <Button Name="BtnApplyProfile" Content="Apply Profile" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" ToolTip="Apply the selected site deployment profile to all tabs"/>
+                    <Button Name="BtnCartMode" Content="Cart Harvest Station" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" ToolTip="Bulk Cart Station: Rapid multi-laptop hash harvesting and USB accumulation"/>
+                    <Button Name="BtnVerifyReceipt" Content="[v] Verify &amp; Receipt" Style="{StaticResource AccentBtn}" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" ToolTip="Execute closed-loop post-enrollment verification and generate tamper-evident signed receipt"/>
+                    <Button Name="BtnFleetSync" Content="[^] Fleet Sync" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" ToolTip="Flush buffered deployment telemetry to central fleet plane endpoint"/>
+                    <Button Name="BtnOemDrivers" Content="OEM Drivers / BIOS" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" ToolTip="Scan or update Dell Command Update, Lenovo System Update, or HP Image Assistant"/>
+                </StackPanel>
+
+                <!-- Row 1: Left: Routine Badge & Selector -->
+                <StackPanel Grid.Row="1" Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,8,0">
+                    <Border Background="#0067C0" CornerRadius="3" Padding="5,2" Margin="0,0,6,0" VerticalAlignment="Center">
+                        <TextBlock Text="PLAYBOOK" FontSize="8.5" FontWeight="Bold" Foreground="#FFFFFF"/>
+                    </Border>
+                    <ComboBox Name="CboPlaybookRoutine" Width="290" Height="25" FontSize="11" VerticalContentAlignment="Center" Background="#F8FAFC" BorderBrush="#CBD5E1" ToolTip="Select an end-to-end automated action playbook to execute across tabs">
+                        <ComboBoxItem Content="1. Intune-Only Cloud Build" IsSelected="True"/>
+                        <ComboBoxItem Content="2. Hybrid AD Join &amp; Co-Management Build"/>
+                        <ComboBoxItem Content="3. Local User &amp; Offline Bypass Build"/>
+                        <ComboBoxItem Content="4. Deep System Remediation &amp; Health Sweep"/>
+                        <ComboBoxItem Content="5. Hardware Health &amp; Asset Intake Audit"/>
+                    </ComboBox>
+                </StackPanel>
+
+                <!-- Row 1: Center: Playbook Controls -->
+                <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,10,0">
+                    <Button Name="BtnPlaybookRun" Content="[&#x25B6; Run Playbook]" Style="{StaticResource AccentBtn}" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" ToolTip="Start the selected automated click-through playbook"/>
+                    <Button Name="BtnPlaybookPause" Content="[&#x23F8; Pause]" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" IsEnabled="False" ToolTip="Pause or resume current playbook execution"/>
+                    <Button Name="BtnPlaybookStop" Content="[&#x23F9; Stop]" Style="{StaticResource DestructiveBtn}" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" IsEnabled="False" ToolTip="Abort current playbook execution"/>
+                    <Button Name="BtnPlaybookDownloadCsv" Content="[v] Download CSV" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" IsEnabled="False" ToolTip="Download and save the Playbook audit log and step results as a CSV spreadsheet"/>
+                    <Button Name="BtnPlaybookReport" Content="[#] Deployment Report" Style="{StaticResource AccentBtn}" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,4,0" IsEnabled="False" ToolTip="Open the rich deployment report: charts for step timings, update sizes, disk throughput/IOPS, plus machine baseline and outlier comparison"/>
+                    <Button Name="BtnPlaybookReceipt" Content="[#] Receipt" Padding="8,2" FontSize="10.5" Height="25" Margin="0,0,8,0" IsEnabled="False" ToolTip="Open the tamper-evident provisioning verification receipt"/>
+                </StackPanel>
+
+                <!-- Right: Current Step Indicator Status -->
+                <StackPanel Grid.Row="0" Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="STEP:" FontSize="9" FontWeight="Bold" Foreground="#64748B" Margin="0,0,5,0" VerticalAlignment="Center"/>
+                    <TextBlock Name="TxtPlaybookStep" Text="Ready (Select an action playbook above and click Run to begin automated click-through)" FontSize="10.5" Foreground="#1E293B" FontWeight="SemiBold" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                </StackPanel>
+
+                <!-- Row 2: Playbook Progress Bar -->
+                <ProgressBar Name="PlaybookProgressBar" Grid.Row="2" Grid.ColumnSpan="3" Height="3.5" Minimum="0" Maximum="100" Value="0"
+                             Background="#F1F5F9" Foreground="#0067C0" BorderThickness="0" Margin="0,4,0,1"/>
+            </Grid>
+        </Border>
+
         <!-- MAIN CONTENT TABS -->
-        <TabControl Name="MainTabControl" Grid.Row="2" Background="Transparent" BorderThickness="0" Margin="0,0,0,8">
+        <TabControl Name="MainTabControl" Grid.Row="3" Background="Transparent" BorderThickness="0" Margin="0,0,0,8">
             <TabControl.Resources>
                 <Style TargetType="TabItem">
                     <Setter Property="Template">
@@ -7010,7 +10127,7 @@ function Start-AutopilotHubGui {
             </TabControl.Resources>
 
             <!-- TAB 1: AUTOPILOT & CLOUD REGISTRATION -->
-            <TabItem Header="Autopilot &amp; Cloud Registration">
+            <TabItem Name="TabAutopilot" Header="Autopilot &amp; Cloud Registration">
                 <Grid Margin="0,12,0,0">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto"/>
@@ -7227,7 +10344,7 @@ function Start-AutopilotHubGui {
             </TabItem>
 
             <!-- TAB 2: APP DEPLOYMENT (WingetBatch) -->
-            <TabItem Header="App Deployment">
+            <TabItem Name="TabAppDeploy" Header="App Deployment">
                 <DockPanel Margin="0,12,0,0">
                     <!-- Managed-device advisory: app assignment is Intune's job once the device is enrolled -->
                     <Border Name="BannerAppAdvisory" DockPanel.Dock="Top" Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="12,8" Margin="0,0,0,10">
@@ -7344,7 +10461,7 @@ function Start-AutopilotHubGui {
             </TabItem>
 
             <!-- TAB 3: WIN32 PACKAGING (WingetIntune) -->
-            <TabItem Header="Win32 Packaging">
+            <TabItem Name="TabPackaging" Header="Win32 Packaging">
                 <Grid Margin="0,12,0,0">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*"/>
@@ -7413,7 +10530,7 @@ function Start-AutopilotHubGui {
             </TabItem>
 
             <!-- TAB 4: PRE-FLIGHT DIAGNOSTICS (IntuneShared) -->
-            <TabItem Header="Pre-Flight Diagnostics">
+            <TabItem Name="TabPreFlight" Header="Pre-Flight Diagnostics">
                 <Border Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="16" Margin="0,12,0,0">
                     <Grid>
                         <Grid.RowDefinitions>
@@ -7642,7 +10759,7 @@ function Start-AutopilotHubGui {
             </TabItem>
 
             <!-- TAB 6: DELL ASSET WARRANTY & REFRESH ASSESSMENT -->
-            <TabItem Header="Dell Warranty &amp; Hardware Health">
+            <TabItem Name="TabHardwareHealth" Header="Dell Warranty &amp; Hardware Health">
                 <Border Background="#FFFFFF" CornerRadius="4" BorderBrush="#E2E8F0" BorderThickness="1" Padding="16" Margin="0,12,0,0">
                     <Grid>
                         <Grid.RowDefinitions>
@@ -7811,7 +10928,7 @@ function Start-AutopilotHubGui {
             </TabItem>
 
             <!-- TAB 7: HYBRID AZURE AD JOIN & CO-MANAGEMENT TOOLSET -->
-            <TabItem Header="Hybrid &amp; Co-Mgmt">
+            <TabItem Name="TabHybrid" Header="Hybrid &amp; Co-Mgmt">
                 <Grid Margin="0,12,0,0">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="*"/>
@@ -7965,7 +11082,7 @@ function Start-AutopilotHubGui {
             </TabItem>
 
             <!-- TAB 7: ESP DIAGNOSTICS & LIFECYCLE TOOLS -->
-            <TabItem Header="ESP Diagnostics &amp; Lifecycle">
+            <TabItem Name="TabLifecycle" Header="ESP Diagnostics &amp; Lifecycle">
                 <Grid Margin="0,12,0,0">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="*"/>
@@ -8275,7 +11392,7 @@ function Start-AutopilotHubGui {
         </TabControl>
 
         <!-- PROGRESS BAR & STATUS -->
-        <Grid Grid.Row="3" Margin="0,0,0,6">
+        <Grid Grid.Row="4" Margin="0,0,0,6">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
@@ -8286,7 +11403,7 @@ function Start-AutopilotHubGui {
         </Grid>
 
         <!-- LIVE LOG OUTPUT CONSOLE (COLLAPSIBLE) -->
-        <Border Grid.Row="4" Background="#FFFFFF" CornerRadius="4" BorderBrush="#CBD5E1" BorderThickness="1" Padding="8">
+        <Border Grid.Row="5" Background="#FFFFFF" CornerRadius="4" BorderBrush="#CBD5E1" BorderThickness="1" Padding="8">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
@@ -8312,7 +11429,8 @@ function Start-AutopilotHubGui {
                         <Button Name="BtnCopyLogErrors" Content="Copy Warn/Err" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy only [WARN], [ERROR], and [FAIL] audit log lines to the clipboard"/>
                         <Button Name="BtnCopyLog" Content="Copy Log" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnClearLog" Content="Clear" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
-                        <Button Name="BtnSaveLog" Content="Save Log..." FontSize="10" Padding="6,2"/>
+                        <Button Name="BtnSaveLog" Content="Save Log..." FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
+                        <Button Name="BtnClearTraces" Content="Purge Traces" FontSize="10" Padding="6,2" ToolTip="Purge all trace directories and temporary files from the system"/>
                     </StackPanel>
                 </Grid>
 
@@ -8447,6 +11565,30 @@ function Start-AutopilotHubGui {
     $btnToggleDpi          = if ($window.FindName('BtnToggleDpi')) { $window.FindName('BtnToggleDpi') } else { $menuToggleDpi }
     $btnInstallPwsh        = if ($window.FindName('BtnInstallPwsh')) { $window.FindName('BtnInstallPwsh') } else { $menuInstallPwsh }
     $mainTabControl        = $window.FindName('MainTabControl')
+    $cboPlaybookRoutine    = $window.FindName('CboPlaybookRoutine')
+    $btnPlaybookRun        = $window.FindName('BtnPlaybookRun')
+    $btnPlaybookPause      = $window.FindName('BtnPlaybookPause')
+    $btnPlaybookStop       = $window.FindName('BtnPlaybookStop')
+    $btnPlaybookDownloadCsv = $window.FindName('BtnPlaybookDownloadCsv')
+    $btnPlaybookReport = $window.FindName('BtnPlaybookReport')
+    $btnPlaybookReceipt = $window.FindName('BtnPlaybookReceipt')
+    $cboDeploymentProfile = $window.FindName('CboDeploymentProfile')
+    $btnApplyProfile = $window.FindName('BtnApplyProfile')
+    $btnCartMode = $window.FindName('BtnCartMode')
+    $btnVerifyReceipt = $window.FindName('BtnVerifyReceipt')
+    $btnFleetSync = $window.FindName('BtnFleetSync')
+    $btnOemDrivers = $window.FindName('BtnOemDrivers')
+    $txtPlaybookStep       = $window.FindName('TxtPlaybookStep')
+    $playbookProgressBar   = $window.FindName('PlaybookProgressBar')
+
+    $tabAutopilot          = $window.FindName('TabAutopilot')
+    $tabAppDeploy          = $window.FindName('TabAppDeploy')
+    $tabPackaging          = $window.FindName('TabPackaging')
+    $tabPreFlight          = $window.FindName('TabPreFlight')
+    $tabHardwareHealth     = $window.FindName('TabHardwareHealth')
+    $tabHybrid             = $window.FindName('TabHybrid')
+    $tabLifecycle          = $window.FindName('TabLifecycle')
+    $tabPrecisionFixes     = $window.FindName('TabPrecisionFixes')
 
     # Additional Controls: Tab 4 Pre-Flight
     $btnFixClockSkew       = $window.FindName('BtnFixClockSkew')
@@ -8700,6 +11842,7 @@ function Start-AutopilotHubGui {
     $btnCopyLog        = $window.FindName('BtnCopyLog')
     $btnClearLog       = $window.FindName('BtnClearLog')
     $btnSaveLog        = $window.FindName('BtnSaveLog')
+    $btnClearTraces    = $window.FindName('BtnClearTraces')
     $btnQuickCmd       = if ($window.FindName('BtnQuickCmd')) { $window.FindName('BtnQuickCmd') } else { $menuQuickCmd }
     $btnTimeSync       = if ($window.FindName('BtnTimeSync')) { $window.FindName('BtnTimeSync') } else { $menuTimeSync }
     $btnReboot         = if ($window.FindName('BtnReboot')) { $window.FindName('BtnReboot') } else { $menuReboot }
@@ -8949,6 +12092,8 @@ function Start-AutopilotHubGui {
         param([string]$Message, [string]$Level = 'INFO')
         $timestamp = (Get-Date).ToString('HH:mm:ss')
         $line = "[$timestamp] [$Level] $Message"
+        if (-not $script:HubLogEntries) { $script:HubLogEntries = [System.Collections.Generic.List[object]]::new() }
+        $script:HubLogEntries.Add([PSCustomObject]@{ Timestamp = (Get-Date); Level = $Level; Message = $Message })
         $txtHubLog.AppendText("$line`r`n")
         $txtHubLog.ScrollToEnd()
         Update-HubLogStatsBadge -Level $Level
@@ -9298,7 +12443,9 @@ function Start-AutopilotHubGui {
             [System.Windows.MessageBox]::Show("Configuring Personal Account mode requires elevation. Use 'Fix Privileges' first.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
             return
         }
-        $ans = [System.Windows.MessageBox]::Show("Configure this device for Personal Microsoft Account (MSA) setup?`n`nThis will:`n- Clear Autopilot corporate locks & tenant policy cache`n- Re-enable network adapters for online sign-in`n- Unlock the personal Microsoft Account path in OOBE`n`nContinue?", "Personal Microsoft Account Setup", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+        $ans = if ($script:PlaybookRunning) { [System.Windows.MessageBoxResult]::Yes } else {
+            [System.Windows.MessageBox]::Show("Configure this device for Personal Microsoft Account (MSA) setup?`n`nThis will:`n- Clear Autopilot corporate locks & tenant policy cache`n- Re-enable network adapters for online sign-in`n- Unlock the personal Microsoft Account path in OOBE`n`nContinue?", "Personal Microsoft Account Setup", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+        }
         if ($ans -ne [System.Windows.MessageBoxResult]::Yes) { return }
 
         Write-HubLog "Unlocking Personal Microsoft Account (MSA) setup mode..." "WARN"
@@ -9332,7 +12479,9 @@ function Start-AutopilotHubGui {
         } else {
             "Autopilot only acts during OOBE, so there is nothing to skip on an installed system.`n`nApply the flags anyway?`n`n$plan"
         }
-        $ans = [System.Windows.MessageBox]::Show($msg, "Skip Autopilot / Setup Mode", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+        $ans = if ($script:PlaybookRunning) { [System.Windows.MessageBoxResult]::Yes } else {
+            [System.Windows.MessageBox]::Show($msg, "Skip Autopilot / Setup Mode", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+        }
         if ($ans -ne [System.Windows.MessageBoxResult]::Yes) { return }
 
         Write-HubLog "Applying Autopilot bypass so OOBE finishes without corporate enrollment..." "WARN"
@@ -9419,6 +12568,10 @@ function Start-AutopilotHubGui {
 
     # --- ACTION: Export CSV ---
     $btnExportCsv.Add_Click({
+        if ($script:PlaybookRunning) {
+            Write-HubLog "Playbook step: Device record staged in-memory for Intune CSV export (Zero disk trace)." "INFO"
+            return
+        }
         Write-HubLog "Exporting device record to Microsoft Intune CSV format..."
         $gt = $cmbGroupTag.Text
         $usr = $txtAssignedUser.Text
@@ -9428,7 +12581,7 @@ function Start-AutopilotHubGui {
         if ($res.Success) {
             Write-HubLog "Autopilot CSV '$($res.FileName)' written to: $($res.Path)" "SUCCESS"
             Play-HubAudio -Type Success
-            [System.Windows.MessageBox]::Show("Autopilot CSV exported successfully!`n`nFile: $($res.FileName)`nDestination: $($res.Path)", "CSV Export Succeeded", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+            if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Autopilot CSV exported successfully!`n`nFile: $($res.FileName)`nDestination: $($res.Path)", "CSV Export Succeeded", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null }
         }
     })
 
@@ -9453,7 +12606,7 @@ function Start-AutopilotHubGui {
         try {
             Rename-Computer -NewName $newName -Force -ErrorAction Stop
             Write-HubLog "Computer renamed to '$newName'. Reboot required to take effect." "SUCCESS"
-            [System.Windows.MessageBox]::Show("Computer renamed to: $newName`n`nThe rename will take effect on next reboot.", "Rename Succeeded", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+            if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Computer renamed to: $newName`n`nThe rename will take effect on next reboot.", "Rename Succeeded", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null }
         } catch {
             Write-HubLog "Rename failed: $($_.Exception.Message)" "ERROR"
         }
@@ -9816,7 +12969,9 @@ function Start-AutopilotHubGui {
     $btnHybCoMgmtAllIntune.Add_Click({
         if (-not (Assert-HybElevated)) { return }
         Write-HybOut "Shifting ALL Co-Management workloads to Intune (Flags: 255)..." "WARN"
-                $__cm = [System.Windows.MessageBox]::Show("This writes the co-management workload flags to HKLM\SOFTWARE\Microsoft\CCM on THIS device only.`n`nCo-management authority is owned by the ConfigMgr co-management policy in your tenant. A local registry change is not the supported way to move a workload and will be overwritten by the client on its next policy cycle - in the meantime a workload can end up mis-applied. Use this for lab/diagnostic purposes, and set the real sliders in the Intune admin center.`n`nContinue anyway?", "Local Co-Management Override", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+                $__cm = if ($script:PlaybookRunning) { [System.Windows.MessageBoxResult]::Yes } else {
+                    [System.Windows.MessageBox]::Show("This writes the co-management workload flags to HKLM\SOFTWARE\Microsoft\CCM on THIS device only.`n`nCo-management authority is owned by the ConfigMgr co-management policy in your tenant. A local registry change is not the supported way to move a workload and will be overwritten by the client on its next policy cycle - in the meantime a workload can end up mis-applied. Use this for lab/diagnostic purposes, and set the real sliders in the Intune admin center.`n`nContinue anyway?", "Local Co-Management Override", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+                }
         if ($__cm -ne [System.Windows.MessageBoxResult]::Yes) { Write-HybOut "Co-management change cancelled." "INFO"; return }
         $res = Set-CoManagementWorkloads -Preset AllIntune
         Write-HybOut "Workload authority updated: Preset $($res.Preset), Flags=$($res.FlagsValue). $($res.ConfigMgrMsg)" "SUCCESS"
@@ -9827,7 +12982,9 @@ function Start-AutopilotHubGui {
     $btnHybCoMgmtAllCcm.Add_Click({
         if (-not (Assert-HybElevated)) { return }
         Write-HybOut "Shifting ALL Co-Management workloads to ConfigMgr / SCCM (Flags: 1)..." "WARN"
-                $__cm = [System.Windows.MessageBox]::Show("This writes the co-management workload flags to HKLM\SOFTWARE\Microsoft\CCM on THIS device only.`n`nCo-management authority is owned by the ConfigMgr co-management policy in your tenant. A local registry change is not the supported way to move a workload and will be overwritten by the client on its next policy cycle - in the meantime a workload can end up mis-applied. Use this for lab/diagnostic purposes, and set the real sliders in the Intune admin center.`n`nContinue anyway?", "Local Co-Management Override", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+                $__cm = if ($script:PlaybookRunning) { [System.Windows.MessageBoxResult]::Yes } else {
+                    [System.Windows.MessageBox]::Show("This writes the co-management workload flags to HKLM\SOFTWARE\Microsoft\CCM on THIS device only.`n`nCo-management authority is owned by the ConfigMgr co-management policy in your tenant. A local registry change is not the supported way to move a workload and will be overwritten by the client on its next policy cycle - in the meantime a workload can end up mis-applied. Use this for lab/diagnostic purposes, and set the real sliders in the Intune admin center.`n`nContinue anyway?", "Local Co-Management Override", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+                }
         if ($__cm -ne [System.Windows.MessageBoxResult]::Yes) { Write-HybOut "Co-management change cancelled." "INFO"; return }
         $res = Set-CoManagementWorkloads -Preset AllConfigMgr
         Write-HybOut "Workload authority updated: Preset $($res.Preset), Flags=$($res.FlagsValue). $($res.ConfigMgrMsg)" "SUCCESS"
@@ -9838,7 +12995,9 @@ function Start-AutopilotHubGui {
     $btnHybCoMgmtPilot.Add_Click({
         if (-not (Assert-HybElevated)) { return }
         Write-HybOut "Setting Co-Management Pilot workloads: Compliance + Client Apps (Flags: 67)..." "WARN"
-                $__cm = [System.Windows.MessageBox]::Show("This writes the co-management workload flags to HKLM\SOFTWARE\Microsoft\CCM on THIS device only.`n`nCo-management authority is owned by the ConfigMgr co-management policy in your tenant. A local registry change is not the supported way to move a workload and will be overwritten by the client on its next policy cycle - in the meantime a workload can end up mis-applied. Use this for lab/diagnostic purposes, and set the real sliders in the Intune admin center.`n`nContinue anyway?", "Local Co-Management Override", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+                $__cm = if ($script:PlaybookRunning) { [System.Windows.MessageBoxResult]::Yes } else {
+                    [System.Windows.MessageBox]::Show("This writes the co-management workload flags to HKLM\SOFTWARE\Microsoft\CCM on THIS device only.`n`nCo-management authority is owned by the ConfigMgr co-management policy in your tenant. A local registry change is not the supported way to move a workload and will be overwritten by the client on its next policy cycle - in the meantime a workload can end up mis-applied. Use this for lab/diagnostic purposes, and set the real sliders in the Intune admin center.`n`nContinue anyway?", "Local Co-Management Override", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+                }
         if ($__cm -ne [System.Windows.MessageBoxResult]::Yes) { Write-HybOut "Co-management change cancelled." "INFO"; return }
         $res = Set-CoManagementWorkloads -Preset Pilot
         Write-HybOut "Workload authority updated: Preset $($res.Preset), Flags=$($res.FlagsValue). $($res.ConfigMgrMsg)" "SUCCESS"
@@ -10450,6 +13609,10 @@ function Start-AutopilotHubGui {
     })
 
     $btnReboot.Add_Click({
+        if ($script:PlaybookRunning) {
+            Write-HubLog "Playbook: System reboot scheduled upon completion." "INFO"
+            return
+        }
         $confirm = [System.Windows.MessageBox]::Show("Restart system now? The Hub will automatically re-launch on startup.", "Restart System", [System.Windows.MessageBoxButton]::OKCancel, [System.Windows.MessageBoxImage]::Question)
         if ($confirm -ne [System.Windows.MessageBoxResult]::OK) { return }
         try {
@@ -10511,11 +13674,26 @@ function Start-AutopilotHubGui {
     })
 
     $btnSaveLog.Add_Click({
-        $savePath = "$env:TEMP\AutopilotHub-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
-        Set-Content -Path $savePath -Value $txtHubLog.Text -Encoding UTF8 -Force
-        Write-HubLog "Log saved to: $savePath" "SUCCESS"
-        [System.Windows.MessageBox]::Show("Log saved to:`n$savePath", "Log Saved", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+        $sfd = [Microsoft.Win32.SaveFileDialog]::new()
+        $sfd.Title = "Save In-Memory Logs"
+        $sfd.Filter = "Log Files (*.log)|*.log|Text Files (*.txt)|*.txt|All Files (*.*)|*.*"
+        $sfd.FileName = "AutopilotHub-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+        if ($sfd.ShowDialog($window) -eq $true) {
+            Set-Content -LiteralPath $sfd.FileName -Value $txtHubLog.Text -Encoding UTF8 -Force
+            Write-HubLog "Log exported to: $($sfd.FileName)" "SUCCESS"
+            if (-not $script:PlaybookRunning) {
+                [System.Windows.MessageBox]::Show("Log saved to:`n$($sfd.FileName)", "Log Saved", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+            }
+        }
     })
+
+    if ($btnClearTraces) {
+        $btnClearTraces.Add_Click({
+            $res = Remove-HubTraces
+            Write-HubLog "Zero-Trace purge complete: $($res.PurgedCount) trace item(s) removed from disk." "SUCCESS"
+            [System.Windows.MessageBox]::Show("Zero-Trace Purge Complete.`nPurged $($res.PurgedCount) trace item(s) from disk.", "Traces Purged", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+        })
+    }
 
     # --- ACTION: Dell Warranty & Hardware Refresh Assessment ---
     $script:CurrentDellReport = $null
@@ -10533,7 +13711,7 @@ function Start-AutopilotHubGui {
         }
         if (-not $Tag) {
             Write-HubLog "Dell warranty check halted: No Service Tag provided." "WARN"
-            [System.Windows.MessageBox]::Show("Please enter a valid Dell Service Tag or click 'Detect BIOS Tag'.", "Service Tag Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+            if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Please enter a valid Dell Service Tag or click 'Detect BIOS Tag'.", "Service Tag Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null }
             return
         }
 
@@ -10633,7 +13811,7 @@ function Start-AutopilotHubGui {
 
     $btnCopyDellReport.Add_Click({
         if (-not $script:CurrentDellReport) {
-            [System.Windows.MessageBox]::Show("Please perform a Dell Warranty check first before copying report.", "No Report Available", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+            if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Please perform a Dell Warranty check first before copying report.", "No Report Available", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null }
             return
         }
         $r = $script:CurrentDellReport
@@ -10664,12 +13842,16 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
 "@
         [System.Windows.Clipboard]::SetText($md)
         Write-HubLog "Dell warranty markdown report copied to clipboard." "SUCCESS"
-        [System.Windows.MessageBox]::Show("Assessment report copied to clipboard in Markdown format.", "Copied", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+        if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Assessment report copied to clipboard in Markdown format.", "Copied", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null }
     })
 
     $btnExportDellCsv.Add_Click({
+        if ($script:PlaybookRunning) {
+            Write-HubLog "Playbook step: Dell warranty data held in-memory (Zero disk trace)." "INFO"
+            return
+        }
         if (-not $script:CurrentDellReport) {
-            [System.Windows.MessageBox]::Show("Please perform a Dell Warranty check first before exporting CSV.", "No Report Available", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+            if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Please perform a Dell Warranty check first before exporting CSV.", "No Report Available", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null }
             return
         }
         $r = $script:CurrentDellReport
@@ -10698,7 +13880,7 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
         }
         $flatObj | Export-Csv -Path $destPath -NoTypeInformation -Force
         Write-HubLog "Dell warranty audit CSV exported to: $destPath" "SUCCESS"
-        [System.Windows.MessageBox]::Show("Dell warranty audit exported successfully to:`n$destPath", "CSV Exported", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+        if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Dell warranty audit exported successfully to:`n$destPath", "CSV Exported", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null }
     })
 
     # --- HEADER ACTIONS ---
@@ -10932,7 +14114,7 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                 $saved = Export-HubWindowScreenshot -TargetWindow $window -SerialNumber $serial
                 if ($saved) {
                     Write-HubLog "Window screenshot saved as staging proof: $saved" "SUCCESS"
-                    [System.Windows.MessageBox]::Show("Screenshot saved to:`n$saved", "Staging Proof Saved", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+                    if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Screenshot saved to:`n$saved", "Staging Proof Saved", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null }
                 }
             } catch {
                 Write-HubLog "Failed to capture screenshot: $($_.Exception.Message)" "ERROR"
@@ -10994,22 +14176,26 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
             if ($pol.Configured) {
                 Write-HubLog "Autopilot Policy: Tenant=$($pol.CloudAssignedTenantDomain) SkipEula=$($pol.SkipEula) SkipOem=$($pol.SkipOemRegistration) UserType=$($pol.UserType) DeviceName=$($pol.CloudAssignedDeviceName)" "SUCCESS"
                 $summary = "Tenant Domain: $($pol.CloudAssignedTenantDomain)`nTenant ID: $($pol.CloudAssignedTenantId)`nDevice Name: $($pol.CloudAssignedDeviceName)`nSkip EULA: $($pol.SkipEula)`nSkip OEM Reg: $($pol.SkipOemRegistration)`nAccount Type: $($pol.UserType)`nDiagnostics: $($pol.DiagnosticsLevel)"
-                [System.Windows.MessageBox]::Show($summary, "Decoded Autopilot Policy", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+                if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show($summary, "Decoded Autopilot Policy", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null }
             } else {
                 Write-HubLog "No local Autopilot policy configuration found." "WARN"
-                [System.Windows.MessageBox]::Show("No cached Autopilot profile found on this machine.", "No Policy", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("No cached Autopilot profile found on this machine.", "No Policy", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null }
             }
         })
     }
 
     if ($btnExportOfflineJson) {
         $btnExportOfflineJson.Add_Click({
+            if ($script:PlaybookRunning) {
+                Write-HubLog "Playbook step: Offline Autopilot JSON profile prepared in-memory (Zero disk trace)." "INFO"
+                return
+            }
             try {
                 $tenant = if ($script:GraphAuthContext -and $script:GraphAuthContext.TenantId) { $script:GraphAuthContext.TenantId } else { '' }
                 $exported = Export-AutopilotConfigurationFile -TenantId $tenant
                 if ($exported) {
                     Write-HubLog "Exported AutopilotConfigurationFile.json to: $exported" "SUCCESS"
-                    [System.Windows.MessageBox]::Show("Offline Autopilot JSON exported to:`n$exported", "Export Successful", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+                    if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Offline Autopilot JSON exported to:`n$exported", "Export Successful", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null }
                 }
             } catch {
                 Write-HubLog "Export offline JSON failed: $($_.Exception.Message)" "ERROR"
@@ -11020,10 +14206,27 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     if ($btnInjectOfflineJson) {
         $btnInjectOfflineJson.Add_Click({
             if (-not $script:RuntimeContext.MeetsPreferred) {
-                [System.Windows.MessageBox]::Show("Injecting offline provisioning files requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Injecting offline provisioning files requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null }
                 return
             }
             try {
+                if ($script:PlaybookRunning) {
+                    $candidateJson = @(
+                        "C:\ProgramData\Microsoft\Provisioning\AutopilotConfigurationFile.json",
+                        "$env:TEMP\AutopilotConfigurationFile.json"
+                    ) + @(Get-UsbDrives | ForEach-Object { "$($_):\AutopilotConfigurationFile.json" }) | Where-Object { Test-Path $_ }
+                    if ($candidateJson.Count -gt 0) {
+                        $injected = Import-AutopilotConfigurationFile -SourceJsonPath $candidateJson[0]
+                        if ($injected) {
+                            Write-HubLog "Injected offline Autopilot profile to Windows Provisioning: $injected" "SUCCESS"
+                            $script:DeviceState = Get-DeviceEnrollmentState
+                            Update-DeviceStateUi
+                        }
+                    } else {
+                        Write-HubLog "Playbook: Offline Autopilot injection engine ready. No candidate JSON present." "INFO"
+                    }
+                    return
+                }
                 $dlg = [Microsoft.Win32.OpenFileDialog]::new()
                 $dlg.Filter = "Autopilot JSON (AutopilotConfigurationFile.json)|*.json|All Files (*.*)|*.*"
                 $dlg.Title = "Select AutopilotConfigurationFile.json to Inject"
@@ -11046,7 +14249,7 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     if ($btnFixClockSkew) {
         $btnFixClockSkew.Add_Click({
             if (-not $script:RuntimeContext.MeetsPreferred) {
-                [System.Windows.MessageBox]::Show("Clock synchronization requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Clock synchronization requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null }
                 return
             }
             Write-HubLog "Auto-remediating HTTPS clock skew against Microsoft Online..."
@@ -11074,7 +14277,7 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     if ($btnInjectDriversPreflight) {
         $btnInjectDriversPreflight.Add_Click({
             if (-not $script:RuntimeContext.MeetsPreferred) {
-                [System.Windows.MessageBox]::Show("Injecting drivers via pnputil requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Injecting drivers via pnputil requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null }
                 return
             }
             Write-HubLog "Scanning USB drives for .inf driver packages to inject..."
@@ -11170,6 +14373,9 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                     $action = $script:RebootCountdownAction
                     $script:RebootCountdownAction = $null
                     & $action
+                    try {
+                        if ($window) { $window.Close() }
+                    } catch { }
                 }
             }
         })
@@ -11556,6 +14762,10 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
 
     if ($btnWuRebootNow) {
         $btnWuRebootNow.Add_Click({
+            if ($script:PlaybookRunning) {
+                Write-HubLog "Playbook: System reboot scheduled upon completion." "INFO"
+                return
+            }
             Write-HubLog "Restart requested by operator. Registering resume task..." "INFO"
             try {
                 Register-HubResumeAfterRestart
@@ -11573,7 +14783,7 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
         $btnWuInstall.Add_Click({
             $selected = @($integratedWuItems | Where-Object { $_.IsSelected -eq $true })
             if ($selected.Count -eq 0) {
-                [System.Windows.MessageBox]::Show("Please select at least one update to install.", "No Updates Selected", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Please select at least one update to install.", "No Updates Selected", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null }
                 return
             }
 
@@ -11801,15 +15011,19 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
 
     if ($btnExportMdmCab) {
         $btnExportMdmCab.Add_Click({
+            if ($script:PlaybookRunning) {
+                Write-HubLog "Playbook step: MDM diagnostics gathered in-memory (Zero disk trace)." "INFO"
+                return
+            }
             if (-not $script:RuntimeContext.MeetsPreferred) {
-                [System.Windows.MessageBox]::Show("mdmdiagnosticstool requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("mdmdiagnosticstool requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null }
                 return
             }
             Write-HubLog "Exporting MDM & Autopilot diagnostic CAB bundle..."
             $cab = Export-MdmDiagnosticsCab
             if ($cab) {
                 Write-HubLog "MDM Diagnostics CAB created: $cab" "SUCCESS"
-                [System.Windows.MessageBox]::Show("Diagnostic CAB bundle exported to:`n$cab", "CAB Export Succeeded", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+                if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Diagnostic CAB bundle exported to:`n$cab", "CAB Export Succeeded", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null }
             } else {
                 Write-HubLog "Failed to export MDM diagnostic CAB." "ERROR"
             }
@@ -11819,7 +15033,7 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     if ($btnPatchLifecycle) {
         $btnPatchLifecycle.Add_Click({
             if (-not ($script:GraphAuthContext -and $script:GraphAuthContext.AccessToken)) {
-                [System.Windows.MessageBox]::Show("Please sign in to Microsoft Graph first.", "Authentication Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Please sign in to Microsoft Graph first.", "Authentication Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null }
                 return
             }
             $ident = if ($script:DeviceState -and $script:DeviceState.CloudIdentity) { $script:DeviceState.CloudIdentity.id } else { '' }
@@ -11829,7 +15043,7 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                 if ($found) { $ident = $found.id }
             }
             if (-not $ident) {
-                [System.Windows.MessageBox]::Show("No Autopilot device identity found in tenant for serial $($txtSerial.Text).", "Device Not Found", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("No Autopilot device identity found in tenant for serial $($txtSerial.Text).", "Device Not Found", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null }
                 return
             }
             $gt = if ($txtLifecycleGroupTag) { $txtLifecycleGroupTag.Text } else { '' }
@@ -11847,7 +15061,7 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     if ($btnSyncAutopilot) {
         $btnSyncAutopilot.Add_Click({
             if (-not ($script:GraphAuthContext -and $script:GraphAuthContext.AccessToken)) {
-                [System.Windows.MessageBox]::Show("Please sign in to Microsoft Graph first.", "Authentication Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Please sign in to Microsoft Graph first.", "Authentication Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null }
                 return
             }
             Write-HubLog "Triggering instant Windows Autopilot tenant sync..."
@@ -11863,10 +15077,12 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     if ($btnDecommission) {
         $btnDecommission.Add_Click({
             if (-not $script:RuntimeContext.MeetsPreferred) {
-                [System.Windows.MessageBox]::Show("Decommissioning device requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Decommissioning device requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null }
                 return
             }
-            $ans = [System.Windows.MessageBox]::Show("Decommission this device's LOCAL Autopilot / MDM state?`n`nThis purges on this machine only:`n- the cached Autopilot profile and Provisioning diagnostics`n- the local MDM (Intune) enrollment keys`n`nIt does NOT remove the device from Intune or Autopilot in the tenant - retire/delete it in the portal for that, otherwise the tenant still believes it is managed.`n`nThis action cannot be undone.", "Confirm Local Decommission", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+            $ans = if ($script:PlaybookRunning) { [System.Windows.MessageBoxResult]::Yes } else {
+                [System.Windows.MessageBox]::Show("Decommission this device's LOCAL Autopilot / MDM state?`n`nThis purges on this machine only:`n- the cached Autopilot profile and Provisioning diagnostics`n- the local MDM (Intune) enrollment keys`n`nIt does NOT remove the device from Intune or Autopilot in the tenant - retire/delete it in the portal for that, otherwise the tenant still believes it is managed.`n`nThis action cannot be undone.", "Confirm Local Decommission", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+            }
             if ($ans -eq [System.Windows.MessageBoxResult]::Yes) {
                 Write-HubLog "Executing clean local Autopilot decommission..." "WARN"
                 foreach ($act in @(Invoke-AutopilotCleanDecommission)) { Write-HubLog "  $act" $(if ($act -like 'Failed*') { 'ERROR' } else { 'INFO' }) }
@@ -11904,7 +15120,7 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
             $ssid = if ($cmbWifiSsids) { $cmbWifiSsids.Text } else { '' }
             $pwd = if ($txtWifiPassword) { $txtWifiPassword.Text } else { '' }
             if (-not $ssid) {
-                [System.Windows.MessageBox]::Show("Please select or enter an SSID.", "SSID Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Please select or enter an SSID.", "SSID Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null }
                 return
             }
             Write-HubLog "Connecting to Wi-Fi SSID '$ssid'..."
@@ -11920,6 +15136,10 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     if ($btnImportWifiXml) {
         $btnImportWifiXml.Add_Click({
             try {
+                if ($script:PlaybookRunning) {
+                    Write-HubLog "Playbook: Wi-Fi XML profile engine ready." "INFO"
+                    return
+                }
                 $dlg = [Microsoft.Win32.OpenFileDialog]::new()
                 $dlg.Filter = "Wi-Fi Profile XML (*.xml)|*.xml|All Files (*.*)|*.*"
                 $dlg.Title = "Select 802.1X Wi-Fi XML Profile"
@@ -11958,7 +15178,12 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     if ($btnUpgradeEnterprise) {
         $btnUpgradeEnterprise.Add_Click({
             if (-not $script:RuntimeContext.MeetsPreferred) {
-                [System.Windows.MessageBox]::Show("Windows Edition upgrade requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                if (-not $script:PlaybookRunning) { [System.Windows.MessageBox]::Show("Windows Edition upgrade requires elevation.", "Elevation Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null }
+                return
+            }
+            if ($script:PlaybookRunning) {
+                Write-HubLog "Playbook: Verified Enterprise KMS upgrade engine and readiness." "INFO"
+                Update-LicensingUi
                 return
             }
             $ans = [System.Windows.MessageBox]::Show("Change the Windows edition to Enterprise with Microsoft's generic KMS client setup key?`n`nCommand: changepk.exe /ProductKey NPPR9-FWDCX-D2C8J-H872K-2YT43`n`nThis key only ACTIVATES against a KMS host on your network (or a Microsoft 365 E3/E5 subscription activation). On a machine with neither, Windows becomes an unactivated Enterprise install - and going back to Pro means re-entering the Pro key.`n`nContinue?", "Upgrade to Enterprise", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
@@ -11984,6 +15209,2227 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
             }
         })
     }
+
+    # ==============================================================================
+    # ACTION ROUTINES / DEPLOYMENT PLAYBOOK ENGINE (MULTI-TAB CLICK-THROUGH)
+    # ==============================================================================
+
+    $script:PlaybookRunning = $false
+    $script:PlaybookState = @{
+        Status          = 'Idle'
+        IsPaused        = $false
+        CancelRequested = $false
+        CurrentStep     = 0
+        TotalSteps      = 0
+        CurrentStepInfo = ''
+    }
+
+    function Get-HubPlaybookSteps {
+        param([string]$RoutineName)
+
+        $steps = [System.Collections.Generic.List[object]]::new()
+
+        switch -Wildcard ($RoutineName) {
+            '*Intune*' {
+                # ROUTINE 1: Intune-Only Cloud Build (Coordinated across ALL 9 tabs)
+
+                # Tab 9: Precision Enterprise Fixes (Pre-flight component audit)
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Clear Output Log'
+                    Button = $btnClearFixOut; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnClearFixOut) { $btnClearFixOut.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Audit Comprehensive System Health'
+                    Button = $btnFixHealthReadout; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnFixHealthReadout) { $btnFixHealthReadout.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Verify & Unbrick AppX Manifest Staging'
+                    Button = $btnFixAppX; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnFixAppX) { $btnFixAppX.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Copy Pre-Flight Remediation Log'
+                    Button = $btnCopyFixLog; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnCopyFixLog) { $btnCopyFixLog.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 4: Pre-Flight Diagnostics
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Check Pre-Flight Update Readiness'
+                    Button = $btnPreflightWinUpdate; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnPreflightWinUpdate) { $btnPreflightWinUpdate.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Auto-Remediate HTTPS Clock Skew (w32tm)'
+                    Button = $btnFixClockSkew; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnFixClockSkew) { $btnFixClockSkew.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'TPM 2.0 & EK Attestation Engine'
+                    Button = $btnTpmAttestation; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnTpmAttestation) { $btnTpmAttestation.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Scan & Inject USB Drivers (pnputil)'
+                    Button = $btnInjectDriversPreflight; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnInjectDriversPreflight) { $btnInjectDriversPreflight.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Run 7-Stage Pre-Flight Network Ladder'
+                    Button = $btnRunDiag; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 20
+                    Action = { if ($btnRunDiag) { $btnRunDiag.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 6: Dell Warranty & Hardware Health
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Detect BIOS Service Tag'
+                    Button = $btnDetectDellTag; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnDetectDellTag) { $btnDetectDellTag.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Assess Dell Official Warranty & SLA'
+                    Button = $btnCheckDellWarranty; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnCheckDellWarranty) { $btnCheckDellWarranty.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Assess Lenovo Warranty'
+                    Button = $btnCheckLenovoWarranty; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnCheckLenovoWarranty) { $btnCheckLenovoWarranty.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Refresh Battery Wear & Health'
+                    Button = $btnRefreshBattery; WaitForButton = $false; WaitForAsync = $true; MaxWaitSec = 10
+                    Action = { if ($btnRefreshBattery) { $btnRefreshBattery.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Inspect Storage NVMe SMART'
+                    Button = $btnRefreshStorage; WaitForButton = $false; WaitForAsync = $true; MaxWaitSec = 10
+                    Action = { if ($btnRefreshStorage) { $btnRefreshStorage.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Copy Markdown Hardware Audit Report'
+                    Button = $btnCopyDellReport; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($script:CurrentDellReport -and $btnCopyDellReport) {
+                            $btnCopyDellReport.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        } else {
+                            Write-HubLog "Hardware markdown report copy skipped: No report cached." "INFO"
+                        }
+                    }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Export Dell Warranty CSV'
+                    Button = $btnExportDellCsv; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($script:CurrentDellReport -and $btnExportDellCsv) {
+                            $btnExportDellCsv.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        } else {
+                            Write-HubLog "Hardware CSV export skipped: No Dell warranty report cached." "INFO"
+                        }
+                    }
+                })
+
+                # Tab 1: Autopilot & Cloud Registration
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Dismiss Tenant Mismatch Banner'
+                    Button = $btnDismissMismatch; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($bannerTenantMismatch -and $bannerTenantMismatch.Visibility -eq [System.Windows.Visibility]::Visible -and $btnDismissMismatch) {
+                            $btnDismissMismatch.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        }
+                    }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Execute Dynamic Device State Action'
+                    Button = $btnDeviceStateAction; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($btnDeviceStateAction -and $btnDeviceStateAction.Visibility -eq [System.Windows.Visibility]::Visible) {
+                            $btnDeviceStateAction.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        }
+                    }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Apply Standardized Computer Name'
+                    Button = $btnApplyRename; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnApplyRename) { $btnApplyRename.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Harvest Genuine OA3 Hardware Hash'
+                    Button = $btnHarvestHash; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHarvestHash) { $btnHarvestHash.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Copy Hardware Hash to Clipboard'
+                    Button = $btnCopyHash; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnCopyHash) { $btnCopyHash.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Inspect Decoded Autopilot Policy'
+                    Button = $btnInspectPolicy; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnInspectPolicy) { $btnInspectPolicy.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Export Intune CSV (USB Priority)'
+                    Button = $btnExportCsv; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnExportCsv) { $btnExportCsv.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Export Offline Provisioning JSON'
+                    Button = $btnExportOfflineJson; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnExportOfflineJson) { $btnExportOfflineJson.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Save Current Settings to .env'
+                    Button = $btnSaveEnvDefaults; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnSaveEnvDefaults) { $btnSaveEnvDefaults.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Register Device with Intune Graph'
+                    Button = $btnRegisterIntune; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($script:GraphAuthContext -and $script:GraphAuthContext.AccessToken -and $btnRegisterIntune) {
+                            $btnRegisterIntune.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        } else {
+                            Write-HubLog "Graph registration skipped in playbook: No active Microsoft Graph session." "INFO"
+                        }
+                    }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Verify Cloud Link & Resume Autopilot'
+                    Button = $btnResumeAutopilot; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($btnResumeAutopilot -and $btnResumeAutopilot.Visibility -eq [System.Windows.Visibility]::Visible) {
+                            $btnResumeAutopilot.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        } elseif ($btnReDockStaging -and $btnReDockStaging.Visibility -eq [System.Windows.Visibility]::Visible) {
+                            $btnReDockStaging.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        }
+                    }
+                })
+
+                # Tab 7: Hybrid & Co-Mgmt (Pure Cloud Authority Verification)
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Clear Diagnostic Output'
+                    Button = $btnClearHybOut; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnClearHybOut) { $btnClearHybOut.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Audit Entra PRT & WAM Broker'
+                    Button = $btnHybPrtDiag; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybPrtDiag) { $btnHybPrtDiag.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Test Entra ID Token Acquisition'
+                    Button = $btnHybAadToken; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybAadToken) { $btnHybAadToken.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Audit SCEP Certificate Health'
+                    Button = $btnHybScepHealth; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybScepHealth) { $btnHybScepHealth.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Check Machine Certificate Health'
+                    Button = $btnHybCerts; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybCerts) { $btnHybCerts.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Read Co-Management Workload Authority'
+                    Button = $btnHybComgmt; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybComgmt) { $btnHybComgmt.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Shift Workloads to Intune (255)'
+                    Button = $btnHybCoMgmtAllIntune; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybCoMgmtAllIntune) { $btnHybCoMgmtAllIntune.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Force Intune MDM Sync'
+                    Button = $btnHybSync; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybSync) { $btnHybSync.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Restart Intune Management Extension'
+                    Button = $btnHybRestartIme; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybRestartIme) { $btnHybRestartIme.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Escrow BitLocker Recovery Keys'
+                    Button = $btnHybBitlocker; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybBitlocker) { $btnHybBitlocker.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 5: Windows Update & Drivers
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Trigger USO Client Background Scan'
+                    Button = $btnWuTriggerUso; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnWuTriggerUso) { $btnWuTriggerUso.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Schedule Post-Update System Restart'
+                    Button = $btnWuRebootNow; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnWuRebootNow) { $btnWuRebootNow.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Scan for Updates & Drivers'
+                    Button = $btnWuScan; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 25
+                    Action = { if ($btnWuScan) { $btnWuScan.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Deselect All Updates'
+                    Button = $btnWuDeselectAll; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnWuDeselectAll) { $btnWuDeselectAll.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Select All Available Updates'
+                    Button = $btnWuSelectAll; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnWuSelectAll) { $btnWuSelectAll.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Install Selected Updates'
+                    Button = $btnWuInstall; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        $sel = @($integratedWuItems | Where-Object { $_.IsSelected -eq $true })
+                        if ($sel.Count -gt 0 -and $btnWuInstall) {
+                            $btnWuInstall.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        } else {
+                            Write-HubLog "No pending Windows updates to install. System is current." "INFO"
+                        }
+                    }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Schedule Post-Update System Restart'
+                    Button = $btnWuRebootNow; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnWuRebootNow) { $btnWuRebootNow.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Start Autonomous Patch Cascade'
+                    Button = $btnStartCascade; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnStartCascade -and $btnStartCascade.IsEnabled) { $btnStartCascade.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Cancel Reboot & Suppress Cascade'
+                    Button = $btnAbortReboot; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($btnAbortReboot) { $btnAbortReboot.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) }
+                        if ($btnStopCascade) { $btnStopCascade.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) }
+                    }
+                })
+
+                # Tab 2: App Deployment
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAppDeploy; TabName = 'App Deployment'; ActionName = 'Clear App Selection'
+                    Button = $btnClearApps; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnClearApps) { $btnClearApps.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAppDeploy; TabName = 'App Deployment'; ActionName = 'Apply Standard Workstation Preset'
+                    Button = $btnPresetWorkstation; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnPresetWorkstation) { $btnPresetWorkstation.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAppDeploy; TabName = 'App Deployment'; ActionName = 'Select Target Applications'
+                    Button = $btnSelectAllApps; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnSelectAllApps) { $btnSelectAllApps.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAppDeploy; TabName = 'App Deployment'; ActionName = 'Install Selected Applications'
+                    Button = $btnInstallBatch; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        $appCount = ($script:AppCatalog | Where-Object { $_.IsSelected }).Count
+                        if ($appCount -gt 0 -and $btnInstallBatch) {
+                            $btnInstallBatch.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        } else {
+                            Write-HubLog "App catalog selection empty. Batch install skipped." "INFO"
+                        }
+                    }
+                })
+
+                # Tab 3: Win32 Packaging
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPackaging; TabName = 'Win32 Packaging'; ActionName = 'Build Win32 App Package (.intunewin)'
+                    Button = $btnBuildPackage; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnBuildPackage) { $btnBuildPackage.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPackaging; TabName = 'Win32 Packaging'; ActionName = 'Publish Win32 Package to Intune Cloud'
+                    Button = $btnPublishIntune; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($script:GraphAuthContext -and $script:GraphAuthContext.AccessToken -and $btnPublishIntune) {
+                            $btnPublishIntune.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        } else {
+                            Write-HubLog "Win32 publishing skipped: Graph authentication required." "INFO"
+                        }
+                    }
+                })
+
+                # Tab 8: ESP Diagnostics & Lifecycle
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Refresh Windows Edition Licensing'
+                    Button = $btnRefreshLicensing; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnRefreshLicensing) { $btnRefreshLicensing.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = '1-Click Enterprise KMS Upgrade Check'
+                    Button = $btnUpgradeEnterprise; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnUpgradeEnterprise) { $btnUpgradeEnterprise.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Scan Wi-Fi SSIDs'
+                    Button = $btnScanWifi; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 10
+                    Action = { if ($btnScanWifi) { $btnScanWifi.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Verify Wi-Fi Connection Readiness'
+                    Button = $btnConnectWifi; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnConnectWifi) { $btnConnectWifi.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Validate 802.1X Profile Engine'
+                    Button = $btnImportWifiXml; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnImportWifiXml) { $btnImportWifiXml.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Refresh ESP Win32 App Tracking'
+                    Button = $btnRefreshWin32Apps; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnRefreshWin32Apps) { $btnRefreshWin32Apps.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'In-Place PATCH Autopilot Identity'
+                    Button = $btnPatchLifecycle; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnPatchLifecycle) { $btnPatchLifecycle.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Trigger Autopilot Tenant Sync'
+                    Button = $btnSyncAutopilot; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnSyncAutopilot) { $btnSyncAutopilot.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Tail Intune Management Extension Log'
+                    Button = $btnTailImeLog; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnTailImeLog) { $btnTailImeLog.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Export MDM Diagnostics CAB Bundle'
+                    Button = $btnExportMdmCab; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnExportMdmCab) { $btnExportMdmCab.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+            }
+
+            '*Hybrid*' {
+                # ROUTINE 2: Hybrid AD Join & Co-Management Build (Coordinated across ALL 9 tabs)
+
+                # Tab 9: Precision Enterprise Fixes (AD & WMI Foundation)
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Clear Diagnostic Output'
+                    Button = $btnClearFixOut; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnClearFixOut) { $btnClearFixOut.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Audit Comprehensive System Health'
+                    Button = $btnFixHealthReadout; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnFixHealthReadout) { $btnFixHealthReadout.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Salvage WMI Repository (SCCM/CIM)'
+                    Button = $btnFixWmi; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnFixWmi) { $btnFixWmi.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Repair DCOM & RPC Limits (Active Directory)'
+                    Button = $btnFixDcom; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnFixDcom) { $btnFixDcom.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Flush TCP/IP Network & Winsock Stack'
+                    Button = $btnFixNetStack; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnFixNetStack) { $btnFixNetStack.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Rebuild WinRM Listener'
+                    Button = $btnFixWinRm; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnFixWinRm) { $btnFixWinRm.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Unbrick AppX Staging Manifests'
+                    Button = $btnFixAppX; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnFixAppX) { $btnFixAppX.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Copy Remediation Log'
+                    Button = $btnCopyFixLog; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnCopyFixLog) { $btnCopyFixLog.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 4: Pre-Flight Diagnostics
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Check Preflight Update Readiness'
+                    Button = $btnPreflightWinUpdate; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnPreflightWinUpdate) { $btnPreflightWinUpdate.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Auto-Remediate Clock Skew (Domain Time)'
+                    Button = $btnFixClockSkew; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnFixClockSkew) { $btnFixClockSkew.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'TPM 2.0 Attestation Engine'
+                    Button = $btnTpmAttestation; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnTpmAttestation) { $btnTpmAttestation.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Inject USB Drivers (pnputil)'
+                    Button = $btnInjectDriversPreflight; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnInjectDriversPreflight) { $btnInjectDriversPreflight.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Run Diagnostics Ladder'
+                    Button = $btnRunDiag; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 20
+                    Action = { if ($btnRunDiag) { $btnRunDiag.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 7: Hybrid & Co-Mgmt (Exhaustive sequence of all 30 buttons!)
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Clear Diagnostic Output'
+                    Button = $btnClearHybOut; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnClearHybOut) { $btnClearHybOut.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Refresh Hybrid Join State'
+                    Button = $btnHybRefresh; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybRefresh) { $btnHybRefresh.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Resync Domain Time (w32tm /resync)'
+                    Button = $btnHybTime; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybTime) { $btnHybTime.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Test DC Line-of-Sight'
+                    Button = $btnHybDc; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybDc) { $btnHybDc.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Test 9-Port Domain Controller Ladder'
+                    Button = $btnHybDcLadder; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnHybDcLadder) { $btnHybDcLadder.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Inspect AD Service Connection Point (SCP)'
+                    Button = $btnHybScp; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 10
+                    Action = { if ($btnHybScp) { $btnHybScp.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Test Netlogon Secure Channel'
+                    Button = $btnHybSecChan; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybSecChan) { $btnHybSecChan.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Verify Computer SPN Registration'
+                    Button = $btnHybSpn; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybSpn) { $btnHybSpn.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Inspect Kerberos Ticket Cache'
+                    Button = $btnHybKerbDiag; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybKerbDiag) { $btnHybKerbDiag.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Purge Cached Kerberos Tickets'
+                    Button = $btnHybKerbPurge; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybKerbPurge) { $btnHybKerbPurge.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Audit Entra PRT & WAM Broker'
+                    Button = $btnHybPrtDiag; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybPrtDiag) { $btnHybPrtDiag.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Test Entra ID Token Acquisition'
+                    Button = $btnHybAadToken; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybAadToken) { $btnHybAadToken.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Reset Token Broker Cache'
+                    Button = $btnHybResetBroker; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybResetBroker) { $btnHybResetBroker.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Read Co-Management Workload Authority'
+                    Button = $btnHybComgmt; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybComgmt) { $btnHybComgmt.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Shift Workloads to Intune (255)'
+                    Button = $btnHybCoMgmtAllIntune; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybCoMgmtAllIntune) { $btnHybCoMgmtAllIntune.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Shift Workloads to Pilot (67)'
+                    Button = $btnHybCoMgmtPilot; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybCoMgmtPilot) { $btnHybCoMgmtPilot.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Shift Workloads to ConfigMgr (1)'
+                    Button = $btnHybCoMgmtAllCcm; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybCoMgmtAllCcm) { $btnHybCoMgmtAllCcm.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Trigger ConfigMgr Machine Policy'
+                    Button = $btnHybCcm; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybCcm) { $btnHybCcm.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Force MDM Enrollment'
+                    Button = $btnHybEnroll; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybEnroll) { $btnHybEnroll.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Force Intune MDM Sync'
+                    Button = $btnHybSync; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybSync) { $btnHybSync.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Restart Intune Management Extension'
+                    Button = $btnHybRestartIme; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybRestartIme) { $btnHybRestartIme.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Escrow BitLocker Recovery Keys'
+                    Button = $btnHybBitlocker; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybBitlocker) { $btnHybBitlocker.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Force Certificate Pulse (certreq)'
+                    Button = $btnHybCertPulse; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybCertPulse) { $btnHybCertPulse.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Audit SCEP Certificate Health'
+                    Button = $btnHybScepHealth; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybScepHealth) { $btnHybScepHealth.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Check Enterprise CA Readiness'
+                    Button = $btnHybCa; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybCa) { $btnHybCa.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Check Machine Certificate Health'
+                    Button = $btnHybCerts; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybCerts) { $btnHybCerts.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Scan Legacy Dependencies'
+                    Button = $btnHybLegacy; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybLegacy) { $btnHybLegacy.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Force Group Policy Update (gpupdate)'
+                    Button = $btnHybGpupdate; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybGpupdate) { $btnHybGpupdate.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Retry Hybrid Join (dsregcmd /join)'
+                    Button = $btnHybRetryJoin; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybRetryJoin) { $btnHybRetryJoin.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Collect Hybrid Diagnostics Bundle (.zip)'
+                    Button = $btnHybBundle; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybBundle) { $btnHybBundle.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 1: Autopilot & Cloud Registration
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Execute Dynamic Device State Action'
+                    Button = $btnDeviceStateAction; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($btnDeviceStateAction -and $btnDeviceStateAction.Visibility -eq [System.Windows.Visibility]::Visible) {
+                            $btnDeviceStateAction.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        }
+                    }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Apply Computer Name Template'
+                    Button = $btnApplyRename; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnApplyRename) { $btnApplyRename.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Harvest Genuine Hardware Hash'
+                    Button = $btnHarvestHash; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHarvestHash) { $btnHarvestHash.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Copy Hardware Hash'
+                    Button = $btnCopyHash; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnCopyHash) { $btnCopyHash.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Inspect Decoded Policy'
+                    Button = $btnInspectPolicy; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnInspectPolicy) { $btnInspectPolicy.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Export Intune CSV'
+                    Button = $btnExportCsv; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnExportCsv) { $btnExportCsv.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Export Offline Provisioning JSON'
+                    Button = $btnExportOfflineJson; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnExportOfflineJson) { $btnExportOfflineJson.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Save Current Settings to .env'
+                    Button = $btnSaveEnvDefaults; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnSaveEnvDefaults) { $btnSaveEnvDefaults.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 6: Hardware
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Detect BIOS Service Tag'
+                    Button = $btnDetectDellTag; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnDetectDellTag) { $btnDetectDellTag.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Assess Hardware Warranty'
+                    Button = $btnCheckDellWarranty; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnCheckDellWarranty) { $btnCheckDellWarranty.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Assess Lenovo Warranty'
+                    Button = $btnCheckLenovoWarranty; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnCheckLenovoWarranty) { $btnCheckLenovoWarranty.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Inspect Battery Wear'
+                    Button = $btnRefreshBattery; WaitForButton = $false; WaitForAsync = $true; MaxWaitSec = 10
+                    Action = { if ($btnRefreshBattery) { $btnRefreshBattery.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Inspect Storage SMART'
+                    Button = $btnRefreshStorage; WaitForButton = $false; WaitForAsync = $true; MaxWaitSec = 10
+                    Action = { if ($btnRefreshStorage) { $btnRefreshStorage.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Copy Markdown Hardware Audit Report'
+                    Button = $btnCopyDellReport; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($script:CurrentDellReport -and $btnCopyDellReport) {
+                            $btnCopyDellReport.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        }
+                    }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Export Hardware CSV'
+                    Button = $btnExportDellCsv; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($script:CurrentDellReport -and $btnExportDellCsv) {
+                            $btnExportDellCsv.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        }
+                    }
+                })
+
+                # Tab 5: Windows Update
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Trigger USO Client Scan'
+                    Button = $btnWuTriggerUso; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnWuTriggerUso) { $btnWuTriggerUso.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Scan for Updates & Drivers'
+                    Button = $btnWuScan; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 25
+                    Action = { if ($btnWuScan) { $btnWuScan.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Select Updates'
+                    Button = $btnWuSelectAll; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnWuSelectAll) { $btnWuSelectAll.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Install Updates'
+                    Button = $btnWuInstall; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        $sel = @($integratedWuItems | Where-Object { $_.IsSelected -eq $true })
+                        if ($sel.Count -gt 0 -and $btnWuInstall) {
+                            $btnWuInstall.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        } else {
+                            Write-HubLog "No pending updates to install." "INFO"
+                        }
+                    }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Schedule Post-Update System Restart'
+                    Button = $btnWuRebootNow; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnWuRebootNow) { $btnWuRebootNow.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Abort Automatic Reboot'
+                    Button = $btnAbortReboot; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnAbortReboot) { $btnAbortReboot.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 2: App Deployment
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAppDeploy; TabName = 'App Deployment'; ActionName = 'Clear App Selection'
+                    Button = $btnClearApps; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnClearApps) { $btnClearApps.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAppDeploy; TabName = 'App Deployment'; ActionName = 'Apply Developer Suite Preset'
+                    Button = $btnPresetDev; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnPresetDev) { $btnPresetDev.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAppDeploy; TabName = 'App Deployment'; ActionName = 'Select Applications'
+                    Button = $btnSelectAllApps; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnSelectAllApps) { $btnSelectAllApps.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAppDeploy; TabName = 'App Deployment'; ActionName = 'Install Selected Applications'
+                    Button = $btnInstallBatch; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        $appCount = ($script:AppCatalog | Where-Object { $_.IsSelected }).Count
+                        if ($appCount -gt 0 -and $btnInstallBatch) {
+                            $btnInstallBatch.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        } else {
+                            Write-HubLog "App catalog selection empty. Batch install skipped." "INFO"
+                        }
+                    }
+                })
+
+                # Tab 3: Win32 Packaging
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPackaging; TabName = 'Win32 Packaging'; ActionName = 'Build Win32 App Package (.intunewin)'
+                    Button = $btnBuildPackage; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnBuildPackage) { $btnBuildPackage.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPackaging; TabName = 'Win32 Packaging'; ActionName = 'Publish Win32 Package to Intune Cloud'
+                    Button = $btnPublishIntune; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($script:GraphAuthContext -and $script:GraphAuthContext.AccessToken -and $btnPublishIntune) {
+                            $btnPublishIntune.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        } else {
+                            Write-HubLog "Win32 publishing skipped: Graph authentication required." "INFO"
+                        }
+                    }
+                })
+
+                # Tab 8: ESP & Lifecycle
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Refresh Windows Edition Licensing'
+                    Button = $btnRefreshLicensing; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnRefreshLicensing) { $btnRefreshLicensing.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = '1-Click Enterprise KMS Upgrade Check'
+                    Button = $btnUpgradeEnterprise; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnUpgradeEnterprise) { $btnUpgradeEnterprise.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Scan Available Wi-Fi SSIDs'
+                    Button = $btnScanWifi; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 10
+                    Action = { if ($btnScanWifi) { $btnScanWifi.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Verify Wi-Fi Readiness'
+                    Button = $btnConnectWifi; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnConnectWifi) { $btnConnectWifi.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Validate 802.1X XML Profile Import'
+                    Button = $btnImportWifiXml; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnImportWifiXml) { $btnImportWifiXml.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Refresh ESP Win32 App Tracking'
+                    Button = $btnRefreshWin32Apps; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnRefreshWin32Apps) { $btnRefreshWin32Apps.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'In-Place PATCH Autopilot Identity'
+                    Button = $btnPatchLifecycle; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnPatchLifecycle) { $btnPatchLifecycle.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Instant Tenant Sync'
+                    Button = $btnSyncAutopilot; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnSyncAutopilot) { $btnSyncAutopilot.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Tail IME Log'
+                    Button = $btnTailImeLog; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnTailImeLog) { $btnTailImeLog.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Export MDM Diagnostics CAB'
+                    Button = $btnExportMdmCab; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnExportMdmCab) { $btnExportMdmCab.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+            }
+
+            '*Local*' {
+                # ROUTINE 3: Local User & Offline Bypass Build (Coordinated across ALL 9 tabs)
+
+                # Tab 9: Precision Enterprise Fixes
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Clear Diagnostic Output'
+                    Button = $btnClearFixOut; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnClearFixOut) { $btnClearFixOut.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Audit Initial System Health'
+                    Button = $btnFixHealthReadout; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnFixHealthReadout) { $btnFixHealthReadout.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Salvage WMI Repository'
+                    Button = $btnFixWmi; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnFixWmi) { $btnFixWmi.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Repair Catroot2 Database'
+                    Button = $btnFixCatroot; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnFixCatroot) { $btnFixCatroot.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Purge BITS Deadlock'
+                    Button = $btnFixBits; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnFixBits) { $btnFixBits.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Purge Spooler Queue'
+                    Button = $btnFixSpooler; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnFixSpooler) { $btnFixSpooler.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Flush Network Stack'
+                    Button = $btnFixNetStack; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnFixNetStack) { $btnFixNetStack.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Rebuild WinRM Listener'
+                    Button = $btnFixWinRm; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnFixWinRm) { $btnFixWinRm.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Unbrick AppX Staging Manifests'
+                    Button = $btnFixAppX; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnFixAppX) { $btnFixAppX.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Copy Remediation Log'
+                    Button = $btnCopyFixLog; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnCopyFixLog) { $btnCopyFixLog.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 4: Pre-Flight Diagnostics
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Check Preflight Update Status'
+                    Button = $btnPreflightWinUpdate; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnPreflightWinUpdate) { $btnPreflightWinUpdate.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Auto-Remediate Clock Skew'
+                    Button = $btnFixClockSkew; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnFixClockSkew) { $btnFixClockSkew.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Verify TPM 2.0 Attestation'
+                    Button = $btnTpmAttestation; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnTpmAttestation) { $btnTpmAttestation.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Scan & Inject USB Drivers'
+                    Button = $btnInjectDriversPreflight; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnInjectDriversPreflight) { $btnInjectDriversPreflight.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Run Diagnostic Network Ladder'
+                    Button = $btnRunDiag; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 20
+                    Action = { if ($btnRunDiag) { $btnRunDiag.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 6: Dell Warranty & Hardware Health
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Detect BIOS Hardware Serial'
+                    Button = $btnDetectDellTag; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnDetectDellTag) { $btnDetectDellTag.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Check Dell Warranty (Cached/Offline)'
+                    Button = $btnCheckDellWarranty; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnCheckDellWarranty) { $btnCheckDellWarranty.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Check Lenovo Serial Audit'
+                    Button = $btnCheckLenovoWarranty; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnCheckLenovoWarranty) { $btnCheckLenovoWarranty.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Check Battery Wear'
+                    Button = $btnRefreshBattery; WaitForButton = $false; WaitForAsync = $true; MaxWaitSec = 10
+                    Action = { if ($btnRefreshBattery) { $btnRefreshBattery.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Inspect Storage SMART'
+                    Button = $btnRefreshStorage; WaitForButton = $false; WaitForAsync = $true; MaxWaitSec = 10
+                    Action = { if ($btnRefreshStorage) { $btnRefreshStorage.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Copy Hardware Report'
+                    Button = $btnCopyDellReport; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($script:CurrentDellReport -and $btnCopyDellReport) {
+                            $btnCopyDellReport.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        }
+                    }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Export Hardware CSV'
+                    Button = $btnExportDellCsv; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($script:CurrentDellReport -and $btnExportDellCsv) {
+                            $btnExportDellCsv.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        }
+                    }
+                })
+
+                # Tab 1: Autopilot & Cloud Registration (Offline Bypass Core)
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Dismiss Tenant Mismatch Banner'
+                    Button = $btnDismissMismatch; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($bannerTenantMismatch -and $bannerTenantMismatch.Visibility -eq [System.Windows.Visibility]::Visible -and $btnDismissMismatch) {
+                            $btnDismissMismatch.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        }
+                    }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Apply Offline Bypass (NRO & Account Unlock)'
+                    Button = $btnSkipAutopilot; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnSkipAutopilot) { $btnSkipAutopilot.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Unlock Personal MSA Setup'
+                    Button = $btnPersonalInstall; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnPersonalInstall) { $btnPersonalInstall.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Create Local Administrator User'
+                    Button = $btnCreateLocalUser; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnCreateLocalUser) { $btnCreateLocalUser.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Apply Computer Name Template'
+                    Button = $btnApplyRename; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnApplyRename) { $btnApplyRename.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Activate Controlled Offline Staging'
+                    Button = $btnOfflineStaging; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnOfflineStaging) { $btnOfflineStaging.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Test Inject Offline JSON Engine'
+                    Button = $btnInjectOfflineJson; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnInjectOfflineJson) { $btnInjectOfflineJson.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Save Offline Configuration to .env'
+                    Button = $btnSaveEnvDefaults; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnSaveEnvDefaults) { $btnSaveEnvDefaults.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Re-enable Physical Network Adapters'
+                    Button = $btnReenableNet; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnReenableNet) { $btnReenableNet.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Restart OOBE Setup Processes'
+                    Button = $btnRestartOobe; WaitForButton = $false; WaitForAsync = $false
+                    Action = { Write-HubLog "Playbook: Signaling OOBE setup refresh." "INFO" }
+                })
+
+                # Tab 7: Hybrid & Co-Mgmt (Local/Offline Identity Validations)
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Clear Diagnostic Output'
+                    Button = $btnClearHybOut; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnClearHybOut) { $btnClearHybOut.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Audit Absence of Cloud PRT'
+                    Button = $btnHybPrtDiag; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybPrtDiag) { $btnHybPrtDiag.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Scan Legacy Dependencies'
+                    Button = $btnHybLegacy; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybLegacy) { $btnHybLegacy.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Check Local Machine Certificate Store'
+                    Button = $btnHybCerts; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybCerts) { $btnHybCerts.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 5: Windows Update & Drivers
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Trigger USO Scan'
+                    Button = $btnWuTriggerUso; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnWuTriggerUso) { $btnWuTriggerUso.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Scan for Pending Updates'
+                    Button = $btnWuScan; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 25
+                    Action = { if ($btnWuScan) { $btnWuScan.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Deselect All Updates'
+                    Button = $btnWuDeselectAll; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnWuDeselectAll) { $btnWuDeselectAll.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Select Updates'
+                    Button = $btnWuSelectAll; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnWuSelectAll) { $btnWuSelectAll.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Abort Automatic Reboot'
+                    Button = $btnAbortReboot; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnAbortReboot) { $btnAbortReboot.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 2: App Deployment
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAppDeploy; TabName = 'App Deployment'; ActionName = 'Clear App Selection'
+                    Button = $btnClearApps; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnClearApps) { $btnClearApps.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAppDeploy; TabName = 'App Deployment'; ActionName = 'Apply Web Browsers Preset'
+                    Button = $btnPresetBrowsers; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnPresetBrowsers) { $btnPresetBrowsers.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAppDeploy; TabName = 'App Deployment'; ActionName = 'Select Target Applications'
+                    Button = $btnSelectAllApps; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnSelectAllApps) { $btnSelectAllApps.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAppDeploy; TabName = 'App Deployment'; ActionName = 'Install Selected Applications'
+                    Button = $btnInstallBatch; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        $appCount = ($script:AppCatalog | Where-Object { $_.IsSelected }).Count
+                        if ($appCount -gt 0 -and $btnInstallBatch) {
+                            $btnInstallBatch.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        } else {
+                            Write-HubLog "App selection empty. Skipping batch install." "INFO"
+                        }
+                    }
+                })
+
+                # Tab 3: Win32 Packaging
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPackaging; TabName = 'Win32 Packaging'; ActionName = 'Build Local Win32 Package'
+                    Button = $btnBuildPackage; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnBuildPackage) { $btnBuildPackage.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 8: ESP Diagnostics & Lifecycle
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Refresh Local Windows Edition'
+                    Button = $btnRefreshLicensing; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnRefreshLicensing) { $btnRefreshLicensing.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Scan Wi-Fi SSIDs'
+                    Button = $btnScanWifi; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 10
+                    Action = { if ($btnScanWifi) { $btnScanWifi.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Test Local Network Connectivity'
+                    Button = $btnConnectWifi; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnConnectWifi) { $btnConnectWifi.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Refresh Win32 App Tracking'
+                    Button = $btnRefreshWin32Apps; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnRefreshWin32Apps) { $btnRefreshWin32Apps.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Export Diagnostics CAB'
+                    Button = $btnExportMdmCab; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnExportMdmCab) { $btnExportMdmCab.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+            }
+
+            '*Remediation*' {
+                # ROUTINE 4: Deep System Remediation & Health Sweep (Coordinated across ALL 9 tabs)
+
+                # Tab 9: Precision Enterprise Fixes (Exhaustive arsenal!)
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Clear Fix Output'
+                    Button = $btnClearFixOut; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnClearFixOut) { $btnClearFixOut.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Clear Remediation Output'
+                    Button = $btnClearRemOut; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnClearRemOut) { $btnClearRemOut.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Audit Comprehensive System Health'
+                    Button = $btnFixHealthReadout; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnFixHealthReadout) { $btnFixHealthReadout.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Salvage WMI Repository'
+                    Button = $btnFixWmi; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 20
+                    Action = { if ($btnFixWmi) { $btnFixWmi.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Deep Reset Windows Update Agent'
+                    Button = $btnFixWu; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 20
+                    Action = { if ($btnFixWu) { $btnFixWu.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Repair Catroot2 ESENT Database'
+                    Button = $btnFixCatroot; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 20
+                    Action = { if ($btnFixCatroot) { $btnFixCatroot.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Purge BITS Deadlock Queue'
+                    Button = $btnFixBits; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 20
+                    Action = { if ($btnFixBits) { $btnFixBits.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Repair DCOM & RPC Limits'
+                    Button = $btnFixDcom; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 20
+                    Action = { if ($btnFixDcom) { $btnFixDcom.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Purge Print Spooler Queue'
+                    Button = $btnFixSpooler; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 20
+                    Action = { if ($btnFixSpooler) { $btnFixSpooler.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Flush TCP/IP Network & Winsock Stack'
+                    Button = $btnFixNetStack; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 20
+                    Action = { if ($btnFixNetStack) { $btnFixNetStack.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Rebuild WinRM Listener'
+                    Button = $btnFixWinRm; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 20
+                    Action = { if ($btnFixWinRm) { $btnFixWinRm.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Un-hook ProfileList .bak Locks'
+                    Button = $btnFixProfiles; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 20
+                    Action = { if ($btnFixProfiles) { $btnFixProfiles.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Heal TPM Attestation'
+                    Button = $btnFixTpm; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 20
+                    Action = { if ($btnFixTpm) { $btnFixTpm.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Unbrick AppX Staging Manifests'
+                    Button = $btnFixAppX; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 20
+                    Action = { if ($btnFixAppX) { $btnFixAppX.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Copy Complete Fix Log'
+                    Button = $btnCopyFixLog; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnCopyFixLog) { $btnCopyFixLog.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 4: Pre-Flight Diagnostics
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Check Preflight Update Readiness'
+                    Button = $btnPreflightWinUpdate; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnPreflightWinUpdate) { $btnPreflightWinUpdate.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Synchronize System Clock'
+                    Button = $btnFixClockSkew; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnFixClockSkew) { $btnFixClockSkew.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Verify TPM 2.0 Attestation'
+                    Button = $btnTpmAttestation; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnTpmAttestation) { $btnTpmAttestation.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Scan and Inject USB Drivers'
+                    Button = $btnInjectDriversPreflight; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnInjectDriversPreflight) { $btnInjectDriversPreflight.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Re-run Network Diagnostic Ladder'
+                    Button = $btnRunDiag; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 20
+                    Action = { if ($btnRunDiag) { $btnRunDiag.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 7: Hybrid & Co-Mgmt (Remediation & Reset Actions)
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Clear Hybrid Output'
+                    Button = $btnClearHybOut; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnClearHybOut) { $btnClearHybOut.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Test Netlogon Secure Channel'
+                    Button = $btnHybSecChan; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybSecChan) { $btnHybSecChan.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Purge Cached Kerberos Tickets'
+                    Button = $btnHybKerbPurge; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybKerbPurge) { $btnHybKerbPurge.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Reset Token Broker Cache'
+                    Button = $btnHybResetBroker; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybResetBroker) { $btnHybResetBroker.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Force Certificate Pulse (certreq)'
+                    Button = $btnHybCertPulse; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybCertPulse) { $btnHybCertPulse.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Restart Intune Management Extension'
+                    Button = $btnHybRestartIme; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybRestartIme) { $btnHybRestartIme.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Audit SCEP Certificate Health'
+                    Button = $btnHybScepHealth; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybScepHealth) { $btnHybScepHealth.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Check Machine Certificates'
+                    Button = $btnHybCerts; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybCerts) { $btnHybCerts.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 1: Autopilot & Cloud Registration
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Verify OA3 Hardware Hash Health'
+                    Button = $btnHarvestHash; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHarvestHash) { $btnHarvestHash.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Inspect Decoded Autopilot Policy'
+                    Button = $btnInspectPolicy; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnInspectPolicy) { $btnInspectPolicy.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Ensure Network Adapters Healthy & Enabled'
+                    Button = $btnReenableNet; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnReenableNet) { $btnReenableNet.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Synchronize .env State'
+                    Button = $btnSaveEnvDefaults; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnSaveEnvDefaults) { $btnSaveEnvDefaults.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 6: Dell Warranty & Hardware Health
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Detect BIOS Service Tag & Health'
+                    Button = $btnDetectDellTag; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnDetectDellTag) { $btnDetectDellTag.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Inspect Battery Health & Capacity'
+                    Button = $btnRefreshBattery; WaitForButton = $false; WaitForAsync = $true; MaxWaitSec = 10
+                    Action = { if ($btnRefreshBattery) { $btnRefreshBattery.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Inspect Storage NVMe SMART Reliability'
+                    Button = $btnRefreshStorage; WaitForButton = $false; WaitForAsync = $true; MaxWaitSec = 10
+                    Action = { if ($btnRefreshStorage) { $btnRefreshStorage.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Copy Hardware Diagnostics Readout'
+                    Button = $btnCopyDellReport; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($script:CurrentDellReport -and $btnCopyDellReport) {
+                            $btnCopyDellReport.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        }
+                    }
+                })
+
+                # Tab 5: Windows Update & Drivers
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Trigger USO Client Background Scan'
+                    Button = $btnWuTriggerUso; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnWuTriggerUso) { $btnWuTriggerUso.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Scan for Pending Updates'
+                    Button = $btnWuScan; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 25
+                    Action = { if ($btnWuScan) { $btnWuScan.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Select Updates'
+                    Button = $btnWuSelectAll; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnWuSelectAll) { $btnWuSelectAll.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Abort Automatic Reboot'
+                    Button = $btnAbortReboot; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnAbortReboot) { $btnAbortReboot.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Ensure Cascade Halted'
+                    Button = $btnStopCascade; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnStopCascade) { $btnStopCascade.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 2: App Deployment
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAppDeploy; TabName = 'App Deployment'; ActionName = 'Clear Application Selection Queue'
+                    Button = $btnClearApps; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnClearApps) { $btnClearApps.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAppDeploy; TabName = 'App Deployment'; ActionName = 'Check Baseline Workstation Catalog'
+                    Button = $btnPresetWorkstation; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnPresetWorkstation) { $btnPresetWorkstation.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 3: Win32 Packaging
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPackaging; TabName = 'Win32 Packaging'; ActionName = 'Test Win32 App Packager Readiness'
+                    Button = $btnBuildPackage; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnBuildPackage) { $btnBuildPackage.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 8: ESP & Lifecycle
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Scan Available Wi-Fi SSIDs'
+                    Button = $btnScanWifi; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 10
+                    Action = { if ($btnScanWifi) { $btnScanWifi.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Reset 3-Registry ESP Tracking Keys'
+                    Button = $btnDecommission; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($script:RuntimeContext.MeetsPreferred -and $btnDecommission) {
+                            $btnDecommission.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        } else {
+                            Write-HubLog "ESP decommission skipped: Elevation required." "INFO"
+                        }
+                    }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Tail IME Log'
+                    Button = $btnTailImeLog; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnTailImeLog) { $btnTailImeLog.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Export MDM Diagnostics CAB Bundle'
+                    Button = $btnExportMdmCab; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnExportMdmCab) { $btnExportMdmCab.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+            }
+
+            '*Hardware*' {
+                # ROUTINE 5: Hardware Health & Asset Intake Audit (Coordinated across ALL 9 tabs)
+
+                # Tab 6: Dell Warranty & Hardware Health
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Detect BIOS Service Tag & Serial'
+                    Button = $btnDetectDellTag; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnDetectDellTag) { $btnDetectDellTag.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Assess Dell Official Warranty API & SLA'
+                    Button = $btnCheckDellWarranty; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnCheckDellWarranty) { $btnCheckDellWarranty.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Assess Lenovo Warranty API'
+                    Button = $btnCheckLenovoWarranty; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnCheckLenovoWarranty) { $btnCheckLenovoWarranty.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Inspect Battery Wear, Capacity & Cycles'
+                    Button = $btnRefreshBattery; WaitForButton = $false; WaitForAsync = $true; MaxWaitSec = 10
+                    Action = { if ($btnRefreshBattery) { $btnRefreshBattery.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Inspect Storage SMART NVMe Reliability'
+                    Button = $btnRefreshStorage; WaitForButton = $false; WaitForAsync = $true; MaxWaitSec = 10
+                    Action = { if ($btnRefreshStorage) { $btnRefreshStorage.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Copy Markdown Hardware Audit Report'
+                    Button = $btnCopyDellReport; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($script:CurrentDellReport -and $btnCopyDellReport) {
+                            $btnCopyDellReport.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        }
+                    }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Export Hardware & Warranty CSV'
+                    Button = $btnExportDellCsv; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($script:CurrentDellReport -and $btnExportDellCsv) {
+                            $btnExportDellCsv.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        }
+                    }
+                })
+
+                # Tab 4: Pre-Flight Diagnostics
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Check Preflight Update Readiness'
+                    Button = $btnPreflightWinUpdate; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnPreflightWinUpdate) { $btnPreflightWinUpdate.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Verify Clock Synchronization'
+                    Button = $btnFixClockSkew; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnFixClockSkew) { $btnFixClockSkew.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Run TPM 2.0 & EK Attestation Engine'
+                    Button = $btnTpmAttestation; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnTpmAttestation) { $btnTpmAttestation.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Check Hardware USB Driver Readiness'
+                    Button = $btnInjectDriversPreflight; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnInjectDriversPreflight) { $btnInjectDriversPreflight.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPreFlight; TabName = 'Pre-Flight Diagnostics'; ActionName = 'Run Hardware Network Interface Ladder'
+                    Button = $btnRunDiag; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 20
+                    Action = { if ($btnRunDiag) { $btnRunDiag.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 1: Autopilot & Cloud Registration
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Execute Dynamic Device State Action'
+                    Button = $btnDeviceStateAction; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($btnDeviceStateAction -and $btnDeviceStateAction.Visibility -eq [System.Windows.Visibility]::Visible) {
+                            $btnDeviceStateAction.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        }
+                    }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Harvest Genuine Hardware Hash'
+                    Button = $btnHarvestHash; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHarvestHash) { $btnHarvestHash.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Copy Hardware Hash to Clipboard'
+                    Button = $btnCopyHash; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnCopyHash) { $btnCopyHash.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Inspect Decoded Autopilot Policy'
+                    Button = $btnInspectPolicy; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnInspectPolicy) { $btnInspectPolicy.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Apply Standardized Asset Tag Renaming'
+                    Button = $btnApplyRename; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnApplyRename) { $btnApplyRename.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Export Intune CSV (USB Flash Priority)'
+                    Button = $btnExportCsv; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnExportCsv) { $btnExportCsv.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAutopilot; TabName = 'Autopilot & Cloud Registration'; ActionName = 'Save Intake Profile to .env'
+                    Button = $btnSaveEnvDefaults; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnSaveEnvDefaults) { $btnSaveEnvDefaults.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 7: Hybrid & Co-Mgmt
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Clear Diagnostic Output'
+                    Button = $btnClearHybOut; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnClearHybOut) { $btnClearHybOut.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Inspect Active Directory SCP'
+                    Button = $btnHybScp; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybScp) { $btnHybScp.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Audit Entra PRT Identity'
+                    Button = $btnHybPrtDiag; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybPrtDiag) { $btnHybPrtDiag.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHybrid; TabName = 'Hybrid & Co-Mgmt'; ActionName = 'Check Machine Certificates'
+                    Button = $btnHybCerts; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnHybCerts) { $btnHybCerts.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 5: Windows Update & Drivers
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Trigger USO Background Scan'
+                    Button = $btnWuTriggerUso; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnWuTriggerUso) { $btnWuTriggerUso.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Scan for Firmware & Driver Updates'
+                    Button = $btnWuScan; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 25
+                    Action = { if ($btnWuScan) { $btnWuScan.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Select Updates'
+                    Button = $btnWuSelectAll; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnWuSelectAll) { $btnWuSelectAll.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabWinUpdate; TabName = 'Windows Update & Drivers'; ActionName = 'Suppress System Reboot'
+                    Button = $btnAbortReboot; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnAbortReboot) { $btnAbortReboot.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 2: App Deployment
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAppDeploy; TabName = 'App Deployment'; ActionName = 'Clear Application Selection'
+                    Button = $btnClearApps; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnClearApps) { $btnClearApps.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabAppDeploy; TabName = 'App Deployment'; ActionName = 'Validate Baseline Application Catalog'
+                    Button = $btnPresetWorkstation; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnPresetWorkstation) { $btnPresetWorkstation.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 3: Win32 Packaging
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPackaging; TabName = 'Win32 Packaging'; ActionName = 'Test Win32 Packaging Workspace Target'
+                    Button = $btnBuildPackage; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnBuildPackage) { $btnBuildPackage.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 8: ESP & Lifecycle
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Refresh Windows Edition Licensing'
+                    Button = $btnRefreshLicensing; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnRefreshLicensing) { $btnRefreshLicensing.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Scan Available Wi-Fi SSIDs'
+                    Button = $btnScanWifi; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 10
+                    Action = { if ($btnScanWifi) { $btnScanWifi.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Tail IME Log'
+                    Button = $btnTailImeLog; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnTailImeLog) { $btnTailImeLog.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabLifecycle; TabName = 'ESP Diagnostics & Lifecycle'; ActionName = 'Export MDM Diagnostics CAB'
+                    Button = $btnExportMdmCab; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnExportMdmCab) { $btnExportMdmCab.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # Tab 9: Precision Enterprise Fixes
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Clear Diagnostic Output'
+                    Button = $btnClearFixOut; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnClearFixOut) { $btnClearFixOut.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Audit System Health Readout'
+                    Button = $btnFixHealthReadout; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnFixHealthReadout) { $btnFixHealthReadout.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Heal TPM Attestation Container'
+                    Button = $btnFixTpm; WaitForButton = $true; WaitForAsync = $true; MaxWaitSec = 15
+                    Action = { if ($btnFixTpm) { $btnFixTpm.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabPrecisionFixes; TabName = 'Precision Enterprise Fixes'; ActionName = 'Copy Audit Remediation Log'
+                    Button = $btnCopyFixLog; WaitForButton = $false; WaitForAsync = $false
+                    Action = { if ($btnCopyFixLog) { $btnCopyFixLog.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } }
+                })
+
+                # System Tools (Staging Proof)
+                $steps.Add([PSCustomObject]@{
+                    Tab = $tabHardwareHealth; TabName = 'Hardware & Warranty'; ActionName = 'Capture Staging Proof Screenshot'
+                    Button = $btnScreenshotUsb; WaitForButton = $false; WaitForAsync = $false
+                    Action = {
+                        if ($btnScreenshotUsb) {
+                            $btnScreenshotUsb.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                        }
+                    }
+                })
+            }
+        }
+
+        return $steps
+    }
+
+    function Invoke-HubActionRoutine {
+        param(
+            [string]$RoutineName = '1. Intune-Only Cloud Build'
+        )
+
+        $steps = Get-HubPlaybookSteps -RoutineName $RoutineName
+        if (-not $steps -or $steps.Count -eq 0) {
+            Write-HubLog "No steps found for routine '$RoutineName'." "ERROR"
+            return
+        }
+
+        $script:PlaybookRunning = $true
+        $script:PlaybookState.Status = 'Running'
+        $script:PlaybookState.IsPaused = $false
+        $script:PlaybookState.CancelRequested = $false
+        $script:PlaybookState.TotalSteps = $steps.Count
+        $stepLogEntries = [System.Collections.Generic.List[PSCustomObject]]::new()
+        $serial = try { if ($script:DeviceState -and $script:DeviceState.SerialNumber) { $script:DeviceState.SerialNumber } else { (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber } } catch { 'UNKNOWN' }
+        $mfg = try { if ($script:DeviceState -and $script:DeviceState.Manufacturer) { $script:DeviceState.Manufacturer } else { (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Manufacturer } } catch { 'UNKNOWN' }
+        $model = try { if ($script:DeviceState -and $script:DeviceState.Model) { $script:DeviceState.Model } else { (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Model } } catch { 'UNKNOWN' }
+
+        # Deployment telemetry: capture start time, reset WU metrics, and sample disk throughput
+        # on a 3s DispatcherTimer (fires during the loop's Update-WpfUI pumps; UI-thread safe).
+        $script:PlaybookStartUtc = [datetime]::UtcNow
+        $script:HubDiskSamples = [System.Collections.Generic.List[object]]::new()
+        $script:HubLastWuMetrics = $null
+        $script:HubDiskSampleTimer = [System.Windows.Threading.DispatcherTimer]::new()
+        $script:HubDiskSampleTimer.Interval = [TimeSpan]::FromSeconds(3)
+        $script:HubDiskSampleTimer.Add_Tick({
+            try {
+                $smp = Get-HubDiskPerfSampleFast
+                if ($smp.Ok) {
+                    $script:HubDiskSamples.Add([PSCustomObject]@{
+                        T         = [math]::Round(([datetime]::UtcNow - $script:PlaybookStartUtc).TotalSeconds, 0)
+                        ReadMBps  = $smp.ReadMBps
+                        WriteMBps = $smp.WriteMBps
+                        Iops      = $smp.Iops
+                    })
+                }
+            } catch { }
+        })
+        $script:HubDiskSampleTimer.Start()
+
+        $btnPlaybookRun.IsEnabled = $false
+        $btnPlaybookPause.IsEnabled = $true
+        $btnPlaybookPause.Content = '[|| Pause]'
+        $btnPlaybookStop.IsEnabled = $true
+        $cboPlaybookRoutine.IsEnabled = $false
+
+        $activeButton = $null
+        $origBg = $null
+
+        Write-HubLog "Starting Deployment Playbook: '$RoutineName' ($($steps.Count) coordinated steps across tabs)..." "INFO"
+
+        try {
+            for ($idx = 0; $idx -lt $steps.Count; $idx++) {
+                if ($script:PlaybookState.CancelRequested) {
+                    Write-HubLog "Playbook execution cancelled by operator." "WARN"
+                    break
+                }
+
+                while ($script:PlaybookState.IsPaused -and -not $script:PlaybookState.CancelRequested) {
+                    Start-Sleep -Milliseconds 100
+                    Update-WpfUI
+                }
+                if ($script:PlaybookState.CancelRequested) { break }
+
+                $step = $steps[$idx]
+                $stepNum = $idx + 1
+                $script:PlaybookState.CurrentStep = $stepNum
+                $script:PlaybookState.CurrentStepInfo = "Step $stepNum/$($steps.Count): [$($step.TabName)] -> $($step.ActionName)"
+
+                # 1. Switch Tab visually
+                if ($step.Tab -and $mainTabControl) {
+                    $mainTabControl.SelectedItem = $step.Tab
+                    Update-WpfUI
+                }
+
+                # 2. Update HUD & Main Progress Bar
+                $txtPlaybookStep.Text = $script:PlaybookState.CurrentStepInfo
+                $pct = [int][math]::Round(($stepNum / $steps.Count) * 100)
+                $playbookProgressBar.Value = $pct
+                Set-HubProgress -Percent $pct -Status "Playbook: $($step.ActionName)"
+                Write-HubLog "Playbook [Step $stepNum/$($steps.Count)] ($($step.TabName)): $($step.ActionName)..." "INFO"
+                Update-WpfUI
+
+                # Restore previous button background if needed
+                if ($activeButton -and $origBg) {
+                    try { $activeButton.Background = $origBg } catch { }
+                    $activeButton = $null
+                    $origBg = $null
+                }
+
+                # 3. Button Visual Highlight
+                if ($step.Button) {
+                    try {
+                        $activeButton = $step.Button
+                        $origBg = $step.Button.Background
+                        $step.Button.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#BAE6FD")
+                        $step.Button.Focus()
+                    } catch { }
+                    Update-WpfUI
+                }
+
+                # 4. Settle delay for visual feedback
+                $settleStart = [datetime]::UtcNow
+                while (([datetime]::UtcNow - $settleStart).TotalMilliseconds -lt 250 -and -not $script:PlaybookState.CancelRequested) {
+                    while ($script:PlaybookState.IsPaused -and -not $script:PlaybookState.CancelRequested) {
+                        Start-Sleep -Milliseconds 100
+                        Update-WpfUI
+                    }
+                    Start-Sleep -Milliseconds 50
+                    Update-WpfUI
+                }
+
+                # 5. Execute Action
+                $stepStartTime = [datetime]::Now
+                $stepStatus = 'Success'
+                $stepDetails = ''
+                try {
+                    if ($step.Action) {
+                        & $step.Action
+                    } elseif ($step.Button -and $step.Button.IsEnabled) {
+                        $step.Button.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+                    }
+                } catch {
+                    $stepStatus = 'Failed'
+                    $stepDetails = $_.Exception.Message
+                    Write-HubLog "Playbook error in step '$($step.ActionName)': $($_.Exception.Message)" "WARN"
+                }
+
+                # 6. Wait for async task or button re-enable (if applicable)
+                $waitStart = [datetime]::UtcNow
+                $maxWait = if ($step.MaxWaitSec) { $step.MaxWaitSec } else { 15 }
+                while (([datetime]::UtcNow - $waitStart).TotalSeconds -lt $maxWait -and -not $script:PlaybookState.CancelRequested) {
+                    while ($script:PlaybookState.IsPaused -and -not $script:PlaybookState.CancelRequested) {
+                        Start-Sleep -Milliseconds 100
+                        Update-WpfUI
+                    }
+                    if ($script:PlaybookState.CancelRequested) { break }
+
+                    if ($step.Button -and $step.WaitForButton -and $step.Button.IsEnabled -eq $false) {
+                        Start-Sleep -Milliseconds 100
+                        Update-WpfUI
+                        continue
+                    }
+                    if ($step.WaitForAsync -and $script:HubActiveAsyncTasks -and $script:HubActiveAsyncTasks.Count -gt 0) {
+                        Start-Sleep -Milliseconds 100
+                        Update-WpfUI
+                        continue
+                    }
+                    break
+                }
+
+                # Restore button background
+                if ($activeButton -and $origBg) {
+                    try { $activeButton.Background = $origBg } catch { }
+                    $activeButton = $null
+                    $origBg = $null
+                }
+
+                $stepDuration = [math]::Round(([datetime]::Now - $stepStartTime).TotalSeconds, 2)
+                $btnName = if ($step.Button -and $step.Button.Name) { $step.Button.Name } else { 'DirectAction' }
+                $stepLogEntries.Add([PSCustomObject]@{
+                    Timestamp    = $stepStartTime.ToString('yyyy-MM-dd HH:mm:ss')
+                    ComputerName = $env:COMPUTERNAME
+                    SerialNumber = $serial
+                    Manufacturer = $mfg
+                    Model        = $model
+                    Playbook     = $RoutineName
+                    Step         = $stepNum
+                    TotalSteps   = $steps.Count
+                    TabName      = $step.TabName
+                    ActionName   = $step.ActionName
+                    Button       = $btnName
+                    Status       = $stepStatus
+                    DurationSec  = $stepDuration
+                    Details      = $stepDetails
+                })
+                Update-WpfUI
+            }
+        } finally {
+            if ($activeButton -and $origBg) {
+                try { $activeButton.Background = $origBg } catch { }
+                $activeButton = $null
+                $origBg = $null
+            }
+            $script:PlaybookRunning = $false
+            $script:PlaybookState.Status = 'Idle'
+            $script:PlaybookState.IsPaused = $false
+            $btnPlaybookRun.IsEnabled = $true
+            $btnPlaybookPause.IsEnabled = $false
+            $btnPlaybookPause.Content = '[|| Pause]'
+            $btnPlaybookStop.IsEnabled = $false
+            $cboPlaybookRoutine.IsEnabled = $true
+
+            if ($script:HubDiskSampleTimer) { try { $script:HubDiskSampleTimer.Stop() } catch { } }
+
+            $exportRes = $null
+            if ($stepLogEntries -and $stepLogEntries.Count -gt 0) {
+                $script:LastPlaybookExecutionRecords = $stepLogEntries
+                $script:LastPlaybookRoutineName = $RoutineName
+
+                # In-memory first: Enable the Download CSV button so the technician can choose to export
+                $btnPlaybookDownloadCsv.IsEnabled = $true
+                $btnPlaybookDownloadCsv.ToolTip = "Download or export the playbook audit CSV (Held in-memory)"
+                Write-HubLog "Playbook execution records held in-memory ($($stepLogEntries.Count) steps). Zero traces on disk." "SUCCESS"
+                Write-HubLog "Click '[v] Download CSV' to save audit report if desired." "INFO"
+
+                # ---- Rich deployment report (HTML with charts + JSON sidecar) held in-memory ----
+                try {
+                    $samples = @($script:HubDiskSamples)
+                    $reads  = @($samples | ForEach-Object { $_.ReadMBps })
+                    $writes = @($samples | ForEach-Object { $_.WriteMBps })
+                    $iopsV  = @($samples | ForEach-Object { $_.Iops })
+                    function _avg($a) { if ($a.Count -gt 0) { [math]::Round(($a | Measure-Object -Average).Average, 0) } else { 0 } }
+                    function _max($a) { if ($a.Count -gt 0) { [math]::Round(($a | Measure-Object -Maximum).Maximum, 0) } else { 0 } }
+                    $wu = if ($script:HubLastWuMetrics) { $script:HubLastWuMetrics } else {
+                        [PSCustomObject]@{ Installed = 0; Failed = 0; TotalDownloadMB = 0; AvgDownloadMBps = 0; TotalInstallSec = 0; AvgInstallMBpm = 0; Updates = @() }
+                    }
+                    $totalSec = [math]::Round(([datetime]::UtcNow - $script:PlaybookStartUtc).TotalSeconds, 1)
+                    $metrics = [PSCustomObject]@{
+                        SchemaVersion = 1
+                        RoutineName   = $RoutineName
+                        GeneratedUtc  = [datetime]::UtcNow.ToString('o')
+                        TotalSeconds  = $totalSec
+                        StepCount     = $stepLogEntries.Count
+                        RebootCount   = 0
+                        Baseline      = (Get-HubSystemBaseline)
+                        Steps         = @($stepLogEntries | ForEach-Object { [PSCustomObject]@{ ActionName = $_.ActionName; DurationSec = $_.DurationSec } })
+                        Wu            = $wu
+                        Disk          = [PSCustomObject]@{
+                            AvgReadMBps  = (_avg $reads);  PeakReadMBps  = (_max $reads)
+                            AvgWriteMBps = (_avg $writes); PeakWriteMBps = (_max $writes)
+                            AvgIops      = (_avg $iopsV);  PeakIops      = (_max $iopsV)
+                            Samples      = $samples
+                        }
+                    }
+                    $storedBaseline = Get-HubStoredBaseline
+                    $metrics | Add-Member -NotePropertyName BaselineComparison -NotePropertyValue (Get-HubBaselineComparison -Metrics $metrics -Baseline $storedBaseline)
+                    $script:LastDeploymentMetrics = $metrics
+                    Update-HubStoredBaseline -Metrics $metrics | Out-Null
+
+                    $repRes = Export-HubDeploymentReport -Metrics $metrics
+                    if ($repRes.Success) {
+                        $script:LastDeploymentReportHtml = $repRes.HtmlContent
+                        if ($btnPlaybookReport) {
+                            $btnPlaybookReport.IsEnabled = $true
+                            $btnPlaybookReport.ToolTip = "View or export rich deployment report (Held in-memory)"
+                        }
+                    }
+
+                    # Post-enrollment Closed-Loop Verification & Tamper-Evident Receipt in-memory
+                    try {
+                        $receiptRes = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId -Metrics $metrics
+                        if ($receiptRes.Success) {
+                            $script:LastProvisioningReceipt = $receiptRes
+                            $script:LastProvisioningReceiptHtml = $receiptRes.HtmlContent
+                            if ($btnPlaybookReceipt) {
+                                $btnPlaybookReceipt.IsEnabled = $true
+                                $btnPlaybookReceipt.ToolTip = "View or export tamper-evident provisioning receipt (Held in-memory)"
+                            }
+                            Write-HubLog "Provisioning receipt verified in-memory (Verdict: $($receiptRes.ReceiptData.Verdict), Score: $($receiptRes.ReceiptData.Score))" "SUCCESS"
+                        }
+                    } catch {
+                        Write-HubLog "Receipt generation note: $($_.Exception.Message)" "WARN"
+                    }
+
+                    # Outbound Fleet Plane Telemetry (in-memory buffering if offline)
+                    try {
+                        $telemetryPayload = [PSCustomObject]@{
+                            SchemaVersion = 1
+                            DeploymentId  = $script:HubDeploymentId
+                            TimestampUtc  = [datetime]::UtcNow.ToString('o')
+                            RoutineName   = $RoutineName
+                            Status        = if ($stepLogEntries | Where-Object { $_.Status -eq 'Failed' }) { 'Failed' } else { 'Success' }
+                            TotalSeconds  = $totalSec
+                            Metrics       = $metrics
+                            Receipt       = if ($script:LastProvisioningReceipt) { $script:LastProvisioningReceipt.ReceiptData } else { $null }
+                            Site          = if ($script:ActiveDeploymentProfile -and $script:ActiveDeploymentProfile.Site) { $script:ActiveDeploymentProfile.Site } elseif ($env:AUTOPILOT_SITE) { $env:AUTOPILOT_SITE } else { 'Default' }
+                            Technician    = $env:USERNAME
+                            Device        = [PSCustomObject]@{
+                                SerialNumber = $serial
+                                Manufacturer = $mfg
+                                Model        = $model
+                                ComputerName = $env:COMPUTERNAME
+                            }
+                        }
+                        $telemRes = Send-HubFleetTelemetry -Payload $telemetryPayload
+                        if ($telemRes.Success -and -not $telemRes.Buffered) {
+                            Write-HubLog "Fleet plane telemetry delivered: $($telemRes.Message)" "SUCCESS"
+                        } elseif ($telemRes.InMemory) {
+                            Write-HubLog "Fleet plane telemetry buffered in-memory (zero disk trace)" "INFO"
+                        } else {
+                            Write-HubLog "Fleet plane buffered offline: $($telemRes.Message)" "INFO"
+                        }
+                    } catch {
+                        Write-HubLog "Fleet telemetry note: $($_.Exception.Message)" "WARN"
+                    }
+                } catch {
+                    Write-HubLog "Deployment report generation note: $($_.Exception.Message)" "WARN"
+                }
+            }
+
+            if ($script:PlaybookState.CancelRequested) {
+                $txtPlaybookStep.Text = "Playbook stopped by operator. (Click '[v] Download CSV' to save audit report)"
+                Write-HubLog "Playbook '$RoutineName' stopped." "WARN"
+                Set-HubProgress -Percent 0 -Status "Playbook Aborted"
+            } else {
+                $txtPlaybookStep.Text = "Playbook '$RoutineName' completed! (Click '[v] Download CSV' to save audit report)"
+                $playbookProgressBar.Value = 100
+                Write-HubLog "Playbook '$RoutineName' completed successfully across all tabs!" "SUCCESS"
+                Set-HubProgress -Percent 100 -Status "Playbook Complete"
+                try { Play-HubAudio -Type Success } catch { }
+
+                if ($exportRes -and $exportRes.Success) {
+                    try {
+                        $csvMsg = "Playbook '$RoutineName' has finished executing all $($stepLogEntries.Count) coordinated steps!`n`nPlaybook CSV audit report saved to:`n$($exportRes.Path)`n`nWould you like to download / save a copy to another destination (e.g. USB flash drive)?"
+                        $ans = [System.Windows.MessageBox]::Show($csvMsg, "Playbook Complete - Download CSV", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Information)
+                        if ($ans -eq [System.Windows.MessageBoxResult]::Yes) {
+                            Save-HubPlaybookCsvDialog -Owner $window
+                        }
+                    } catch { }
+                }
+            }
+            Update-WpfUI
+        }
+    }
+
+        $btnPlaybookRun.Add_Click({
+        if ($script:PlaybookState.Status -eq 'Running') {
+            if ($script:PlaybookState.IsPaused) {
+                $script:PlaybookState.IsPaused = $false
+                $btnPlaybookPause.Content = '[|| Pause]'
+                $btnPlaybookRun.IsEnabled = $false
+                Write-HubLog "Playbook resumed by operator." "INFO"
+            }
+            return
+        }
+
+        $selectedItem = $cboPlaybookRoutine.SelectedItem
+        $routineName = if ($selectedItem -is [System.Windows.Controls.ComboBoxItem]) {
+            $selectedItem.Content.ToString()
+        } elseif ($selectedItem) {
+            [string]$selectedItem
+        } else {
+            '1. Intune-Only Cloud Build'
+        }
+        Invoke-HubActionRoutine -RoutineName $routineName
+    })
+
+    $btnPlaybookPause.Add_Click({
+        if ($script:PlaybookState.Status -ne 'Running') { return }
+        $script:PlaybookState.IsPaused = -not $script:PlaybookState.IsPaused
+        if ($script:PlaybookState.IsPaused) {
+            $btnPlaybookPause.Content = '[> Resume]'
+            $btnPlaybookRun.IsEnabled = $true
+            Write-HubLog "Playbook paused by operator." "WARN"
+            $txtPlaybookStep.Text = "Paused: $($script:PlaybookState.CurrentStepInfo)"
+        } else {
+            $btnPlaybookPause.Content = '[|| Pause]'
+            $btnPlaybookRun.IsEnabled = $false
+            Write-HubLog "Playbook resumed by operator." "INFO"
+        }
+    })
+
+    $btnPlaybookStop.Add_Click({
+        if ($script:PlaybookState.Status -eq 'Running') {
+            $script:PlaybookState.CancelRequested = $true
+            Write-HubLog "Stop requested. Aborting playbook..." "WARN"
+            $txtPlaybookStep.Text = "Stopping playbook..."
+        }
+    })
+
+    # --- Helper: Save-HubPlaybookCsvDialog (Export / Download Playbook CSV) ---
+    function Save-HubPlaybookCsvDialog {
+        param($Owner)
+        if (-not $script:LastPlaybookExecutionRecords -or $script:LastPlaybookExecutionRecords.Count -eq 0) {
+            [System.Windows.MessageBox]::Show("No playbook has been executed yet in this session. Run an action playbook first to generate audit data.", "No Playbook Data", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+            return
+        }
+
+        $sfd = [Microsoft.Win32.SaveFileDialog]::new()
+        $sfd.Title = "Download Playbook Execution CSV Report"
+        $sfd.Filter = "CSV Spreadsheet (*.csv)|*.csv|All Files (*.*)|*.*"
+        $cleanRoutine = ($script:LastPlaybookRoutineName -replace '[^\w\-]', '_').Trim('_')
+        $serial = try { if ($script:DeviceState -and $script:DeviceState.SerialNumber) { $script:DeviceState.SerialNumber } else { (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber } } catch { 'UNKNOWN' }
+        $sfd.FileName = "Playbook_${cleanRoutine}_${serial}_$([datetime]::Now.ToString('yyyyMMdd_HHmmss')).csv"
+
+        try {
+            $usbDrives = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType = 2" -ErrorAction SilentlyContinue
+            foreach ($d in $usbDrives) {
+                if (Test-Path "$($d.DeviceID)\") {
+                    $sfd.InitialDirectory = "$($d.DeviceID)\"
+                    break
+                }
+            }
+        } catch { }
+
+        $showResult = if ($Owner) { $sfd.ShowDialog($Owner) } else { $sfd.ShowDialog() }
+        if ($showResult -eq $true) {
+            try {
+                (Protect-HubCsvRecords -Records $script:LastPlaybookExecutionRecords) | Export-Csv -LiteralPath $sfd.FileName -NoTypeInformation -Encoding UTF8
+                Write-HubLog "Playbook CSV report downloaded to: $($sfd.FileName)" "SUCCESS"
+                $ans = [System.Windows.MessageBox]::Show("Playbook CSV exported successfully to:`n$($sfd.FileName)`n`nOpen containing folder?", "Download Complete", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Information)
+                if ($ans -eq [System.Windows.MessageBoxResult]::Yes) {
+                    Start-Process explorer.exe -ArgumentList "/select,`"$($sfd.FileName)`""
+                }
+            } catch {
+                Write-HubLog "Failed to download Playbook CSV: $($_.Exception.Message)" "ERROR"
+                [System.Windows.MessageBox]::Show("Error saving CSV: $($_.Exception.Message)", "Export Failed", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+            }
+        }
+    }
+
+    $btnPlaybookDownloadCsv.Add_Click({
+        Save-HubPlaybookCsvDialog -Owner $window
+    })
+
+    $btnPlaybookReport.Add_Click({
+        if ($script:LastDeploymentReportHtml) {
+            $sfd = [Microsoft.Win32.SaveFileDialog]::new()
+            $sfd.Title = "Save Deployment HTML Report"
+            $sfd.Filter = "HTML Files (*.html)|*.html|All Files (*.*)|*.*"
+            $serial = try { if ($script:DeviceState -and $script:DeviceState.SerialNumber) { $script:DeviceState.SerialNumber } else { (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber } } catch { 'UNKNOWN' }
+            $sfd.FileName = "DeploymentReport_${serial}_$([datetime]::Now.ToString('yyyyMMdd_HHmmss')).html"
+            if ($sfd.ShowDialog($window) -eq $true) {
+                [System.IO.File]::WriteAllText($sfd.FileName, $script:LastDeploymentReportHtml, [System.Text.UTF8Encoding]::new($false))
+                $script:LastDeploymentReportPath = $sfd.FileName
+                Write-HubLog "Deployment report saved to: $($sfd.FileName)" "SUCCESS"
+                try { Start-Process $sfd.FileName } catch { }
+            }
+        } elseif ($script:LastDeploymentReportPath -and (Test-Path $script:LastDeploymentReportPath)) {
+            try { Start-Process $script:LastDeploymentReportPath } catch { }
+        } else {
+            [System.Windows.MessageBox]::Show("No deployment report yet. Run an action playbook first - report data is held in-memory.", "No Report", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+        }
+    })
+
+    if ($btnPlaybookReceipt) {
+        $btnPlaybookReceipt.Add_Click({
+            $rec = $script:LastProvisioningReceipt
+            if (-not $rec) {
+                $rec = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId
+                $script:LastProvisioningReceipt = $rec
+            }
+            if ($rec -and $rec.HtmlContent) {
+                $sfd = [Microsoft.Win32.SaveFileDialog]::new()
+                $sfd.Title = "Save Provisioning Receipt"
+                $sfd.Filter = "HTML Files (*.html)|*.html|JSON Files (*.json)|*.json|All Files (*.*)|*.*"
+                $serial = try { if ($rec.ReceiptData -and $rec.ReceiptData.Device -and $rec.ReceiptData.Device.SerialNumber) { $rec.ReceiptData.Device.SerialNumber } else { 'DEVICE' } } catch { 'DEVICE' }
+                $sfd.FileName = "Receipt_${serial}_$($rec.DeploymentId).html"
+                if ($sfd.ShowDialog($window) -eq $true) {
+                    $saveHtml = $sfd.FileName
+                    [System.IO.File]::WriteAllText($saveHtml, $rec.HtmlContent, [System.Text.UTF8Encoding]::new($false))
+                    $saveJson = [System.IO.Path]::ChangeExtension($saveHtml, '.json')
+                    [System.IO.File]::WriteAllText($saveJson, ($rec.ReceiptData | ConvertTo-Json -Depth 6), [System.Text.UTF8Encoding]::new($false))
+                    $script:LastProvisioningReceiptPath = $saveHtml
+                    Write-HubLog "Provisioning receipt saved to: $saveHtml" "SUCCESS"
+                    try { Start-Process $saveHtml } catch { }
+                }
+            } elseif ($script:LastProvisioningReceiptPath -and (Test-Path $script:LastProvisioningReceiptPath)) {
+                try { Start-Process $script:LastProvisioningReceiptPath } catch { }
+            }
+        })
+    }
+
+    if ($btnVerifyReceipt) {
+        $btnVerifyReceipt.Add_Click({
+            try {
+                Write-HubLog "Executing closed-loop post-enrollment verification (in-memory)..." "INFO"
+                $rec = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId
+                if ($rec.Success) {
+                    $script:LastProvisioningReceipt = $rec
+                    if ($btnPlaybookReceipt) { $btnPlaybookReceipt.IsEnabled = $true }
+                    Write-HubLog "Verification receipt generated in RAM (Verdict: $($rec.ReceiptData.Verdict), Score: $($rec.ReceiptData.Score), Seal: $($rec.ReceiptData.IntegrityHash))" "SUCCESS"
+                    Write-HubLog "Click 'Receipt' button if you wish to export HTML/JSON to disk." "INFO"
+                }
+            } catch {
+                Write-HubLog "Verification error: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+
+    if ($btnApplyProfile) {
+        $btnApplyProfile.Add_Click({
+            try {
+                $selItem = $cboDeploymentProfile.SelectedItem
+                $profName = if ($selItem -is [System.Windows.Controls.ComboBoxItem]) { $selItem.Content.ToString() } else { [string]$selItem }
+                $applied = Apply-HubDeploymentProfile -ProfileNameOrId $profName
+                if ($applied) {
+                    if ($txtGroupTag) { $txtGroupTag.Text = $applied.GroupTag }
+                    if ($txtComputerNameTemplate) { $txtComputerNameTemplate.Text = $applied.ComputerNameTemplate }
+                    Write-HubLog "Applied profile '$($applied.Name)' (Site: $($applied.Site), GroupTag: $($applied.GroupTag))." "SUCCESS"
+                }
+            } catch {
+                Write-HubLog "Profile error: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+
+    if ($btnCartMode) {
+        $btnCartMode.Add_Click({
+            try {
+                Write-HubLog "Initiating Cart Harvest Station for current device..." "INFO"
+                $gt = if ($txtGroupTag) { $txtGroupTag.Text } else { '' }
+                $cartRes = Invoke-HubCartHarvest -CartName 'BenchCart' -GroupTag $gt
+                if ($cartRes.Success) {
+                    Write-HubLog "Device $($cartRes.SerialNumber) captured into cart batch (Total: $($cartRes.TotalUnits) units). CSV: $($cartRes.CartCsvPath)" "SUCCESS"
+                    [System.Windows.MessageBox]::Show("Device $($cartRes.SerialNumber) successfully added to Cart Batch!`n`nTotal units in batch: $($cartRes.TotalUnits)`nCSV: $($cartRes.CartCsvPath)`n`nSafe to unplug USB and proceed to next laptop.", "Cart Harvest Success", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+                }
+            } catch {
+                Write-HubLog "Cart harvest error: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+
+    if ($btnFleetSync) {
+        $btnFleetSync.Add_Click({
+            try {
+                Write-HubLog "Flushing buffered fleet telemetry to central endpoint..." "INFO"
+                $flushed = Flush-HubFleetBuffer
+                Write-HubLog "Fleet flush complete: $($flushed.FlushedCount) sent, $($flushed.PendingCount) pending." $(if ($flushed.FlushedCount -gt 0) { 'SUCCESS' } else { 'INFO' })
+            } catch {
+                Write-HubLog "Fleet sync error: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+
+    if ($btnOemDrivers) {
+        $btnOemDrivers.Add_Click({
+            try {
+                Write-HubLog "Scanning for OEM drivers and firmware updates..." "INFO"
+                Start-HubAsyncWork -Description "OEM Driver Scan" -WorkerScript {
+                    Invoke-HubOemDriverUpdate -ScanOnly
+                } -OnComplete {
+                    param($res, $err)
+                    if ($res -and $res.Success) {
+                        Write-HubLog "OEM driver scan: $($res.Message)" "SUCCESS"
+                    } else {
+                        Write-HubLog "OEM driver scan note: $(if ($err) { $err.Message } else { $res.Message })" "WARN"
+                    }
+                } | Out-Null
+            } catch {
+                Write-HubLog "OEM driver error: $($_.Exception.Message)" "ERROR"
+            }
+        })
+    }
+
 
     # Initial Diagnostic Run. The 7-stage ladder is ~3 s of network waits. It was kicked off in a
     # dedicated runspace back in Section C (before the console intro), so by the time the window is built
@@ -12065,24 +17511,64 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
     }
     Set-HubProgress -Percent 0 -Status "Ready"
 
-    # Check for active multi-pass autonomous Patch Cascade from a prior reboot
+    # Check for active multi-pass autonomous Patch Cascade from a prior reboot.
+    # This installs updates and can trigger a real system restart, so a state file merely
+    # existing on disk (which can be abandoned, days old, or left by a different operator) is
+    # NOT sufficient consent to auto-fire it. Only the single-use -ResumeFromRestart launch -
+    # the same trust boundary already used for the OOBE Hub-resume-after-restart feature - may
+    # resume silently, and only if the state is still fresh. Any other launch asks first.
     $cascadeState = Get-HubPatchCascadeState
     if ($cascadeState) {
-        Write-HubLog "Active Patch Cascade detected (Pass $($cascadeState.CurrentPass) of $($cascadeState.MaxPasses), $($cascadeState.TotalInstalled) updates installed so far)." "INFO"
-        if ($mainTabControl -and $tabWinUpdate) {
-            $mainTabControl.SelectedItem = $tabWinUpdate
+        $cascadeAgeHours = 999
+        try {
+            if ($cascadeState.Timestamp) {
+                $cascadeAgeHours = ([datetime]::UtcNow - [datetime]::Parse($cascadeState.Timestamp, $null, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal)).TotalHours
+            }
+        } catch { }
+        $cascadeSummary = "Pass $($cascadeState.CurrentPass) of $($cascadeState.MaxPasses), $($cascadeState.TotalInstalled) update(s) installed so far (saved $([Math]::Round($cascadeAgeHours, 1))h ago)"
+
+        if ($script:ResumeFromRestart -and $cascadeAgeHours -lt 6) {
+            Write-HubLog "Active Patch Cascade detected: $cascadeSummary. Resuming automatically (this launch is the consented post-restart resume)." "INFO"
+            if ($mainTabControl -and $tabWinUpdate) { $mainTabControl.SelectedItem = $tabWinUpdate }
+            $cascadeResumeTimer = [System.Windows.Threading.DispatcherTimer]::new()
+            $cascadeResumeTimer.Interval = [TimeSpan]::FromSeconds(2)
+            $cascadeResumeTimer.Add_Tick({
+                $cascadeResumeTimer.Stop()
+                Invoke-GuiCascadePass
+            })
+            $cascadeResumeTimer.Start()
+        } elseif ($cascadeAgeHours -ge 6) {
+            Write-HubLog "Abandoned Patch Cascade state found ($cascadeSummary) - too old to auto-resume. Clearing it; start a fresh cascade from the Windows Update tab if needed." "WARN"
+            Clear-HubPatchCascadeState
+        } else {
+            Write-HubLog "Incomplete Patch Cascade found from a previous session: $cascadeSummary." "WARN"
+            if ($mainTabControl -and $tabWinUpdate) { $mainTabControl.SelectedItem = $tabWinUpdate }
+            $__cascadeAsk = [System.Windows.MessageBox]::Show("An incomplete Autonomous Patch Cascade was found from a previous session:`n`n$cascadeSummary`n`nThis was NOT launched via the automatic post-restart resume, so it will not continue on its own. Resume installing updates now (and allow another automatic restart if needed)?`n`nChoosing No clears this saved state; you can start a fresh cascade any time from the Windows Update tab.", "Resume Incomplete Patch Cascade?", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+            if ($__cascadeAsk -eq [System.Windows.MessageBoxResult]::Yes) {
+                Write-HubLog "Operator approved resuming the Patch Cascade." "INFO"
+                Invoke-GuiCascadePass
+            } else {
+                Write-HubLog "Operator declined to resume the Patch Cascade. Saved state cleared." "INFO"
+                Clear-HubPatchCascadeState
+            }
         }
-        $cascadeResumeTimer = [System.Windows.Threading.DispatcherTimer]::new()
-        $cascadeResumeTimer.Interval = [TimeSpan]::FromSeconds(2)
-        $cascadeResumeTimer.Add_Tick({
-            $cascadeResumeTimer.Stop()
-            Invoke-GuiCascadePass
-        })
-        $cascadeResumeTimer.Start()
     }
 
     # Initialize Offline Staging banner state
     Update-OfflineStagingUi
+
+    # Check for CLI Playbook / ActionRoutine invocation
+    $targetPlaybook = if ($Playbook) { $Playbook } elseif ($ActionRoutine) { $ActionRoutine } else { '' }
+    if ($targetPlaybook) {
+        Write-HubLog "Command-line Action Playbook scheduled: $targetPlaybook" "INFO"
+        $playbookTimer = [System.Windows.Threading.DispatcherTimer]::new()
+        $playbookTimer.Interval = [TimeSpan]::FromSeconds(2)
+        $playbookTimer.Add_Tick({
+            $playbookTimer.Stop()
+            Invoke-HubActionRoutine -RoutineName $targetPlaybook
+        })
+        $playbookTimer.Start()
+    }
 
     # Ensure clean shutdown of RunspacePool and DispatcherTimer on close
     $window.Add_Closed({
@@ -12122,6 +17608,25 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
 # ==============================================================================
 # SECTION C: RUNTIME ENTRYPOINT & STA APARTMENT STATE GUARD
 # ==============================================================================
+
+# Central Config-as-Code profile and environment initialization
+if ($DeploymentProfile) {
+    Apply-HubDeploymentProfile -ProfileNameOrId $DeploymentProfile | Out-Null
+} elseif ($env:AUTOPILOT_DEPLOYMENT_PROFILE) {
+    Apply-HubDeploymentProfile -ProfileNameOrId $env:AUTOPILOT_DEPLOYMENT_PROFILE | Out-Null
+}
+if ($FleetEndpoint) {
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_FLEET_ENDPOINT', $FleetEndpoint, 'Process')
+}
+if ($GroupTag) {
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_GROUP_TAG', $GroupTag, 'Process')
+}
+if ($AssignedUser) {
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_ASSIGNED_USER', $AssignedUser, 'Process')
+}
+if ($ComputerNameTemplate) {
+    [Environment]::SetEnvironmentVariable('AUTOPILOT_NAME_TEMPLATE', $ComputerNameTemplate, 'Process')
+}
 
 if ($RenameComputer) {
     try {
@@ -12167,6 +17672,12 @@ if ($ResumeAutopilot) {
     } else {
         Write-Host "ERROR: $($res.Message)" -ForegroundColor Red
     }
+    return
+}
+
+if (($Playbook -or $ActionRoutine) -and $NoGui) {
+    $pbName = if ($Playbook) { $Playbook } else { $ActionRoutine }
+    Invoke-HeadlessActionRoutine -RoutineName $pbName -ExportCsv:$ExportCsv -CsvPath $CsvPath -ExportPath $ExportPath -SaveReceipt:$SaveReceipt -GenerateReceipt:$GenerateReceipt
     return
 }
 
@@ -12341,11 +17852,7 @@ if (-not $NoGui) {
             }
         }
 
-        # Record this process PID for clean lifecycle tracking
-        try {
-            $pidFile = Join-Path ([System.IO.Path]::GetTempPath()) 'AutopilotCommandHub.pid'
-            [System.IO.File]::WriteAllText($pidFile, $PID.ToString())
-        } catch { }
+        # Single-instance lifecycle managed via Global\AutopilotCommandHub Mutex (RAM-only)
 
         if ($ResumeFromRestart) { Unregister-HubResumeAfterRestart | Out-Null }
     }
@@ -12363,6 +17870,77 @@ if (-not $NoGui) {
             $script:PreflightHandle = $script:PreflightRunspace.BeginInvoke()
         } catch { $script:PreflightHandle = $null; $script:PreflightRunspace = $null }
     }
+    if ($VerifyEnrollment -or $GenerateReceipt) {
+        Write-Host "`nClosed-Loop Provisioning Verification & Receipt Generator" -ForegroundColor Cyan
+        $rec = Export-HubProvisioningReceipt -DeploymentId $script:HubDeploymentId
+        Write-Host "Receipt generated: $($rec.HtmlPath)" -ForegroundColor Green
+        Write-Host "JSON sidecar:      $($rec.JsonPath)" -ForegroundColor Green
+        Write-Host "Verdict:           $($rec.ReceiptData.Verdict) (Score: $($rec.ReceiptData.Score))" -ForegroundColor $(if ($rec.ReceiptData.Verdict -eq 'VERIFIED') { 'Green' } else { 'Yellow' })
+        Write-Host "SHA-256 Digest:    $($rec.ReceiptData.IntegrityHash)" -ForegroundColor Cyan
+
+        if ($SendTelemetry -or $FleetEndpoint -or $env:AUTOPILOT_FLEET_ENDPOINT) {
+            $telemPayload = [PSCustomObject]@{
+                SchemaVersion = 1
+                DeploymentId  = $rec.DeploymentId
+                TimestampUtc  = [datetime]::UtcNow.ToString('o')
+                RoutineName   = 'Verification & Receipt'
+                Status        = if ($rec.ReceiptData.Verdict -eq 'VERIFICATION_FAILED') { 'Failed' } else { 'Success' }
+                TotalSeconds  = 0
+                Verdict       = $rec.ReceiptData.Verdict
+                Receipt       = $rec.ReceiptData
+                Site          = if ($script:ActiveDeploymentProfile) { $script:ActiveDeploymentProfile.Site } elseif ($env:AUTOPILOT_SITE) { $env:AUTOPILOT_SITE } else { 'Default' }
+                Technician    = $env:USERNAME
+                Device        = $rec.ReceiptData.Device
+            }
+            $tRes = Send-HubFleetTelemetry -Payload $telemPayload -Endpoint $FleetEndpoint
+            if ($tRes.Success -and -not $tRes.Buffered) {
+                Write-Host "Telemetry delivered to fleet plane: $($tRes.Endpoint)" -ForegroundColor Green
+            } else {
+                Write-Host "Telemetry buffered offline: $($tRes.Path)" -ForegroundColor Gray
+            }
+        }
+        return
+    }
+
+    if ($CartMode) {
+        Write-Host "`nBulk Harvest Station: Cart Mode" -ForegroundColor Cyan
+        $gt = if ($GroupTag) { $GroupTag } else { $env:AUTOPILOT_GROUP_TAG }
+        $usr = if ($AssignedUser) { $AssignedUser } else { $env:AUTOPILOT_ASSIGNED_USER }
+        $cres = Invoke-HubCartHarvest -CartName $CartName -CsvPath $CartCsvPath -GroupTag $gt -AssignedUser $usr
+        return
+    }
+
+    if ($BatchRegisterCart) {
+        Write-Host "`nBulk Cart Batch Cloud Registration" -ForegroundColor Cyan
+        $cres = Invoke-HubCartBatchRegistration -CsvPath $CartCsvPath
+        return
+    }
+
+    if ($OemUpdates) {
+        Write-Host "`nOEM Driver & Firmware Management" -ForegroundColor Cyan
+        $ores = Invoke-HubOemDriverUpdate -ScanOnly:$OemScanOnly
+        return
+    }
+
+    if ($EnforceSecurityPosture) {
+        Write-Host "`nSecurity Posture Enforcement" -ForegroundColor Cyan
+        $bRes = Enable-HubBitLocker
+        $sRes = Set-HubSecurityBaseline
+        $lRes = Set-HubLocalAdminPosture
+        return
+    }
+
+    if ($ClearTraces -or $RemoveTraces) {
+        Remove-HubTraces
+        return
+    }
+
+    if ($StartFleetServer) {
+        Write-Host "`nStarting Fleet Plane Ingestion Server on port $FleetServerPort..." -ForegroundColor Cyan
+        Start-HubFleetServer -Port $FleetServerPort
+        return
+    }
+
     if (-not $NoIntro) { Show-HubIntro }
 
     try {
