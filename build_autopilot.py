@@ -6973,7 +6973,7 @@ function Start-AutopilotHubGui {
 
                 <StackPanel Grid.Column="5">
                     <TextBlock Text="DEVICE STATE" FontSize="8" Foreground="#64748B" FontWeight="SemiBold"/>
-                    <TextBlock Name="TxtDeviceState" Text="Inspecting..." FontSize="10.5" Foreground="#475569" FontWeight="Bold" Margin="0,1,0,0" TextTrimming="CharacterEllipsis"/>
+                    <TextBlock Name="TxtDeviceState" Text="Inspecting..." FontSize="10.5" Foreground="#475569" FontWeight="Bold" Margin="0,1,0,0" TextTrimming="CharacterEllipsis" Cursor="Hand" ToolTip="Click to copy Device State to clipboard"/>
                 </StackPanel>
             </Grid>
         </Border>
@@ -8302,9 +8302,13 @@ function Start-AutopilotHubGui {
                     </Grid.ColumnDefinitions>
                     <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                         <TextBlock Text="SYSTEM AUDIT LOG" FontSize="10" FontWeight="SemiBold" Foreground="#64748B" VerticalAlignment="Center"/>
-                        <Button Name="BtnToggleConsole" Content="[-] Hide Log" FontSize="9.5" Padding="6,2" Margin="10,0,0,0" ToolTip="Collapse or expand the system audit log console"/>
+                        <Border Name="BadgeLogStats" Background="#F1F5F9" CornerRadius="3" Padding="6,1" Margin="8,0,0,0" VerticalAlignment="Center" BorderBrush="#CBD5E1" BorderThickness="1" ToolTip="Live count of audit log entries and warnings/errors">
+                            <TextBlock Name="TxtLogStats" Text="0 lines" FontSize="8.5" FontWeight="SemiBold" Foreground="#475569" VerticalAlignment="Center"/>
+                        </Border>
+                        <Button Name="BtnToggleConsole" Content="[-] Hide Log" FontSize="9.5" Padding="6,2" Margin="8,0,0,0" ToolTip="Collapse or expand the system audit log console"/>
                     </StackPanel>
                     <StackPanel Grid.Column="2" Orientation="Horizontal">
+                        <Button Name="BtnCopyLogErrors" Content="Copy Warn/Err" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy only [WARN], [ERROR], and [FAIL] audit log lines to the clipboard"/>
                         <Button Name="BtnCopyLog" Content="Copy Log" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnClearLog" Content="Clear" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnSaveLog" Content="Save Log..." FontSize="10" Padding="6,2"/>
@@ -8682,11 +8686,14 @@ function Start-AutopilotHubGui {
     $lstDiagStages     = $window.FindName('LstDiagStages')
 
     $rowConsoleLog     = $window.FindName('RowConsoleLog')
+    $badgeLogStats     = $window.FindName('BadgeLogStats')
+    $txtLogStats       = $window.FindName('TxtLogStats')
     $btnToggleConsole  = $window.FindName('BtnToggleConsole')
     $btnClearHybOut    = $window.FindName('BtnClearHybOut')
     $hubProgressBar    = $window.FindName('HubProgressBar')
     $txtProgressStatus = $window.FindName('TxtProgressStatus')
     $txtHubLog         = $window.FindName('TxtHubLog')
+    $btnCopyLogErrors  = $window.FindName('BtnCopyLogErrors')
     $btnCopyLog        = $window.FindName('BtnCopyLog')
     $btnClearLog       = $window.FindName('BtnClearLog')
     $btnSaveLog        = $window.FindName('BtnSaveLog')
@@ -8713,6 +8720,35 @@ function Start-AutopilotHubGui {
     $txtDellEndDate        = $window.FindName('TxtDellEndDate')
     $txtDellDaysRemaining  = $window.FindName('TxtDellDaysRemaining')
     $lstDellEntitlements   = $window.FindName('LstDellEntitlements')
+
+    $script:HubLogLineCount = 0
+    $script:HubLogWarnErrCount = 0
+    function Update-HubLogStatsBadge {
+        param([string]$Level = '')
+        if ($Level) {
+            $script:HubLogLineCount++
+            if ($Level -match '^(WARN|ERROR|FAIL)$') {
+                $script:HubLogWarnErrCount++
+            }
+        }
+        if ($txtLogStats) {
+            if ($script:HubLogWarnErrCount -gt 0) {
+                $txtLogStats.Text = "$($script:HubLogLineCount) lines · $($script:HubLogWarnErrCount) warn/err"
+                $txtLogStats.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#B45309")
+                if ($badgeLogStats) {
+                    $badgeLogStats.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FEF3C7")
+                    $badgeLogStats.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FDE68A")
+                }
+            } else {
+                $txtLogStats.Text = "$($script:HubLogLineCount) lines"
+                $txtLogStats.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#475569")
+                if ($badgeLogStats) {
+                    $badgeLogStats.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#F1F5F9")
+                    $badgeLogStats.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#CBD5E1")
+                }
+            }
+        }
+    }
 
     # Hyperthreaded Asynchronous Background Worker Architecture
     $script:HubAsyncQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
@@ -8834,6 +8870,7 @@ function Start-AutopilotHubGui {
                         $line = "[$timestamp] [$($msg.Level)] $($msg.Message)"
                         $txtHubLog.AppendText("$line`r`n")
                         $txtHubLog.ScrollToEnd()
+                        Update-HubLogStatsBadge -Level $msg.Level
                     } elseif ($msg.Type -eq 'Progress') {
                         $hubProgressBar.Value = $msg.Percent
                         $txtProgressStatus.Text = $msg.Status
@@ -8911,6 +8948,7 @@ function Start-AutopilotHubGui {
         $line = "[$timestamp] [$Level] $Message"
         $txtHubLog.AppendText("$line`r`n")
         $txtHubLog.ScrollToEnd()
+        Update-HubLogStatsBadge -Level $Level
         Update-WpfUI
     }
 
@@ -10421,12 +10459,31 @@ function Start-AutopilotHubGui {
         Invoke-HubSystemReboot -Reason 'Autonomous System Restart'
     })
 
+    if ($btnCopyLogErrors) {
+        $btnCopyLogErrors.Add_Click({
+            try {
+                $rawLines = if ($txtHubLog -and $txtHubLog.Text) { $txtHubLog.Text -split "`r?`n" } else { @() }
+                $errLines = @($rawLines | Where-Object { $_ -match '\[(WARN|ERROR|FAIL)\]' })
+                if ($errLines.Count -gt 0) {
+                    [System.Windows.Clipboard]::SetText(($errLines -join "`r`n"))
+                    Write-HubLog "Copied $($errLines.Count) warning/error log line(s) to clipboard." "SUCCESS"
+                } else {
+                    [System.Windows.Clipboard]::SetText("[OK] Zero warnings or errors recorded in System Audit Log.")
+                    Write-HubLog "No [WARN] or [ERROR] lines found in audit log (copied clean status)." "INFO"
+                }
+            } catch { }
+        })
+    }
+
     $btnCopyLog.Add_Click({
         [System.Windows.Clipboard]::SetText($txtHubLog.Text)
     })
 
     $btnClearLog.Add_Click({
         $txtHubLog.Clear()
+        $script:HubLogLineCount = 0
+        $script:HubLogWarnErrCount = 0
+        Update-HubLogStatsBadge
     })
 
     $btnSaveLog.Add_Click({
@@ -10674,6 +10731,16 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                 if ($txtNetwork.Text) {
                     [System.Windows.Clipboard]::SetText($txtNetwork.Text.Trim())
                     Write-HubLog "Copied Network Status ($($txtNetwork.Text.Trim())) to clipboard." "SUCCESS"
+                }
+            } catch { }
+        })
+    }
+    if ($txtDeviceState) {
+        $txtDeviceState.Add_MouseLeftButtonUp({
+            try {
+                if ($txtDeviceState.Text) {
+                    [System.Windows.Clipboard]::SetText($txtDeviceState.Text.Trim())
+                    Write-HubLog "Copied Device State ($($txtDeviceState.Text.Trim())) to clipboard." "SUCCESS"
                 }
             } catch { }
         })
