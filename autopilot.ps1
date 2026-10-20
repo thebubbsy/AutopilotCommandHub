@@ -9962,6 +9962,11 @@ function Start-AutopilotHubGui {
                             ToolTip="Click to copy RFC-4180 CSV readiness metrics (headers + values) directly to the clipboard.">
                         <TextBlock Name="TxtCopyDiagCsv" Text="COPY CSV" FontSize="8.5" FontWeight="SemiBold" Foreground="#15803D" VerticalAlignment="Center"/>
                     </Border>
+                    <!-- One-Click Copy JSON Snapshot Pill -->
+                    <Border Name="BadgeCopyDiagJson" Background="#EEF2FF" CornerRadius="3" Padding="6,1.5" Margin="4,0,0,0" VerticalAlignment="Center" BorderBrush="#C7D2FE" BorderThickness="1" Cursor="Hand"
+                            ToolTip="Click to copy structured JSON endpoint readiness metrics directly to the clipboard.">
+                        <TextBlock Name="TxtCopyDiagJson" Text="COPY JSON" FontSize="8.5" FontWeight="SemiBold" Foreground="#4338CA" VerticalAlignment="Center"/>
+                    </Border>
             </StackPanel>
 
             <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
@@ -11443,6 +11448,7 @@ function Start-AutopilotHubGui {
                         <Button Name="BtnCopyLogTsv" Content="Copy TSV" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy structured System Audit Log rows (Timestamp, Severity, Message) as TSV for Excel/Sheets"/>
                         <Button Name="BtnCopyLogCsv" Content="Copy CSV" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy structured System Audit Log rows (Line, Timestamp, Severity, Message) as RFC-4180 CSV to clipboard"/>
                         <Button Name="BtnExportLogCsv" Content="Export CSV" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a structured CSV file and copy its path to the clipboard"/>
+                        <Button Name="BtnExportLogJson" Content="Export JSON" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a structured JSON file and copy its path to the clipboard"/>
                         <Button Name="BtnCopyLog" Content="Copy Log" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnClearLog" Content="Clear" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnSaveLog" Content="Save Log..." FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
@@ -11861,6 +11867,7 @@ function Start-AutopilotHubGui {
     $btnCopyLogTsv     = $window.FindName('BtnCopyLogTsv')
     $btnCopyLogCsv     = $window.FindName('BtnCopyLogCsv')
     $btnExportLogCsv   = $window.FindName('BtnExportLogCsv')
+    $btnExportLogJson  = $window.FindName('BtnExportLogJson')
     $btnCopyLog        = $window.FindName('BtnCopyLog')
     $btnClearLog       = $window.FindName('BtnClearLog')
     $btnSaveLog        = $window.FindName('BtnSaveLog')
@@ -13830,6 +13837,41 @@ function Start-AutopilotHubGui {
         })
     }
 
+    if ($btnExportLogJson) {
+        $btnExportLogJson.Add_Click({
+            try {
+                $q = if ($txtLogFilter -and $txtLogFilter.Text) { $txtLogFilter.Text.Trim() } else { '' }
+                $rawLines = if ($txtHubLog -and $txtHubLog.Text) { $txtHubLog.Text -split "`r?`n" } else { @() }
+                $targetLines = @($rawLines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and ([string]::IsNullOrWhiteSpace($q) -or $_.IndexOf($q, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) })
+                $rows = [System.Collections.Generic.List[object]]::new()
+                $idx = 0
+                foreach ($ln in $targetLines) {
+                    $idx++
+                    $cleanLn = ($ln -replace "[\r\n]+", " ").Trim()
+                    if ($cleanLn -match '^\[(?<ts>[^\]]+)\]\s*\[(?<sev>[^\]]+)\]\s*(?<msg>.*)$') {
+                        $rows.Add([ordered]@{ line = $idx; timestamp = $Matches['ts']; severity = $Matches['sev']; message = $Matches['msg'] })
+                    } else {
+                        $rows.Add([ordered]@{ line = $idx; timestamp = ''; severity = 'INFO'; message = $cleanLn })
+                    }
+                }
+                $payload = [ordered]@{
+                    exportedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+                    computerName  = $env:COMPUTERNAME
+                    filterQuery   = $q
+                    entryCount    = $idx
+                    entries       = $rows
+                }
+                $outDir = if (Test-Path "C:\ProgramData\AutopilotCommandHub") { "C:\ProgramData\AutopilotCommandHub" } else { $env:TEMP }
+                $outFile = Join-Path $outDir ("AutopilotAuditLog_{0}_{1}.json" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd_HHmmss"))
+                ($payload | ConvertTo-Json -Depth 6) | Set-Content -Path $outFile -Encoding UTF8 -Force
+                [System.Windows.Clipboard]::SetText($outFile)
+                Write-HubLog "Exported $($idx) audit log row(s) to JSON: $outFile (path copied)." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not export audit log JSON: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
     $btnCopyLog.Add_Click({
         [System.Windows.Clipboard]::SetText($txtHubLog.Text)
     })
@@ -14305,6 +14347,35 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                 Write-HubLog "Copied RFC-4180 CSV endpoint readiness row (headers + values) to clipboard." "SUCCESS"
             } catch {
                 Write-HubLog "Could not copy diagnostic CSV: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
+    $badgeCopyDiagJson = $window.FindName('BadgeCopyDiagJson')
+    $txtCopyDiagJson   = $window.FindName('TxtCopyDiagJson')
+    if ($badgeCopyDiagJson) {
+        $badgeCopyDiagJson.Add_MouseLeftButtonUp({
+            try {
+                $payload = [ordered]@{
+                    timestampUtc     = (Get-Date).ToUniversalTime().ToString("o")
+                    computerName     = $env:COMPUTERNAME
+                    serialNumber     = $(if ($txtSerial) { $txtSerial.Text } else { 'Unknown' })
+                    hardwareModel    = $(if ($txtModel) { $txtModel.Text } else { 'Unknown' })
+                    tpmStatus        = $(if ($txtTpm) { $txtTpm.Text } else { 'Unknown' })
+                    secureBoot       = $(if ($txtSecureBoot) { $txtSecureBoot.Text } else { 'Unknown' })
+                    networkStatus    = $(if ($txtNetwork) { $txtNetwork.Text } else { 'Unknown' })
+                    deviceState      = $(if ($txtDeviceState) { $txtDeviceState.Text } else { 'Unknown' })
+                    powerStatus      = $(if ($txtPowerStatus) { $txtPowerStatus.Text } else { 'Unknown' })
+                    privilegeContext = $(if ($txtPrivilege) { $txtPrivilege.Text } else { 'Unknown' })
+                    graphStatus      = $(if ($txtGraphStatus) { $txtGraphStatus.Text } else { 'Unknown' })
+                }
+                [System.Windows.Clipboard]::SetText(($payload | ConvertTo-Json -Depth 4))
+                if ($txtCopyDiagJson) { $txtCopyDiagJson.Text = "JSON COPIED" }
+                $badgeCopyDiagJson.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#DCFCE7")
+                $badgeCopyDiagJson.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#86EFAC")
+                Write-HubLog "Copied structured JSON endpoint readiness snapshot to clipboard." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not copy diagnostic JSON: $($_.Exception.Message)" "WARN"
             }
         })
     }
