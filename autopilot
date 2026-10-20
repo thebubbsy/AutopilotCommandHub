@@ -9967,6 +9967,11 @@ function Start-AutopilotHubGui {
                             ToolTip="Click to copy structured JSON endpoint readiness metrics directly to the clipboard.">
                         <TextBlock Name="TxtCopyDiagJson" Text="COPY JSON" FontSize="8.5" FontWeight="SemiBold" Foreground="#4338CA" VerticalAlignment="Center"/>
                     </Border>
+                    <!-- One-Click Export Diagnostic TSV Pill -->
+                    <Border Name="BadgeExportDiagTsv" Background="#F0FDFA" CornerRadius="3" Padding="6,1.5" Margin="4,0,0,0" VerticalAlignment="Center" BorderBrush="#99F6E4" BorderThickness="1" Cursor="Hand"
+                            ToolTip="Click to export a tab-separated (TSV) hardware &amp; session readiness row to USB (or %TEMP%) and copy its path.">
+                        <TextBlock Name="TxtExportDiagTsv" Text="EXPORT TSV" FontSize="8.5" FontWeight="SemiBold" Foreground="#0F766E" VerticalAlignment="Center"/>
+                    </Border>
             </StackPanel>
 
             <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
@@ -11448,7 +11453,9 @@ function Start-AutopilotHubGui {
                         <Button Name="BtnCopyLogTsv" Content="Copy TSV" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy structured System Audit Log rows (Timestamp, Severity, Message) as TSV for Excel/Sheets"/>
                         <Button Name="BtnCopyLogCsv" Content="Copy CSV" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy structured System Audit Log rows (Line, Timestamp, Severity, Message) as RFC-4180 CSV to clipboard"/>
                         <Button Name="BtnExportLogCsv" Content="Export CSV" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a structured CSV file and copy its path to the clipboard"/>
+                        <Button Name="BtnExportLogTsv" Content="Export TSV" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a tab-separated (.tsv) file and copy its path to the clipboard"/>
                         <Button Name="BtnExportLogJson" Content="Export JSON" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a structured JSON file and copy its path to the clipboard"/>
+                        <Button Name="BtnExportLogMd" Content="Export MD" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a formatted Markdown report (.md) and copy its path to the clipboard"/>
                         <Button Name="BtnCopyLog" Content="Copy Log" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnClearLog" Content="Clear" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnSaveLog" Content="Save Log..." FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
@@ -11867,7 +11874,9 @@ function Start-AutopilotHubGui {
     $btnCopyLogTsv     = $window.FindName('BtnCopyLogTsv')
     $btnCopyLogCsv     = $window.FindName('BtnCopyLogCsv')
     $btnExportLogCsv   = $window.FindName('BtnExportLogCsv')
+    $btnExportLogTsv   = $window.FindName('BtnExportLogTsv')
     $btnExportLogJson  = $window.FindName('BtnExportLogJson')
+    $btnExportLogMd    = $window.FindName('BtnExportLogMd')
     $btnCopyLog        = $window.FindName('BtnCopyLog')
     $btnClearLog       = $window.FindName('BtnClearLog')
     $btnSaveLog        = $window.FindName('BtnSaveLog')
@@ -13872,6 +13881,70 @@ function Start-AutopilotHubGui {
         })
     }
 
+    if ($btnExportLogTsv) {
+        $btnExportLogTsv.Add_Click({
+            try {
+                $q = if ($txtLogFilter -and $txtLogFilter.Text) { $txtLogFilter.Text.Trim() } else { '' }
+                $rawLines = if ($txtHubLog -and $txtHubLog.Text) { $txtHubLog.Text -split "`r?`n" } else { @() }
+                $targetLines = @($rawLines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and ([string]::IsNullOrWhiteSpace($q) -or $_.IndexOf($q, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) })
+                $tsvLines = [System.Collections.Generic.List[string]]::new()
+                $tsvLines.Add("Line`tTimestamp`tSeverity`tMessage")
+                $idx = 0
+                foreach ($ln in $targetLines) {
+                    $idx++
+                    $cleanLn = ($ln -replace "[\t\r\n]+", " ").Trim()
+                    if ($cleanLn -match '^\[(?<ts>[^\]]+)\]\s*\[(?<sev>[^\]]+)\]\s*(?<msg>.*)$') {
+                        $tsvLines.Add("$idx`t$($Matches['ts'])`t$($Matches['sev'])`t$($Matches['msg'])")
+                    } else {
+                        $tsvLines.Add("$idx`t`tINFO`t$cleanLn")
+                    }
+                }
+                $outDir = if (Test-Path "C:\ProgramData\AutopilotCommandHub") { "C:\ProgramData\AutopilotCommandHub" } else { $env:TEMP }
+                $outFile = Join-Path $outDir ("AutopilotAuditLog_{0}_{1}.tsv" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd_HHmmss"))
+                ($tsvLines -join "`r`n") | Set-Content -Path $outFile -Encoding UTF8 -Force
+                [System.Windows.Clipboard]::SetText($outFile)
+                Write-HubLog "Exported $($idx) audit log row(s) to TSV: $outFile (path copied)." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not export audit log TSV: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
+    if ($btnExportLogMd) {
+        $btnExportLogMd.Add_Click({
+            try {
+                $q = if ($txtLogFilter -and $txtLogFilter.Text) { $txtLogFilter.Text.Trim() } else { '' }
+                $rawLines = if ($txtHubLog -and $txtHubLog.Text) { $txtHubLog.Text -split "`r?`n" } else { @() }
+                $targetLines = @($rawLines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and ([string]::IsNullOrWhiteSpace($q) -or $_.IndexOf($q, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) })
+                $mdLines = [System.Collections.Generic.List[string]]::new()
+                $mdLines.Add("# Autopilot Command Hub -- System Audit Log ($env:COMPUTERNAME)")
+                $mdLines.Add("")
+                $mdLines.Add("- **Exported (UTC)**: $((Get-Date).ToUniversalTime().ToString('o'))")
+                $mdLines.Add("- **Filter**: $(if ($q) { $q } else { '(none)' })")
+                $mdLines.Add("")
+                $mdLines.Add("| # | Timestamp | Severity | Message |")
+                $mdLines.Add("| ---: | :--- | :---: | :--- |")
+                $idx = 0
+                foreach ($ln in $targetLines) {
+                    $idx++
+                    $cleanLn = (($ln -replace "[\r\n]+", " ") -replace "\|", "\|").Trim()
+                    if ($cleanLn -match '^\[(?<ts>[^\]]+)\]\s*\[(?<sev>[^\]]+)\]\s*(?<msg>.*)$') {
+                        $mdLines.Add("| $idx | ``$($Matches['ts'])`` | **$($Matches['sev'])** | $($Matches['msg']) |")
+                    } else {
+                        $mdLines.Add("| $idx | - | **INFO** | $cleanLn |")
+                    }
+                }
+                $outDir = if (Test-Path "C:\ProgramData\AutopilotCommandHub") { "C:\ProgramData\AutopilotCommandHub" } else { $env:TEMP }
+                $outFile = Join-Path $outDir ("AutopilotAuditLog_{0}_{1}.md" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd_HHmmss"))
+                ($mdLines -join "`r`n") | Set-Content -Path $outFile -Encoding UTF8 -Force
+                [System.Windows.Clipboard]::SetText($outFile)
+                Write-HubLog "Exported $($idx) audit log row(s) to Markdown: $outFile (path copied)." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not export audit log Markdown: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
     $btnCopyLog.Add_Click({
         [System.Windows.Clipboard]::SetText($txtHubLog.Text)
     })
@@ -14376,6 +14449,40 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                 Write-HubLog "Copied structured JSON endpoint readiness snapshot to clipboard." "SUCCESS"
             } catch {
                 Write-HubLog "Could not copy diagnostic JSON: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
+    $badgeExportDiagTsv = $window.FindName('BadgeExportDiagTsv')
+    $txtExportDiagTsv   = $window.FindName('TxtExportDiagTsv')
+    if ($badgeExportDiagTsv) {
+        $badgeExportDiagTsv.Add_MouseLeftButtonUp({
+            try {
+                $cleanTsv = { param($v) ([string]$v -replace "[\t\r\n]+", " ").Trim() }
+                $headers = @('TimestampUtc','ComputerName','SerialNumber','HardwareModel','TpmStatus','SecureBoot','NetworkStatus','DeviceState','PowerStatus','PrivilegeContext','GraphStatus') -join "`t"
+                $vals = @(
+                    (Get-Date).ToUniversalTime().ToString("o"),
+                    (& $cleanTsv $env:COMPUTERNAME),
+                    (& $cleanTsv $(if ($txtSerial) { $txtSerial.Text } else { 'Unknown' })),
+                    (& $cleanTsv $(if ($txtModel) { $txtModel.Text } else { 'Unknown' })),
+                    (& $cleanTsv $(if ($txtTpm) { $txtTpm.Text } else { 'Unknown' })),
+                    (& $cleanTsv $(if ($txtSecureBoot) { $txtSecureBoot.Text } else { 'Unknown' })),
+                    (& $cleanTsv $(if ($txtNetwork) { $txtNetwork.Text } else { 'Unknown' })),
+                    (& $cleanTsv $(if ($txtDeviceState) { $txtDeviceState.Text } else { 'Unknown' })),
+                    (& $cleanTsv $(if ($txtPowerStatus) { $txtPowerStatus.Text } else { 'Unknown' })),
+                    (& $cleanTsv $(if ($txtPrivilege) { $txtPrivilege.Text } else { 'Unknown' })),
+                    (& $cleanTsv $(if ($txtGraphStatus) { $txtGraphStatus.Text } else { 'Unknown' }))
+                ) -join "`t"
+                $outDir = if (Test-Path "C:\ProgramData\AutopilotCommandHub") { "C:\ProgramData\AutopilotCommandHub" } else { $env:TEMP }
+                $outFile = Join-Path $outDir ("AutopilotDiag_{0}_{1}.tsv" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd_HHmmss"))
+                ("$headers`r`n$vals") | Set-Content -Path $outFile -Encoding UTF8 -Force
+                [System.Windows.Clipboard]::SetText($outFile)
+                if ($txtExportDiagTsv) { $txtExportDiagTsv.Text = "TSV SAVED" }
+                $badgeExportDiagTsv.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#DCFCE7")
+                $badgeExportDiagTsv.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#86EFAC")
+                Write-HubLog "Exported TSV endpoint readiness row to $outFile (path copied)." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not export diagnostic TSV: $($_.Exception.Message)" "WARN"
             }
         })
     }
