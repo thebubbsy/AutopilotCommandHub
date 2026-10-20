@@ -9957,6 +9957,11 @@ function Start-AutopilotHubGui {
                             ToolTip="Click to copy tab-separated (TSV) readiness metrics (headers + values) for instant paste into Excel or Google Sheets.">
                         <TextBlock Name="TxtCopyDiagTsv" Text="COPY TSV" FontSize="8.5" FontWeight="SemiBold" Foreground="#047857" VerticalAlignment="Center"/>
                     </Border>
+                    <!-- One-Click Copy CSV Row Pill (RFC-4180 Clipboard Paste) -->
+                    <Border Name="BadgeCopyDiagCsv" Background="#F0FDF4" CornerRadius="3" Padding="6,1.5" Margin="4,0,0,0" VerticalAlignment="Center" BorderBrush="#BBF7D0" BorderThickness="1" Cursor="Hand"
+                            ToolTip="Click to copy RFC-4180 CSV readiness metrics (headers + values) directly to the clipboard.">
+                        <TextBlock Name="TxtCopyDiagCsv" Text="COPY CSV" FontSize="8.5" FontWeight="SemiBold" Foreground="#15803D" VerticalAlignment="Center"/>
+                    </Border>
             </StackPanel>
 
             <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
@@ -11436,6 +11441,7 @@ function Start-AutopilotHubGui {
                         <Button Name="BtnCopyLogJson" Content="Copy JSON" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy structured System Audit Log entries (Line, Timestamp, Severity, Message) as JSON to clipboard"/>
                         <Button Name="BtnCopyLogMd" Content="Copy MD" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy System Audit Log entries as a formatted Markdown table to clipboard"/>
                         <Button Name="BtnCopyLogTsv" Content="Copy TSV" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy structured System Audit Log rows (Timestamp, Severity, Message) as TSV for Excel/Sheets"/>
+                        <Button Name="BtnCopyLogCsv" Content="Copy CSV" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy structured System Audit Log rows (Line, Timestamp, Severity, Message) as RFC-4180 CSV to clipboard"/>
                         <Button Name="BtnExportLogCsv" Content="Export CSV" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a structured CSV file and copy its path to the clipboard"/>
                         <Button Name="BtnCopyLog" Content="Copy Log" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnClearLog" Content="Clear" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
@@ -11853,6 +11859,7 @@ function Start-AutopilotHubGui {
     $btnCopyLogJson    = $window.FindName('BtnCopyLogJson')
     $btnCopyLogMd      = $window.FindName('BtnCopyLogMd')
     $btnCopyLogTsv     = $window.FindName('BtnCopyLogTsv')
+    $btnCopyLogCsv     = $window.FindName('BtnCopyLogCsv')
     $btnExportLogCsv   = $window.FindName('BtnExportLogCsv')
     $btnCopyLog        = $window.FindName('BtnCopyLog')
     $btnClearLog       = $window.FindName('BtnClearLog')
@@ -13765,6 +13772,36 @@ function Start-AutopilotHubGui {
         })
     }
 
+    if ($btnCopyLogCsv) {
+        $btnCopyLogCsv.Add_Click({
+            try {
+                $q = if ($txtLogFilter -and $txtLogFilter.Text) { $txtLogFilter.Text.Trim() } else { '' }
+                $rawLines = if ($txtHubLog -and $txtHubLog.Text) { $txtHubLog.Text -split "`r?`n" } else { @() }
+                $targetLines = @($rawLines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and ([string]::IsNullOrWhiteSpace($q) -or $_.IndexOf($q, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) })
+                $csvOut = [System.Collections.Generic.List[string]]::new()
+                $csvOut.Add('"Line","Timestamp","Severity","Message"')
+                $idx = 0
+                foreach ($ln in $targetLines) {
+                    $idx++
+                    $cleanLn = ($ln -replace "[\r\n]+", " ").Trim()
+                    if ($cleanLn -match '^\[(?<ts>[^\]]+)\]\s*\[(?<sev>[^\]]+)\]\s*(?<msg>.*)$') {
+                        $tsEsc  = $Matches['ts'].Replace('"', '""')
+                        $sevEsc = $Matches['sev'].Replace('"', '""')
+                        $msgEsc = $Matches['msg'].Replace('"', '""')
+                        $csvOut.Add(('"{0}","{1}","{2}","{3}"' -f $idx, $tsEsc, $sevEsc, $msgEsc))
+                    } else {
+                        $msgEsc = $cleanLn.Replace('"', '""')
+                        $csvOut.Add(('"{0}","","INFO","{1}"' -f $idx, $msgEsc))
+                    }
+                }
+                [System.Windows.Clipboard]::SetText(($csvOut -join "`r`n"))
+                Write-HubLog "Copied $($idx) audit log row(s) as RFC-4180 CSV to clipboard." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not copy audit log CSV: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
     if ($btnExportLogCsv) {
         $btnExportLogCsv.Add_Click({
             try {
@@ -14237,6 +14274,37 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                 Write-HubLog "Copied TSV endpoint readiness row (headers + values) to clipboard for Excel/Sheets." "SUCCESS"
             } catch {
                 Write-HubLog "Could not copy diagnostic TSV: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
+    $badgeCopyDiagCsv = $window.FindName('BadgeCopyDiagCsv')
+    $txtCopyDiagCsv   = $window.FindName('TxtCopyDiagCsv')
+    if ($badgeCopyDiagCsv) {
+        $badgeCopyDiagCsv.Add_MouseLeftButtonUp({
+            try {
+                $headers = '"TimestampUtc","ComputerName","SerialNumber","HardwareModel","TpmStatus","SecureBoot","NetworkStatus","DeviceState","PowerStatus","PrivilegeContext","GraphStatus"'
+                $rawVals = @(
+                    (Get-Date).ToUniversalTime().ToString("o"),
+                    $env:COMPUTERNAME,
+                    $(if ($txtSerial) { $txtSerial.Text } else { 'Unknown' }),
+                    $(if ($txtModel) { $txtModel.Text } else { 'Unknown' }),
+                    $(if ($txtTpm) { $txtTpm.Text } else { 'Unknown' }),
+                    $(if ($txtSecureBoot) { $txtSecureBoot.Text } else { 'Unknown' }),
+                    $(if ($txtNetwork) { $txtNetwork.Text } else { 'Unknown' }),
+                    $(if ($txtDeviceState) { $txtDeviceState.Text } else { 'Unknown' }),
+                    $(if ($txtPowerStatus) { $txtPowerStatus.Text } else { 'Unknown' }),
+                    $(if ($txtPrivilege) { $txtPrivilege.Text } else { 'Unknown' }),
+                    $(if ($txtGraphStatus) { $txtGraphStatus.Text } else { 'Unknown' })
+                )
+                $csvRow = ($rawVals | ForEach-Object { '"' + ([string]$_).Replace('"', '""') + '"' }) -join ','
+                [System.Windows.Clipboard]::SetText("$headers`r`n$csvRow")
+                if ($txtCopyDiagCsv) { $txtCopyDiagCsv.Text = "CSV COPIED" }
+                $badgeCopyDiagCsv.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#DCFCE7")
+                $badgeCopyDiagCsv.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#86EFAC")
+                Write-HubLog "Copied RFC-4180 CSV endpoint readiness row (headers + values) to clipboard." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not copy diagnostic CSV: $($_.Exception.Message)" "WARN"
             }
         })
     }
