@@ -9972,6 +9972,11 @@ function Start-AutopilotHubGui {
                             ToolTip="Click to export a tab-separated (TSV) hardware &amp; session readiness row to USB (or %TEMP%) and copy its path.">
                         <TextBlock Name="TxtExportDiagTsv" Text="EXPORT TSV" FontSize="8.5" FontWeight="SemiBold" Foreground="#0F766E" VerticalAlignment="Center"/>
                     </Border>
+                    <!-- One-Click Export Diagnostic Markdown Pill -->
+                    <Border Name="BadgeExportDiagMd" Background="#FDF4FF" CornerRadius="3" Padding="6,1.5" Margin="4,0,0,0" VerticalAlignment="Center" BorderBrush="#F0ABFC" BorderThickness="1" Cursor="Hand"
+                            ToolTip="Click to export a formatted Markdown (.md) endpoint readiness &amp; audit summary report to USB (or %TEMP%) and copy its path.">
+                        <TextBlock Name="TxtExportDiagMd" Text="EXPORT MD" FontSize="8.5" FontWeight="SemiBold" Foreground="#86198F" VerticalAlignment="Center"/>
+                    </Border>
             </StackPanel>
 
             <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
@@ -11456,6 +11461,7 @@ function Start-AutopilotHubGui {
                         <Button Name="BtnExportLogTsv" Content="Export TSV" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a tab-separated (.tsv) file and copy its path to the clipboard"/>
                         <Button Name="BtnExportLogJson" Content="Export JSON" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a structured JSON file and copy its path to the clipboard"/>
                         <Button Name="BtnExportLogMd" Content="Export MD" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a formatted Markdown report (.md) and copy its path to the clipboard"/>
+                        <Button Name="BtnCopyLogLatest" Content="Copy Latest" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy the most recent System Audit Log entry to the clipboard"/>
                         <Button Name="BtnCopyLog" Content="Copy Log" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnClearLog" Content="Clear" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnSaveLog" Content="Save Log..." FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
@@ -11877,6 +11883,7 @@ function Start-AutopilotHubGui {
     $btnExportLogTsv   = $window.FindName('BtnExportLogTsv')
     $btnExportLogJson  = $window.FindName('BtnExportLogJson')
     $btnExportLogMd    = $window.FindName('BtnExportLogMd')
+    $btnCopyLogLatest  = $window.FindName('BtnCopyLogLatest')
     $btnCopyLog        = $window.FindName('BtnCopyLog')
     $btnClearLog       = $window.FindName('BtnClearLog')
     $btnSaveLog        = $window.FindName('BtnSaveLog')
@@ -13945,6 +13952,23 @@ function Start-AutopilotHubGui {
         })
     }
 
+    if ($btnCopyLogLatest) {
+        $btnCopyLogLatest.Add_Click({
+            try {
+                $rawLines = if ($txtHubLog -and $txtHubLog.Text) { @($txtHubLog.Text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) } else { @() }
+                if ($rawLines.Count -gt 0) {
+                    $latestLine = $rawLines[-1].Trim()
+                    [System.Windows.Clipboard]::SetText($latestLine)
+                    Write-HubLog "Copied latest audit log entry to clipboard." "SUCCESS"
+                } else {
+                    Write-HubLog "No audit log entries available to copy." "INFO"
+                }
+            } catch {
+                Write-HubLog "Could not copy latest audit log entry: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
     $btnCopyLog.Add_Click({
         [System.Windows.Clipboard]::SetText($txtHubLog.Text)
     })
@@ -14483,6 +14507,43 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                 Write-HubLog "Exported TSV endpoint readiness row to $outFile (path copied)." "SUCCESS"
             } catch {
                 Write-HubLog "Could not export diagnostic TSV: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
+    $badgeExportDiagMd = $window.FindName('BadgeExportDiagMd')
+    $txtExportDiagMd   = $window.FindName('TxtExportDiagMd')
+    if ($badgeExportDiagMd) {
+        $badgeExportDiagMd.Add_MouseLeftButtonUp({
+            try {
+                $cleanMd = { param($v) (([string]$v -replace "[\r\n]+", " ") -replace "\|", "\|").Trim() }
+                $mdLines = [System.Collections.Generic.List[string]]::new()
+                $mdLines.Add("# Autopilot Command Hub -- Endpoint Readiness Report ($env:COMPUTERNAME)")
+                $mdLines.Add("")
+                $mdLines.Add("- **Exported (UTC)**: $((Get-Date).ToUniversalTime().ToString('o'))")
+                $mdLines.Add("- **Computer Name**: ``$env:COMPUTERNAME``")
+                $mdLines.Add("")
+                $mdLines.Add("| Metric | Status / Value |")
+                $mdLines.Add("| :--- | :--- |")
+                $mdLines.Add("| **Serial Number** | ``$(& $cleanMd $(if ($txtSerial) { $txtSerial.Text } else { 'Unknown' }))`` |")
+                $mdLines.Add("| **Hardware Model** | $(& $cleanMd $(if ($txtModel) { $txtModel.Text } else { 'Unknown' })) |")
+                $mdLines.Add("| **TPM Status** | $(& $cleanMd $(if ($txtTpm) { $txtTpm.Text } else { 'Unknown' })) |")
+                $mdLines.Add("| **Secure Boot** | $(& $cleanMd $(if ($txtSecureBoot) { $txtSecureBoot.Text } else { 'Unknown' })) |")
+                $mdLines.Add("| **Network Status** | $(& $cleanMd $(if ($txtNetwork) { $txtNetwork.Text } else { 'Unknown' })) |")
+                $mdLines.Add("| **Device State** | $(& $cleanMd $(if ($txtDeviceState) { $txtDeviceState.Text } else { 'Unknown' })) |")
+                $mdLines.Add("| **Power Status** | $(& $cleanMd $(if ($txtPowerStatus) { $txtPowerStatus.Text } else { 'Unknown' })) |")
+                $mdLines.Add("| **Privilege Context** | $(& $cleanMd $(if ($txtPrivilege) { $txtPrivilege.Text } else { 'Unknown' })) |")
+                $mdLines.Add("| **Graph Status** | $(& $cleanMd $(if ($txtGraphStatus) { $txtGraphStatus.Text } else { 'Unknown' })) |")
+                $outDir = if (Test-Path "C:\ProgramData\AutopilotCommandHub") { "C:\ProgramData\AutopilotCommandHub" } else { $env:TEMP }
+                $outFile = Join-Path $outDir ("AutopilotDiag_{0}_{1}.md" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd_HHmmss"))
+                ($mdLines -join "`r`n") | Set-Content -Path $outFile -Encoding UTF8 -Force
+                [System.Windows.Clipboard]::SetText($outFile)
+                if ($txtExportDiagMd) { $txtExportDiagMd.Text = "MD SAVED" }
+                $badgeExportDiagMd.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#DCFCE7")
+                $badgeExportDiagMd.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#86EFAC")
+                Write-HubLog "Exported Markdown endpoint readiness report to $outFile (path copied)." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not export diagnostic Markdown: $($_.Exception.Message)" "WARN"
             }
         })
     }
