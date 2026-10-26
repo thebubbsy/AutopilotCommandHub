@@ -9982,6 +9982,11 @@ function Start-AutopilotHubGui {
                             ToolTip="Click to export a styled offline HTML endpoint readiness report to USB (or %TEMP%) and copy its path.">
                         <TextBlock Name="TxtExportDiagHtml" Text="EXPORT HTML" FontSize="8.5" FontWeight="SemiBold" Foreground="#15803D" VerticalAlignment="Center"/>
                     </Border>
+                    <!-- One-Click Copy Diagnostic HTML Pill -->
+                    <Border Name="BadgeCopyDiagHtml" Background="#F0FDFA" CornerRadius="3" Padding="6,1.5" Margin="4,0,0,0" VerticalAlignment="Center" BorderBrush="#99F6E4" BorderThickness="1" Cursor="Hand"
+                            ToolTip="Click to copy styled HTML endpoint readiness metrics &amp; status cards directly to the clipboard.">
+                        <TextBlock Name="TxtCopyDiagHtml" Text="COPY HTML" FontSize="8.5" FontWeight="SemiBold" Foreground="#0F766E" VerticalAlignment="Center"/>
+                    </Border>
             </StackPanel>
 
             <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
@@ -14699,6 +14704,58 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                 Write-HubLog "Exported HTML endpoint readiness report to $outFile (path copied)." "SUCCESS"
             } catch {
                 Write-HubLog "Could not export diagnostic HTML: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
+    $badgeCopyDiagHtml = $window.FindName('BadgeCopyDiagHtml')
+    $txtCopyDiagHtml   = $window.FindName('TxtCopyDiagHtml')
+    if ($badgeCopyDiagHtml) {
+        $badgeCopyDiagHtml.Add_MouseLeftButtonUp({
+            try {
+                $esc = { param($v) [System.Net.WebUtility]::HtmlEncode([string]$v) }
+                $sSerial   = & $esc $(if ($txtSerial) { $txtSerial.Text } else { 'Unknown' })
+                $sModel    = & $esc $(if ($txtModel) { $txtModel.Text } else { 'Unknown' })
+                $sTpm      = & $esc $(if ($txtTpm) { $txtTpm.Text } else { 'Unknown' })
+                $sSecBoot  = & $esc $(if ($txtSecureBoot) { $txtSecureBoot.Text } else { 'Unknown' })
+                $sNet      = & $esc $(if ($txtNetwork) { $txtNetwork.Text } else { 'Unknown' })
+                $sDevState = & $esc $(if ($txtDeviceState) { $txtDeviceState.Text } else { 'Unknown' })
+                $sPower    = & $esc $(if ($txtPowerStatus) { $txtPowerStatus.Text } else { 'Unknown' })
+                $sPriv     = & $esc $(if ($txtPrivilege) { $txtPrivilege.Text } else { 'Unknown' })
+                $sGraph    = & $esc $(if ($txtGraphStatus) { $txtGraphStatus.Text } else { 'Unknown' })
+                $htmlSnippet = @"
+<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0B0F19; color: #E2E8F0; padding: 16px; border-radius: 8px; border: 1px solid #1E293B; max-width: 600px;">
+  <div style="color: #38BDF8; font-weight: 700; font-size: 14px; margin-bottom: 4px;">Autopilot Command Hub &bull; Endpoint Readiness</div>
+  <div style="color: #94A3B8; font-size: 11px; margin-bottom: 12px; border-bottom: 1px solid #1E293B; padding-bottom: 6px;">$((Get-Date).ToString("yyyy-MM-dd HH:mm:ss")) &bull; Computer: <strong style="color: #F8FAFC;">$env:COMPUTERNAME</strong></div>
+  <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
+    <tr><td style="padding: 4px 6px; color: #94A3B8;">Serial</td><td style="padding: 4px 6px; font-weight: 600;"><code style="background: rgba(56,189,248,0.12); color: #38BDF8; padding: 1px 4px; border-radius: 3px;">$sSerial</code></td></tr>
+    <tr><td style="padding: 4px 6px; color: #94A3B8;">Model</td><td style="padding: 4px 6px; color: #F8FAFC;">$sModel</td></tr>
+    <tr><td style="padding: 4px 6px; color: #94A3B8;">TPM 2.0</td><td style="padding: 4px 6px; color: #F8FAFC;">$sTpm</td></tr>
+    <tr><td style="padding: 4px 6px; color: #94A3B8;">Secure Boot</td><td style="padding: 4px 6px; color: #F8FAFC;">$sSecBoot</td></tr>
+    <tr><td style="padding: 4px 6px; color: #94A3B8;">Network</td><td style="padding: 4px 6px; color: #F8FAFC;">$sNet</td></tr>
+    <tr><td style="padding: 4px 6px; color: #94A3B8;">Device State</td><td style="padding: 4px 6px; color: #F8FAFC;">$sDevState</td></tr>
+    <tr><td style="padding: 4px 6px; color: #94A3B8;">Power</td><td style="padding: 4px 6px; color: #F8FAFC;">$sPower</td></tr>
+    <tr><td style="padding: 4px 6px; color: #94A3B8;">Privilege</td><td style="padding: 4px 6px; color: #F8FAFC;">$sPriv</td></tr>
+    <tr><td style="padding: 4px 6px; color: #94A3B8;">Intune Graph</td><td style="padding: 4px 6px; color: #F8FAFC;">$sGraph</td></tr>
+  </table>
+</div>
+"@
+                [System.Windows.Clipboard]::SetText($htmlSnippet)
+                if ($txtCopyDiagHtml) { $txtCopyDiagHtml.Text = "COPIED HTML" }
+                $badgeCopyDiagHtml.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#CCFBF1")
+                $badgeCopyDiagHtml.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#5EEAD4")
+                Write-HubLog "Copied HTML endpoint readiness snapshot to clipboard." "SUCCESS"
+                $null = [System.Threading.Tasks.Task]::Delay(1600).ContinueWith({
+                    [System.Windows.Application]::Current.Dispatcher.Invoke([Action]{
+                        if ($txtCopyDiagHtml) { $txtCopyDiagHtml.Text = "COPY HTML" }
+                        if ($badgeCopyDiagHtml) {
+                            $badgeCopyDiagHtml.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#F0FDFA")
+                            $badgeCopyDiagHtml.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#99F6E4")
+                        }
+                    })
+                })
+            } catch {
+                Write-HubLog "Could not copy diagnostic HTML: $($_.Exception.Message)" "WARN"
             }
         })
     }
