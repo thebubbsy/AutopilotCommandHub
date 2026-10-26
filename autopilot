@@ -9987,6 +9987,11 @@ function Start-AutopilotHubGui {
                             ToolTip="Click to copy styled HTML endpoint readiness metrics &amp; status cards directly to the clipboard.">
                         <TextBlock Name="TxtCopyDiagHtml" Text="COPY HTML" FontSize="8.5" FontWeight="SemiBold" Foreground="#0F766E" VerticalAlignment="Center"/>
                     </Border>
+                    <!-- One-Click Copy Diagnostic XML Pill -->
+                    <Border Name="BadgeCopyDiagXml" Background="#FFFBEB" CornerRadius="3" Padding="6,1.5" Margin="4,0,0,0" VerticalAlignment="Center" BorderBrush="#FDE68A" BorderThickness="1" Cursor="Hand"
+                            ToolTip="Click to copy structured XML endpoint readiness metrics directly to the clipboard.">
+                        <TextBlock Name="TxtCopyDiagXml" Text="COPY XML" FontSize="8.5" FontWeight="SemiBold" Foreground="#D97706" VerticalAlignment="Center"/>
+                    </Border>
             </StackPanel>
 
             <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
@@ -11474,6 +11479,8 @@ function Start-AutopilotHubGui {
                         <Button Name="BtnCopyLogLatest" Content="Copy Latest" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy the most recent System Audit Log entry to the clipboard"/>
                         <Button Name="BtnExportLogHtml" Content="Export HTML" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a styled dark-mode HTML console transcript and copy its path to the clipboard"/>
                         <Button Name="BtnCopyLogHtml" Content="Copy HTML" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy System Audit Log entries as formatted HTML snippet to clipboard"/>
+                        <Button Name="BtnExportLogXml" Content="Export XML" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a structured XML file and copy its path to the clipboard"/>
+                        <Button Name="BtnCopyLogXml" Content="Copy XML" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy System Audit Log entries as structured XML to clipboard"/>
                         <Button Name="BtnCopyLog" Content="Copy Log" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnClearLog" Content="Clear" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnSaveLog" Content="Save Log..." FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
@@ -11898,6 +11905,8 @@ function Start-AutopilotHubGui {
     $btnCopyLogLatest  = $window.FindName('BtnCopyLogLatest')
     $btnExportLogHtml  = $window.FindName('BtnExportLogHtml')
     $btnCopyLogHtml    = $window.FindName('BtnCopyLogHtml')
+    $btnExportLogXml   = $window.FindName('BtnExportLogXml')
+    $btnCopyLogXml     = $window.FindName('BtnCopyLogXml')
     $btnCopyLog        = $window.FindName('BtnCopyLog')
     $btnClearLog       = $window.FindName('BtnClearLog')
     $btnSaveLog        = $window.FindName('BtnSaveLog')
@@ -14058,6 +14067,67 @@ function Start-AutopilotHubGui {
         })
     }
 
+    if ($btnExportLogXml) {
+        $btnExportLogXml.Add_Click({
+            try {
+                $rawLines = if ($txtHubLog -and $txtHubLog.Text) { @($txtHubLog.Text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) } else { @() }
+                $entriesXml = [System.Collections.Generic.List[string]]::new()
+                $lineNum = 1
+                foreach ($line in $rawLines) {
+                    $severity = "INFO"
+                    if ($line -match "\[SUCCESS\]") { $severity = "SUCCESS" }
+                    elseif ($line -match "\[WARN\]") { $severity = "WARN" }
+                    elseif ($line -match "\[ERROR\]" -or $line -match "\[FAIL\]") { $severity = "ERROR" }
+                    $clean = $line -replace ']]>', ']]&gt;'
+                    $entriesXml.Add("    <entry line=`"$lineNum`" severity=`"$severity`"><![CDATA[$clean]]></entry>")
+                    $lineNum++
+                }
+                $xml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<auditLog computer="$env:COMPUTERNAME" exported="$((Get-Date).ToString("o"))" totalEntries="$($rawLines.Count)">
+$($entriesXml -join "`n")
+</auditLog>
+"@
+                $outDir = if (Test-Path "C:\ProgramData\AutopilotCommandHub") { "C:\ProgramData\AutopilotCommandHub" } else { $env:TEMP }
+                $outFile = Join-Path $outDir ("AutopilotAuditLog_{0}_{1}.xml" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd_HHmmss"))
+                $xml | Set-Content -Path $outFile -Encoding UTF8 -Force
+                [System.Windows.Clipboard]::SetText($outFile)
+                Write-HubLog "Exported XML System Audit Log to $outFile (path copied)." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not export XML System Audit Log: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
+    if ($btnCopyLogXml) {
+        $btnCopyLogXml.Add_Click({
+            try {
+                $rawLines = if ($txtHubLog -and $txtHubLog.Text) { @($txtHubLog.Text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) } else { @() }
+                $entriesXml = [System.Collections.Generic.List[string]]::new()
+                $lineNum = 1
+                foreach ($line in $rawLines) {
+                    $severity = "INFO"
+                    if ($line -match "\[SUCCESS\]") { $severity = "SUCCESS" }
+                    elseif ($line -match "\[WARN\]") { $severity = "WARN" }
+                    elseif ($line -match "\[ERROR\]" -or $line -match "\[FAIL\]") { $severity = "ERROR" }
+                    $clean = $line -replace ']]>', ']]&gt;'
+                    $entriesXml.Add("    <entry line=`"$lineNum`" severity=`"$severity`"><![CDATA[$clean]]></entry>")
+                    $lineNum++
+                }
+                $xml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<auditLog computer="$env:COMPUTERNAME" exported="$((Get-Date).ToString("o"))" totalEntries="$($rawLines.Count)">
+$($entriesXml -join "`n")
+</auditLog>
+"@
+                [System.Windows.Clipboard]::SetText($xml)
+                Write-HubLog "Copied structured XML audit log to clipboard ($($rawLines.Count) entries)." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not copy audit log as XML: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
 $btnCopyLog.Add_Click({
         [System.Windows.Clipboard]::SetText($txtHubLog.Text)
     })
@@ -14756,6 +14826,55 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                 })
             } catch {
                 Write-HubLog "Could not copy diagnostic HTML: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
+    $badgeCopyDiagXml = $window.FindName('BadgeCopyDiagXml')
+    $txtCopyDiagXml   = $window.FindName('TxtCopyDiagXml')
+    if ($badgeCopyDiagXml) {
+        $badgeCopyDiagXml.Add_MouseLeftButtonUp({
+            try {
+                $esc = { param($v) [System.Security.SecurityElement]::Escape([string]$v) }
+                $sSerial   = & $esc $(if ($txtSerial) { $txtSerial.Text } else { 'Unknown' })
+                $sModel    = & $esc $(if ($txtModel) { $txtModel.Text } else { 'Unknown' })
+                $sTpm      = & $esc $(if ($txtTpm) { $txtTpm.Text } else { 'Unknown' })
+                $sSecBoot  = & $esc $(if ($txtSecureBoot) { $txtSecureBoot.Text } else { 'Unknown' })
+                $sNet      = & $esc $(if ($txtNetwork) { $txtNetwork.Text } else { 'Unknown' })
+                $sDevState = & $esc $(if ($txtDeviceState) { $txtDeviceState.Text } else { 'Unknown' })
+                $sPower    = & $esc $(if ($txtPowerStatus) { $txtPowerStatus.Text } else { 'Unknown' })
+                $sPriv     = & $esc $(if ($txtPrivilege) { $txtPrivilege.Text } else { 'Unknown' })
+                $sGraph    = & $esc $(if ($txtGraphStatus) { $txtGraphStatus.Text } else { 'Unknown' })
+                $xmlSnippet = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<endpointReadiness computer="$env:COMPUTERNAME" timestamp="$((Get-Date).ToString("o"))">
+  <serial>$sSerial</serial>
+  <model>$sModel</model>
+  <tpm20>$sTpm</tpm20>
+  <secureBoot>$sSecBoot</secureBoot>
+  <network>$sNet</network>
+  <deviceState>$sDevState</deviceState>
+  <power>$sPower</power>
+  <privilege>$sPriv</privilege>
+  <graph>$sGraph</graph>
+</endpointReadiness>
+"@
+                [System.Windows.Clipboard]::SetText($xmlSnippet)
+                if ($txtCopyDiagXml) { $txtCopyDiagXml.Text = "COPIED XML" }
+                $badgeCopyDiagXml.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FEF3C7")
+                $badgeCopyDiagXml.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#F59E0B")
+                Write-HubLog "Copied XML endpoint readiness snapshot to clipboard." "SUCCESS"
+                $null = [System.Threading.Tasks.Task]::Delay(1600).ContinueWith({
+                    [System.Windows.Application]::Current.Dispatcher.Invoke([Action]{
+                        if ($txtCopyDiagXml) { $txtCopyDiagXml.Text = "COPY XML" }
+                        if ($badgeCopyDiagXml) {
+                            $badgeCopyDiagXml.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FFFBEB")
+                            $badgeCopyDiagXml.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FDE68A")
+                        }
+                    })
+                })
+            } catch {
+                Write-HubLog "Could not copy diagnostic XML: $($_.Exception.Message)" "WARN"
             }
         })
     }
