@@ -9977,6 +9977,11 @@ function Start-AutopilotHubGui {
                             ToolTip="Click to export a formatted Markdown (.md) endpoint readiness &amp; audit summary report to USB (or %TEMP%) and copy its path.">
                         <TextBlock Name="TxtExportDiagMd" Text="EXPORT MD" FontSize="8.5" FontWeight="SemiBold" Foreground="#86198F" VerticalAlignment="Center"/>
                     </Border>
+                    <!-- One-Click Export Diagnostic HTML Pill -->
+                    <Border Name="BadgeExportDiagHtml" Background="#F0FDF4" CornerRadius="3" Padding="6,1.5" Margin="4,0,0,0" VerticalAlignment="Center" BorderBrush="#BBF7D0" BorderThickness="1" Cursor="Hand"
+                            ToolTip="Click to export a styled offline HTML endpoint readiness report to USB (or %TEMP%) and copy its path.">
+                        <TextBlock Name="TxtExportDiagHtml" Text="EXPORT HTML" FontSize="8.5" FontWeight="SemiBold" Foreground="#15803D" VerticalAlignment="Center"/>
+                    </Border>
             </StackPanel>
 
             <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
@@ -11462,6 +11467,8 @@ function Start-AutopilotHubGui {
                         <Button Name="BtnExportLogJson" Content="Export JSON" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a structured JSON file and copy its path to the clipboard"/>
                         <Button Name="BtnExportLogMd" Content="Export MD" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a formatted Markdown report (.md) and copy its path to the clipboard"/>
                         <Button Name="BtnCopyLogLatest" Content="Copy Latest" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy the most recent System Audit Log entry to the clipboard"/>
+                        <Button Name="BtnExportLogHtml" Content="Export HTML" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a styled dark-mode HTML console transcript and copy its path to the clipboard"/>
+                        <Button Name="BtnCopyLogHtml" Content="Copy HTML" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy System Audit Log entries as formatted HTML snippet to clipboard"/>
                         <Button Name="BtnCopyLog" Content="Copy Log" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnClearLog" Content="Clear" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnSaveLog" Content="Save Log..." FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
@@ -11884,6 +11891,8 @@ function Start-AutopilotHubGui {
     $btnExportLogJson  = $window.FindName('BtnExportLogJson')
     $btnExportLogMd    = $window.FindName('BtnExportLogMd')
     $btnCopyLogLatest  = $window.FindName('BtnCopyLogLatest')
+    $btnExportLogHtml  = $window.FindName('BtnExportLogHtml')
+    $btnCopyLogHtml    = $window.FindName('BtnCopyLogHtml')
     $btnCopyLog        = $window.FindName('BtnCopyLog')
     $btnClearLog       = $window.FindName('BtnClearLog')
     $btnSaveLog        = $window.FindName('BtnSaveLog')
@@ -13969,7 +13978,82 @@ function Start-AutopilotHubGui {
         })
     }
 
-    $btnCopyLog.Add_Click({
+        if ($btnExportLogHtml) {
+        $btnExportLogHtml.Add_Click({
+            try {
+                $esc = { param($v) [System.Net.WebUtility]::HtmlEncode([string]$v) }
+                $rawLines = if ($txtHubLog -and $txtHubLog.Text) { @($txtHubLog.Text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) } else { @() }
+                $renderedLines = [System.Collections.Generic.List[string]]::new()
+                foreach ($line in $rawLines) {
+                    $color = "#E2E8F0"
+                    if ($line -match "\[SUCCESS\]") { $color = "#4ADE80" }
+                    elseif ($line -match "\[WARN\]") { $color = "#FBBF24" }
+                    elseif ($line -match "\[ERROR\]" -or $line -match "\[FAIL\]") { $color = "#F87171" }
+                    elseif ($line -match "\[INFO\]") { $color = "#38BDF8" }
+                    $renderedLines.Add(("<div style='color: {0}; line-height: 1.5; font-family: Consolas, monospace; font-size: 13px;'>{1}</div>" -f $color, (& $esc $line)))
+                }
+                $html = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Autopilot Command Hub -- System Audit Log ($env:COMPUTERNAME)</title>
+    <style>
+        body { font-family: Consolas, 'Cascadia Code', monospace; background: #0C1017; color: #E2E8F0; padding: 2rem; margin: 0; }
+        .window { max-width: 1100px; margin: 0 auto; background: #161B22; border: 1px solid #30363D; border-radius: 8px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        .header { background: #21262D; padding: 10px 16px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #30363D; }
+        .title { color: #F0F6FC; font-weight: 600; font-size: 13px; }
+        .body { padding: 1rem 1.5rem; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <div class="window">
+        <div class="header">
+            <span class="title">Autopilot Command Hub &bull; System Audit Log &bull; $env:COMPUTERNAME</span>
+            <span style="font-size: 11px; color: #8B949E;">$((Get-Date).ToString("yyyy-MM-dd HH:mm:ss"))</span>
+        </div>
+        <div class="body">
+            $($renderedLines -join "`n")
+        </div>
+    </div>
+</body>
+</html>
+"@
+                $outDir = if (Test-Path "C:\ProgramData\AutopilotCommandHub") { "C:\ProgramData\AutopilotCommandHub" } else { $env:TEMP }
+                $outFile = Join-Path $outDir ("AutopilotAuditLog_{0}_{1}.html" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd_HHmmss"))
+                $html | Set-Content -Path $outFile -Encoding UTF8 -Force
+                [System.Windows.Clipboard]::SetText($outFile)
+                Write-HubLog "Exported HTML System Audit Log report to $outFile (path copied)." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not export HTML System Audit Log: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
+    if ($btnCopyLogHtml) {
+        $btnCopyLogHtml.Add_Click({
+            try {
+                $esc = { param($v) [System.Net.WebUtility]::HtmlEncode([string]$v) }
+                $rawLines = if ($txtHubLog -and $txtHubLog.Text) { @($txtHubLog.Text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) } else { @() }
+                $renderedLines = [System.Collections.Generic.List[string]]::new()
+                foreach ($line in $rawLines) {
+                    $color = "#E2E8F0"
+                    if ($line -match "\[SUCCESS\]") { $color = "#4ADE80" }
+                    elseif ($line -match "\[WARN\]") { $color = "#FBBF24" }
+                    elseif ($line -match "\[ERROR\]" -or $line -match "\[FAIL\]") { $color = "#F87171" }
+                    elseif ($line -match "\[INFO\]") { $color = "#38BDF8" }
+                    $renderedLines.Add(("<div style='color: {0}; line-height: 1.5;'>{1}</div>" -f $color, (& $esc $line)))
+                }
+                $htmlSnippet = "<div style='background: #0F172A; color: #E2E8F0; font-family: Consolas, monospace; font-size: 13px; padding: 14px; border-radius: 6px; border: 1px solid #1E293B;'><div style='color: #94A3B8; font-size: 11px; margin-bottom: 8px; border-bottom: 1px solid #334155; padding-bottom: 4px;'><strong>Autopilot Audit Log</strong> &bull; $env:COMPUTERNAME &bull; $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))</div>$($renderedLines -join "`n")</div>"
+                [System.Windows.Clipboard]::SetText($htmlSnippet)
+                Write-HubLog "Copied formatted HTML audit log snippet to clipboard." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not copy audit log as HTML snippet: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
+$btnCopyLog.Add_Click({
         [System.Windows.Clipboard]::SetText($txtHubLog.Text)
     })
 
@@ -14548,7 +14632,78 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
         })
     }
 
-    if ($btnDismissMismatch) {
+        $badgeExportDiagHtml = $window.FindName('BadgeExportDiagHtml')
+    $txtExportDiagHtml   = $window.FindName('TxtExportDiagHtml')
+    if ($badgeExportDiagHtml) {
+        $badgeExportDiagHtml.Add_MouseLeftButtonUp({
+            try {
+                $esc = { param($v) [System.Net.WebUtility]::HtmlEncode([string]$v) }
+                $sSerial   = & $esc $(if ($txtSerial) { $txtSerial.Text } else { 'Unknown' })
+                $sModel    = & $esc $(if ($txtModel) { $txtModel.Text } else { 'Unknown' })
+                $sTpm      = & $esc $(if ($txtTpm) { $txtTpm.Text } else { 'Unknown' })
+                $sSecBoot  = & $esc $(if ($txtSecureBoot) { $txtSecureBoot.Text } else { 'Unknown' })
+                $sNet      = & $esc $(if ($txtNetwork) { $txtNetwork.Text } else { 'Unknown' })
+                $sDevState = & $esc $(if ($txtDeviceState) { $txtDeviceState.Text } else { 'Unknown' })
+                $sPower    = & $esc $(if ($txtPowerStatus) { $txtPowerStatus.Text } else { 'Unknown' })
+                $sPriv     = & $esc $(if ($txtPrivilege) { $txtPrivilege.Text } else { 'Unknown' })
+                $sGraph    = & $esc $(if ($txtGraphStatus) { $txtGraphStatus.Text } else { 'Unknown' })
+                $html = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Autopilot Command Hub -- Endpoint Readiness ($env:COMPUTERNAME)</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0B0F19; color: #E2E8F0; padding: 2rem; margin: 0; }
+        .container { max-width: 800px; margin: 0 auto; }
+        h1 { color: #F8FAFC; font-size: 1.5rem; margin-bottom: 0.25rem; }
+        .meta { color: #94A3B8; font-size: 0.85rem; margin-bottom: 1.5rem; }
+        table { width: 100%; border-collapse: collapse; background: #131B2E; border: 1px solid #1E293B; border-radius: 8px; overflow: hidden; font-size: 0.9rem; }
+        th { background: #1E293B; color: #94A3B8; padding: 10px 14px; text-align: left; border-bottom: 1px solid #334155; font-size: 0.8rem; text-transform: uppercase; }
+        td { padding: 10px 14px; border-bottom: 1px solid rgba(255,255,255,0.06); }
+        tr:hover td { background: rgba(255,255,255,0.02); }
+        .badge { background: rgba(56,189,248,0.12); color: #38BDF8; border: 1px solid rgba(56,189,248,0.25); border-radius: 4px; padding: 2px 6px; font-size: 0.8rem; font-family: monospace; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Autopilot Command Hub &bull; Endpoint Readiness</h1>
+        <div class="meta">Exported: $((Get-Date).ToString("yyyy-MM-dd HH:mm:ss")) &bull; Computer: <strong>$env:COMPUTERNAME</strong></div>
+        <table>
+            <thead>
+                <tr><th>Metric</th><th>Status / Value</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><strong>Serial Number</strong></td><td><span class="badge">$sSerial</span></td></tr>
+                <tr><td><strong>Hardware Model</strong></td><td>$sModel</td></tr>
+                <tr><td><strong>TPM Status</strong></td><td>$sTpm</td></tr>
+                <tr><td><strong>Secure Boot</strong></td><td>$sSecBoot</td></tr>
+                <tr><td><strong>Network Status</strong></td><td>$sNet</td></tr>
+                <tr><td><strong>Device State</strong></td><td>$sDevState</td></tr>
+                <tr><td><strong>Power Status</strong></td><td>$sPower</td></tr>
+                <tr><td><strong>Privilege Context</strong></td><td>$sPriv</td></tr>
+                <tr><td><strong>Graph Status</strong></td><td>$sGraph</td></tr>
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>
+"@
+                $outDir = if (Test-Path "C:\ProgramData\AutopilotCommandHub") { "C:\ProgramData\AutopilotCommandHub" } else { $env:TEMP }
+                $outFile = Join-Path $outDir ("AutopilotDiag_{0}_{1}.html" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd_HHmmss"))
+                $html | Set-Content -Path $outFile -Encoding UTF8 -Force
+                [System.Windows.Clipboard]::SetText($outFile)
+                if ($txtExportDiagHtml) { $txtExportDiagHtml.Text = "HTML SAVED" }
+                $badgeExportDiagHtml.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#DCFCE7")
+                $badgeExportDiagHtml.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#86EFAC")
+                Write-HubLog "Exported HTML endpoint readiness report to $outFile (path copied)." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not export diagnostic HTML: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
+if ($btnDismissMismatch) {
         $btnDismissMismatch.Add_Click({
             if ($bannerTenantMismatch) { $bannerTenantMismatch.Visibility = [System.Windows.Visibility]::Collapsed }
         })
