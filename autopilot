@@ -9997,6 +9997,11 @@ function Start-AutopilotHubGui {
                             ToolTip="Click to copy structured YAML endpoint readiness metrics directly to the clipboard.">
                         <TextBlock Name="TxtCopyDiagYaml" Text="COPY YAML" FontSize="8.5" FontWeight="SemiBold" Foreground="#BE185D" VerticalAlignment="Center"/>
                     </Border>
+                    <!-- One-Click Copy Diagnostic NDJSON Pill -->
+                    <Border Name="BadgeCopyDiagNdjson" Background="#EEF2FF" CornerRadius="3" Padding="6,1.5" Margin="4,0,0,0" VerticalAlignment="Center" BorderBrush="#C7D2FE" BorderThickness="1" Cursor="Hand"
+                            ToolTip="Click to copy newline-delimited JSON (NDJSON / JSONL) endpoint readiness metrics directly to the clipboard.">
+                        <TextBlock Name="TxtCopyDiagNdjson" Text="COPY NDJSON" FontSize="8.5" FontWeight="SemiBold" Foreground="#4338CA" VerticalAlignment="Center"/>
+                    </Border>
             </StackPanel>
 
             <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
@@ -11488,6 +11493,8 @@ function Start-AutopilotHubGui {
                         <Button Name="BtnCopyLogXml" Content="Copy XML" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy System Audit Log entries as structured XML to clipboard"/>
                         <Button Name="BtnExportLogYaml" Content="Export YAML" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a structured YAML file and copy its path to the clipboard"/>
                         <Button Name="BtnCopyLogYaml" Content="Copy YAML" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy System Audit Log entries as structured YAML to clipboard"/>
+                        <Button Name="BtnExportLogNdjson" Content="Export NDJSON" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a newline-delimited JSON (.jsonl) file and copy its path to the clipboard"/>
+                        <Button Name="BtnCopyLogNdjson" Content="Copy NDJSON" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy System Audit Log entries as newline-delimited JSON (NDJSON / JSONL) to clipboard"/>
                         <Button Name="BtnCopyLog" Content="Copy Log" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnClearLog" Content="Clear" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnSaveLog" Content="Save Log..." FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
@@ -11916,6 +11923,8 @@ function Start-AutopilotHubGui {
     $btnCopyLogXml     = $window.FindName('BtnCopyLogXml')
     $btnExportLogYaml  = $window.FindName('BtnExportLogYaml')
     $btnCopyLogYaml    = $window.FindName('BtnCopyLogYaml')
+    $btnExportLogNdjson = $window.FindName('BtnExportLogNdjson')
+    $btnCopyLogNdjson   = $window.FindName('BtnCopyLogNdjson')
     $btnCopyLog        = $window.FindName('BtnCopyLog')
     $btnClearLog       = $window.FindName('BtnClearLog')
     $btnSaveLog        = $window.FindName('BtnSaveLog')
@@ -14208,6 +14217,70 @@ $($entriesYaml -join "`n")
         })
     }
 
+    if ($btnExportLogNdjson) {
+        $btnExportLogNdjson.Add_Click({
+            try {
+                $rawLines = if ($txtHubLog -and $txtHubLog.Text) { @($txtHubLog.Text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) } else { @() }
+                $entriesNdjson = [System.Collections.Generic.List[string]]::new()
+                $lineNum = 1
+                $nowIso = (Get-Date).ToString("o")
+                foreach ($line in $rawLines) {
+                    $severity = "INFO"
+                    if ($line -match "\[SUCCESS\]") { $severity = "SUCCESS" }
+                    elseif ($line -match "\[WARN\]") { $severity = "WARN" }
+                    elseif ($line -match "\[ERROR\]" -or $line -match "\[FAIL\]") { $severity = "ERROR" }
+                    $obj = [ordered]@{
+                        computer  = $env:COMPUTERNAME
+                        line      = $lineNum
+                        severity  = $severity
+                        message   = $line
+                        timestamp = $nowIso
+                    }
+                    $entriesNdjson.Add(($obj | ConvertTo-Json -Compress))
+                    $lineNum++
+                }
+                $outDir = if (Test-Path "C:\ProgramData\AutopilotCommandHub") { "C:\ProgramData\AutopilotCommandHub" } else { $env:TEMP }
+                $outFile = Join-Path $outDir ("AutopilotAuditLog_{0}_{1}.jsonl" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd_HHmmss"))
+                $entriesNdjson | Set-Content -Path $outFile -Encoding UTF8 -Force
+                [System.Windows.Clipboard]::SetText($outFile)
+                Write-HubLog "Exported NDJSON System Audit Log to $outFile (path copied)." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not export NDJSON System Audit Log: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
+    if ($btnCopyLogNdjson) {
+        $btnCopyLogNdjson.Add_Click({
+            try {
+                $rawLines = if ($txtHubLog -and $txtHubLog.Text) { @($txtHubLog.Text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) } else { @() }
+                $entriesNdjson = [System.Collections.Generic.List[string]]::new()
+                $lineNum = 1
+                $nowIso = (Get-Date).ToString("o")
+                foreach ($line in $rawLines) {
+                    $severity = "INFO"
+                    if ($line -match "\[SUCCESS\]") { $severity = "SUCCESS" }
+                    elseif ($line -match "\[WARN\]") { $severity = "WARN" }
+                    elseif ($line -match "\[ERROR\]" -or $line -match "\[FAIL\]") { $severity = "ERROR" }
+                    $obj = [ordered]@{
+                        computer  = $env:COMPUTERNAME
+                        line      = $lineNum
+                        severity  = $severity
+                        message   = $line
+                        timestamp = $nowIso
+                    }
+                    $entriesNdjson.Add(($obj | ConvertTo-Json -Compress))
+                    $lineNum++
+                }
+                $ndjsonText = $entriesNdjson -join "`n"
+                [System.Windows.Clipboard]::SetText($ndjsonText)
+                Write-HubLog "Copied structured NDJSON audit log to clipboard ($($rawLines.Count) entries)." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not copy audit log as NDJSON: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
 $btnCopyLog.Add_Click({
         [System.Windows.Clipboard]::SetText($txtHubLog.Text)
     })
@@ -15005,6 +15078,56 @@ readiness:
                 })
             } catch {
                 Write-HubLog "Could not copy diagnostic YAML: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
+    $badgeCopyDiagNdjson = $window.FindName('BadgeCopyDiagNdjson')
+    $txtCopyDiagNdjson   = $window.FindName('TxtCopyDiagNdjson')
+    if ($badgeCopyDiagNdjson) {
+        $badgeCopyDiagNdjson.Add_MouseLeftButtonUp({
+            try {
+                $sSerial   = if ($txtSerial) { $txtSerial.Text } else { 'Unknown' }
+                $sModel    = if ($txtModel) { $txtModel.Text } else { 'Unknown' }
+                $sTpm      = if ($txtTpm) { $txtTpm.Text } else { 'Unknown' }
+                $sSecBoot  = if ($txtSecureBoot) { $txtSecureBoot.Text } else { 'Unknown' }
+                $sNet      = if ($txtNetwork) { $txtNetwork.Text } else { 'Unknown' }
+                $sDevState = if ($txtDeviceState) { $txtDeviceState.Text } else { 'Unknown' }
+                $sPower    = if ($txtPowerStatus) { $txtPowerStatus.Text } else { 'Unknown' }
+                $sPriv     = if ($txtPrivilege) { $txtPrivilege.Text } else { 'Unknown' }
+                $sGraph    = if ($txtGraphStatus) { $txtGraphStatus.Text } else { 'Unknown' }
+                $snap = [ordered]@{
+                    computer   = $env:COMPUTERNAME
+                    timestamp  = (Get-Date).ToString("o")
+                    readiness  = [ordered]@{
+                        serial      = $sSerial
+                        model       = $sModel
+                        tpm20       = $sTpm
+                        secureBoot  = $sSecBoot
+                        network     = $sNet
+                        deviceState = $sDevState
+                        power       = $sPower
+                        privilege   = $sPriv
+                        graph       = $sGraph
+                    }
+                }
+                $ndjsonSnippet = $snap | ConvertTo-Json -Compress
+                [System.Windows.Clipboard]::SetText($ndjsonSnippet)
+                if ($txtCopyDiagNdjson) { $txtCopyDiagNdjson.Text = "COPIED NDJSON" }
+                $badgeCopyDiagNdjson.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#E0E7FF")
+                $badgeCopyDiagNdjson.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#6366F1")
+                Write-HubLog "Copied NDJSON endpoint readiness snapshot to clipboard." "SUCCESS"
+                $null = [System.Threading.Tasks.Task]::Delay(1600).ContinueWith({
+                    [System.Windows.Application]::Current.Dispatcher.Invoke([Action]{
+                        if ($txtCopyDiagNdjson) { $txtCopyDiagNdjson.Text = "COPY NDJSON" }
+                        if ($badgeCopyDiagNdjson) {
+                            $badgeCopyDiagNdjson.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#EEF2FF")
+                            $badgeCopyDiagNdjson.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#C7D2FE")
+                        }
+                    })
+                })
+            } catch {
+                Write-HubLog "Could not copy diagnostic NDJSON: $($_.Exception.Message)" "WARN"
             }
         })
     }
