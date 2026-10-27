@@ -9992,6 +9992,11 @@ function Start-AutopilotHubGui {
                             ToolTip="Click to copy structured XML endpoint readiness metrics directly to the clipboard.">
                         <TextBlock Name="TxtCopyDiagXml" Text="COPY XML" FontSize="8.5" FontWeight="SemiBold" Foreground="#D97706" VerticalAlignment="Center"/>
                     </Border>
+                    <!-- One-Click Copy Diagnostic YAML Pill -->
+                    <Border Name="BadgeCopyDiagYaml" Background="#FDF2F8" CornerRadius="3" Padding="6,1.5" Margin="4,0,0,0" VerticalAlignment="Center" BorderBrush="#FBCFE8" BorderThickness="1" Cursor="Hand"
+                            ToolTip="Click to copy structured YAML endpoint readiness metrics directly to the clipboard.">
+                        <TextBlock Name="TxtCopyDiagYaml" Text="COPY YAML" FontSize="8.5" FontWeight="SemiBold" Foreground="#BE185D" VerticalAlignment="Center"/>
+                    </Border>
             </StackPanel>
 
             <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
@@ -11481,6 +11486,8 @@ function Start-AutopilotHubGui {
                         <Button Name="BtnCopyLogHtml" Content="Copy HTML" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy System Audit Log entries as formatted HTML snippet to clipboard"/>
                         <Button Name="BtnExportLogXml" Content="Export XML" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a structured XML file and copy its path to the clipboard"/>
                         <Button Name="BtnCopyLogXml" Content="Copy XML" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy System Audit Log entries as structured XML to clipboard"/>
+                        <Button Name="BtnExportLogYaml" Content="Export YAML" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Export System Audit Log entries as a structured YAML file and copy its path to the clipboard"/>
+                        <Button Name="BtnCopyLogYaml" Content="Copy YAML" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy System Audit Log entries as structured YAML to clipboard"/>
                         <Button Name="BtnCopyLog" Content="Copy Log" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnClearLog" Content="Clear" FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
                         <Button Name="BtnSaveLog" Content="Save Log..." FontSize="10" Padding="6,2" Margin="0,0,4,0"/>
@@ -11907,6 +11914,8 @@ function Start-AutopilotHubGui {
     $btnCopyLogHtml    = $window.FindName('BtnCopyLogHtml')
     $btnExportLogXml   = $window.FindName('BtnExportLogXml')
     $btnCopyLogXml     = $window.FindName('BtnCopyLogXml')
+    $btnExportLogYaml  = $window.FindName('BtnExportLogYaml')
+    $btnCopyLogYaml    = $window.FindName('BtnCopyLogYaml')
     $btnCopyLog        = $window.FindName('BtnCopyLog')
     $btnClearLog       = $window.FindName('BtnClearLog')
     $btnSaveLog        = $window.FindName('BtnSaveLog')
@@ -14128,6 +14137,77 @@ $($entriesXml -join "`n")
         })
     }
 
+    if ($btnExportLogYaml) {
+        $btnExportLogYaml.Add_Click({
+            try {
+                $rawLines = if ($txtHubLog -and $txtHubLog.Text) { @($txtHubLog.Text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) } else { @() }
+                $entriesYaml = [System.Collections.Generic.List[string]]::new()
+                $lineNum = 1
+                foreach ($line in $rawLines) {
+                    $severity = "INFO"
+                    if ($line -match "\[SUCCESS\]") { $severity = "SUCCESS" }
+                    elseif ($line -match "\[WARN\]") { $severity = "WARN" }
+                    elseif ($line -match "\[ERROR\]" -or $line -match "\[FAIL\]") { $severity = "ERROR" }
+                    $cleanYaml = '"' + ($line -replace '\\', '\\' -replace '"', '\"' -replace "`t", '\t' -replace "`r", '\r' -replace "`n", '\n') + '"'
+                    $entriesYaml.Add("  - line: $lineNum`n    severity: `"$severity`"`n    message: $cleanYaml")
+                    $lineNum++
+                }
+                $yaml = @"
+# Autopilot System Audit Log
+# Computer: $env:COMPUTERNAME
+# Exported: $((Get-Date).ToString("o"))
+auditLog:
+  computer: "$env:COMPUTERNAME"
+  exported: "$((Get-Date).ToString("o"))"
+  totalEntries: $($rawLines.Count)
+  entries:
+$($entriesYaml -join "`n")
+"@
+                $outDir = if (Test-Path "C:\ProgramData\AutopilotCommandHub") { "C:\ProgramData\AutopilotCommandHub" } else { $env:TEMP }
+                $outFile = Join-Path $outDir ("AutopilotAuditLog_{0}_{1}.yaml" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd_HHmmss"))
+                $yaml | Set-Content -Path $outFile -Encoding UTF8 -Force
+                [System.Windows.Clipboard]::SetText($outFile)
+                Write-HubLog "Exported YAML System Audit Log to $outFile (path copied)." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not export YAML System Audit Log: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
+    if ($btnCopyLogYaml) {
+        $btnCopyLogYaml.Add_Click({
+            try {
+                $rawLines = if ($txtHubLog -and $txtHubLog.Text) { @($txtHubLog.Text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) } else { @() }
+                $entriesYaml = [System.Collections.Generic.List[string]]::new()
+                $lineNum = 1
+                foreach ($line in $rawLines) {
+                    $severity = "INFO"
+                    if ($line -match "\[SUCCESS\]") { $severity = "SUCCESS" }
+                    elseif ($line -match "\[WARN\]") { $severity = "WARN" }
+                    elseif ($line -match "\[ERROR\]" -or $line -match "\[FAIL\]") { $severity = "ERROR" }
+                    $cleanYaml = '"' + ($line -replace '\\', '\\' -replace '"', '\"' -replace "`t", '\t' -replace "`r", '\r' -replace "`n", '\n') + '"'
+                    $entriesYaml.Add("  - line: $lineNum`n    severity: `"$severity`"`n    message: $cleanYaml")
+                    $lineNum++
+                }
+                $yaml = @"
+# Autopilot System Audit Log
+# Computer: $env:COMPUTERNAME
+# Exported: $((Get-Date).ToString("o"))
+auditLog:
+  computer: "$env:COMPUTERNAME"
+  exported: "$((Get-Date).ToString("o"))"
+  totalEntries: $($rawLines.Count)
+  entries:
+$($entriesYaml -join "`n")
+"@
+                [System.Windows.Clipboard]::SetText($yaml)
+                Write-HubLog "Copied structured YAML audit log to clipboard ($($rawLines.Count) entries)." "SUCCESS"
+            } catch {
+                Write-HubLog "Could not copy audit log as YAML: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
 $btnCopyLog.Add_Click({
         [System.Windows.Clipboard]::SetText($txtHubLog.Text)
     })
@@ -14875,6 +14955,56 @@ $($r.Entitlements | ForEach-Object { "| $($_.ServiceLevelDescription) | $($_.Ent
                 })
             } catch {
                 Write-HubLog "Could not copy diagnostic XML: $($_.Exception.Message)" "WARN"
+            }
+        })
+    }
+
+    $badgeCopyDiagYaml = $window.FindName('BadgeCopyDiagYaml')
+    $txtCopyDiagYaml   = $window.FindName('TxtCopyDiagYaml')
+    if ($badgeCopyDiagYaml) {
+        $badgeCopyDiagYaml.Add_MouseLeftButtonUp({
+            try {
+                $esc = { param($v) '"' + ([string]$v -replace '\\', '\\' -replace '"', '\"') + '"' }
+                $sSerial   = & $esc $(if ($txtSerial) { $txtSerial.Text } else { 'Unknown' })
+                $sModel    = & $esc $(if ($txtModel) { $txtModel.Text } else { 'Unknown' })
+                $sTpm      = & $esc $(if ($txtTpm) { $txtTpm.Text } else { 'Unknown' })
+                $sSecBoot  = & $esc $(if ($txtSecureBoot) { $txtSecureBoot.Text } else { 'Unknown' })
+                $sNet      = & $esc $(if ($txtNetwork) { $txtNetwork.Text } else { 'Unknown' })
+                $sDevState = & $esc $(if ($txtDeviceState) { $txtDeviceState.Text } else { 'Unknown' })
+                $sPower    = & $esc $(if ($txtPowerStatus) { $txtPowerStatus.Text } else { 'Unknown' })
+                $sPriv     = & $esc $(if ($txtPrivilege) { $txtPrivilege.Text } else { 'Unknown' })
+                $sGraph    = & $esc $(if ($txtGraphStatus) { $txtGraphStatus.Text } else { 'Unknown' })
+                $yamlSnippet = @"
+# Endpoint Readiness Snapshot
+computer: "$env:COMPUTERNAME"
+timestamp: "$((Get-Date).ToString("o"))"
+readiness:
+  serial: $sSerial
+  model: $sModel
+  tpm20: $sTpm
+  secureBoot: $sSecBoot
+  network: $sNet
+  deviceState: $sDevState
+  power: $sPower
+  privilege: $sPriv
+  graph: $sGraph
+"@
+                [System.Windows.Clipboard]::SetText($yamlSnippet)
+                if ($txtCopyDiagYaml) { $txtCopyDiagYaml.Text = "COPIED YAML" }
+                $badgeCopyDiagYaml.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FCE7F3")
+                $badgeCopyDiagYaml.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#EC4899")
+                Write-HubLog "Copied YAML endpoint readiness snapshot to clipboard." "SUCCESS"
+                $null = [System.Threading.Tasks.Task]::Delay(1600).ContinueWith({
+                    [System.Windows.Application]::Current.Dispatcher.Invoke([Action]{
+                        if ($txtCopyDiagYaml) { $txtCopyDiagYaml.Text = "COPY YAML" }
+                        if ($badgeCopyDiagYaml) {
+                            $badgeCopyDiagYaml.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FDF2F8")
+                            $badgeCopyDiagYaml.BorderBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FBCFE8")
+                        }
+                    })
+                })
+            } catch {
+                Write-HubLog "Could not copy diagnostic YAML: $($_.Exception.Message)" "WARN"
             }
         })
     }
