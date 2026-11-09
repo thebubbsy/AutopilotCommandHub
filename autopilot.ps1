@@ -11475,7 +11475,7 @@ function Start-AutopilotHubGui {
                     </StackPanel>
                     <StackPanel Grid.Column="2" Orientation="Horizontal">
                         <TextBox Name="TxtLogFilter" Width="115" Height="20" FontSize="9.5" Padding="4,1" Margin="0,0,2,0" VerticalContentAlignment="Center" Background="#F8FAFC" BorderBrush="#CBD5E1" BorderThickness="1" ToolTip="Type keyword to filter &amp; copy matching audit log lines (e.g. OA3, TPM, Graph, WARN)"/>
-                        <Button Name="BtnClearLogFilter" Content="✕" FontSize="9" Padding="4,1" Margin="0,0,4,0" ToolTip="Clear log keyword filter box"/>
+                        <Button Name="BtnClearLogFilter" Content="X" FontSize="9" Padding="4,1" Margin="0,0,4,0" ToolTip="Clear log keyword filter box"/>
                         <Button Name="BtnCopyFilteredLog" Content="Copy Match" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy audit log lines matching the filter box (or all lines if empty)"/>
                         <Button Name="BtnCopyLogErrors" Content="Copy Warn/Err" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy only [WARN], [ERROR], and [FAIL] audit log lines to the clipboard"/>
                         <Button Name="BtnCopyLogJson" Content="Copy JSON" FontSize="10" Padding="6,2" Margin="0,0,4,0" ToolTip="Copy structured System Audit Log entries (Line, Timestamp, Severity, Message) as JSON to clipboard"/>
@@ -11965,7 +11965,7 @@ function Start-AutopilotHubGui {
         }
         if ($txtLogStats) {
             if ($script:HubLogWarnErrCount -gt 0) {
-                $txtLogStats.Text = "$($script:HubLogLineCount) lines · $($script:HubLogWarnErrCount) warn/err"
+                $txtLogStats.Text = "$($script:HubLogLineCount) lines - $($script:HubLogWarnErrCount) warn/err"
                 $txtLogStats.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#B45309")
                 if ($badgeLogStats) {
                     $badgeLogStats.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FEF3C7")
